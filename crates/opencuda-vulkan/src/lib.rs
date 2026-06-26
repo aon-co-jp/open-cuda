@@ -2,7 +2,7 @@
 //!
 //! Vulkan Compute バックエンドの準備用クレート。
 //!
-//! v0.3 では、実GPUや Vulkan SDK が無い環境でも開発を進めるため、
+//! v0.3.5 では、実GPUや Vulkan SDK が無い環境でも開発を進めるため、
 //! `VulkanMockDevice` を提供する。これは実Vulkanではない。目的は次の3つ。
 //!
 //! 1. Vulkan系バックエンドでは `Native` カーネルを拒否し、`SpirV` だけを受ける契約を固定する。
@@ -110,7 +110,7 @@ impl VulkanMockDevice {
         Ok(())
     }
 
-    /// v0.3 のSPIR-V/OmniIR経路シミュレーション。
+    /// v0.3.5 のSPIR-V/OmniIR経路シミュレーション。
     ///
     /// 実装済み範囲を意図的に限定し、誇大に見えないよう vector_add 系のみ受け付ける。
     fn run_vector_add_simulation(&self, args: &[KernelArg]) -> Result<()> {
@@ -215,7 +215,7 @@ impl GpuDevice for VulkanMockDevice {
         match kernel.name.as_str() {
             "vector_add" | "vector_add_f32" => self.run_vector_add_simulation(args),
             other => bail!(
-                "VulkanMockDevice only simulates vector_add/vector_add_f32 in v0.3; got kernel `{other}`"
+                "VulkanMockDevice only simulates vector_add/vector_add_f32 in v0.3.5; got kernel `{other}`"
             ),
         }
     }
@@ -230,13 +230,13 @@ pub fn enumerate(start_id: usize) -> Vec<Arc<dyn GpuDevice>> {
 }
 
 
-/// v0.3 の OmniIR → SPIR-V 代替コンパイラ。
+/// v0.3.5 の OmniIR → SPIR-V 代替コンパイラ。
 ///
 /// これは本物のSPIR-V生成器ではなく、Vulkan実装前にパイプライン契約を固定するfixture生成器。
 /// 本物の実装では `IrModule` を SPIR-V 命令列へ下げ、`VkShaderModule` に渡す。
 pub fn compile_omniir_to_spirv_fixture(module: &IrModule) -> Result<Vec<u8>> {
     if module.name != "vector_add_f32" {
-        bail!("opencuda-vulkan v0.3 only compiles vector_add_f32 OmniIR fixture");
+        bail!("opencuda-vulkan v0.3.5 only compiles vector_add_f32 OmniIR fixture");
     }
     Ok(SPIRV_VECTOR_ADD_FIXTURE.to_vec())
 }

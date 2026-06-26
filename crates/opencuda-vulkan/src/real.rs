@@ -1,6 +1,6 @@
 //! Optional real Vulkan Compute backend implemented with `ash`.
 //!
-//! v0.3 scope is intentionally small: one compute queue, host-visible storage buffers,
+//! v0.3.5 scope is intentionally small: one compute queue, host-visible storage buffers,
 //! SPIR-V shader modules supplied by the caller, and the `vector_add` argument contract.
 //! This keeps the first real GPU path understandable and easy to debug.
 
@@ -21,22 +21,24 @@ struct VulkanAllocation {
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     len: usize,
+    mapped_size: vk::DeviceSize,
+    coherent: bool,
 }
 
 unsafe impl Send for VulkanAllocation {}
 
 /// A minimal real Vulkan Compute device.
 ///
-/// This is not yet a high-performance backend. It is a correctness backend for v0.3:
+/// This is not yet a high-performance backend. It is a correctness backend for v0.3.5:
 /// allocate host-visible buffers, create a compute pipeline from SPIR-V, dispatch it,
 /// and read results back for comparison with the CPU reference path.
 pub struct VulkanDevice {
     _entry: Entry,
     instance: ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    _physical_device: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
-    queue_family_index: u32,
+    _queue_family_index: u32,
     command_pool: vk::CommandPool,
     info: DeviceInfo,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -117,10 +119,10 @@ impl VulkanDevice {
         Ok(Arc::new(Self {
             _entry: entry,
             instance,
-            physical_device,
+            _physical_device: physical_device,
             device,
             queue,
-            queue_family_index,
+            _queue_family_index: queue_family_index,
             command_pool,
             info: DeviceInfo {
                 id,
@@ -135,13 +137,13 @@ impl VulkanDevice {
         }))
     }
 
-    fn get_allocation(&self, ptr: DevicePtr) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, usize)> {
+    fn get_allocation(&self, ptr: DevicePtr) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, usize, vk::DeviceSize, bool)> {
         if ptr.device_id as usize != self.info.id {
             return Err(GpuError::InvalidPtr(ptr).into());
         }
         let map = self.allocations.lock().unwrap();
         let a = map.get(&ptr.addr).ok_or(GpuError::InvalidPtr(ptr))?;
-        Ok((a.buffer, a.memory, a.mapped, a.len))
+        Ok((a.buffer, a.memory, a.mapped, a.len, a.mapped_size, a.coherent))
     }
 
     fn find_memory_type(&self, bits: u32, flags: vk::MemoryPropertyFlags) -> Result<u32> {
@@ -154,7 +156,51 @@ impl VulkanDevice {
                 return Ok(i);
             }
         }
-        bail!("no compatible Vulkan memory type for flags {flags:?}")
+        bail!("no compatible Vulkan memory type for flags 0x{:x}", flags.as_raw())
+    }
+
+    /// Prefer HOST_VISIBLE | HOST_COHERENT, but fall back to HOST_VISIBLE.
+    /// Some Vulkan stacks do not expose a coherent memory type for every buffer requirement.
+    /// In that case v0.3.5 explicitly flushes host writes and invalidates host reads.
+    fn find_host_visible_memory_type(&self, bits: u32) -> Result<(u32, bool)> {
+        let coherent_flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        if let Ok(index) = self.find_memory_type(bits, coherent_flags) {
+            return Ok((index, true));
+        }
+        let index = self.find_memory_type(bits, vk::MemoryPropertyFlags::HOST_VISIBLE)?;
+        Ok((index, false))
+    }
+
+    fn flush_if_needed(&self, memory: vk::DeviceMemory, _mapped_size: vk::DeviceSize, coherent: bool) -> Result<()> {
+        if coherent {
+            return Ok(());
+        }
+        // Use VK_WHOLE_SIZE so the range stays valid even when the nonCoherentAtomSize
+        // alignment is larger than the requested copy length. The allocation is mapped
+        // from offset 0 to its full memory-requirements size.
+        let range = vk::MappedMemoryRange::builder()
+            .memory(memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)
+            .build();
+        unsafe { self.device.flush_mapped_memory_ranges(&[range]) }
+            .context("vkFlushMappedMemoryRanges failed")?;
+        Ok(())
+    }
+
+    fn invalidate_if_needed(&self, memory: vk::DeviceMemory, _mapped_size: vk::DeviceSize, coherent: bool) -> Result<()> {
+        if coherent {
+            return Ok(());
+        }
+        // Use VK_WHOLE_SIZE for the same reason as flush_if_needed.
+        let range = vk::MappedMemoryRange::builder()
+            .memory(memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)
+            .build();
+        unsafe { self.device.invalidate_mapped_memory_ranges(&[range]) }
+            .context("vkInvalidateMappedMemoryRanges failed")?;
+        Ok(())
     }
 
     fn ensure_vector_add_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer, u32)> {
@@ -165,14 +211,15 @@ impl VulkanDevice {
         let b = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 must be pointer"))?;
         let c = args[2].as_ptr().ok_or_else(|| anyhow!("arg2 must be pointer"))?;
         let n = args[3].as_usize().ok_or_else(|| anyhow!("arg3 must be usize/u32"))?;
-        let (abuf, _, _, alen) = self.get_allocation(a)?;
-        let (bbuf, _, _, blen) = self.get_allocation(b)?;
-        let (cbuf, _, _, clen) = self.get_allocation(c)?;
+        let (abuf, _, _, alen, _, _) = self.get_allocation(a)?;
+        let (bbuf, _, _, blen, _, _) = self.get_allocation(b)?;
+        let (cbuf, _, _, clen, _, _) = self.get_allocation(c)?;
         let bytes = n.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| anyhow!("byte size overflow"))?;
         if bytes > alen || bytes > blen || bytes > clen {
             bail!("vector_add buffer too small: need {bytes} bytes");
         }
-        Ok((abuf, bbuf, cbuf, n as u32))
+        let n_u32 = u32::try_from(n).context("vector_add n does not fit in u32 push constant")?;
+        Ok((abuf, bbuf, cbuf, n_u32))
     }
 
     fn run_vector_add_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
@@ -314,10 +361,7 @@ impl GpuDevice for VulkanDevice {
             let buffer = self.device.create_buffer(&buffer_info, None)
                 .context("vkCreateBuffer failed")?;
             let req = self.device.get_buffer_memory_requirements(buffer);
-            let memory_type = self.find_memory_type(
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?;
+            let (memory_type, coherent) = self.find_host_visible_memory_type(req.memory_type_bits)?;
             let alloc_info = vk::MemoryAllocateInfo::builder()
                 .allocation_size(req.size)
                 .memory_type_index(memory_type);
@@ -325,10 +369,19 @@ impl GpuDevice for VulkanDevice {
                 .context("vkAllocateMemory failed")?;
             self.device.bind_buffer_memory(buffer, memory, 0)
                 .context("vkBindBufferMemory failed")?;
-            let mapped = self.device.map_memory(memory, 0, bytes as u64, vk::MemoryMapFlags::empty())
+            // Map the full memory-requirements size, not only the requested byte count.
+            // Non-coherent flush/invalidate can then safely use VK_WHOLE_SIZE.
+            let mapped = self.device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
                 .context("vkMapMemory failed")? as *mut u8;
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            self.allocations.lock().unwrap().insert(handle, VulkanAllocation { buffer, memory, mapped, len: bytes });
+            self.allocations.lock().unwrap().insert(handle, VulkanAllocation {
+                buffer,
+                memory,
+                mapped,
+                len: bytes,
+                mapped_size: req.size,
+                coherent,
+            });
             Ok(DevicePtr::new(handle, self.info.id as u32))
         }
     }
@@ -347,31 +400,33 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn memcpy_h2d(&self, dst: DevicePtr, src: &[u8]) -> Result<()> {
-        let (_, _, mapped, len) = self.get_allocation(dst)?;
+        let (_, memory, mapped, len, memory_size, coherent) = self.get_allocation(dst)?;
         if src.len() > len {
             return Err(GpuError::OutOfMemory(src.len()).into());
         }
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), mapped, src.len()) };
-        Ok(())
+        self.flush_if_needed(memory, memory_size, coherent)
     }
 
     fn memcpy_d2h(&self, dst: &mut [u8], src: DevicePtr) -> Result<()> {
-        let (_, _, mapped, len) = self.get_allocation(src)?;
+        let (_, memory, mapped, len, memory_size, coherent) = self.get_allocation(src)?;
         if dst.len() > len {
             return Err(GpuError::InvalidPtr(src).into());
         }
+        self.invalidate_if_needed(memory, memory_size, coherent)?;
         unsafe { std::ptr::copy_nonoverlapping(mapped, dst.as_mut_ptr(), dst.len()) };
         Ok(())
     }
 
     fn memcpy_d2d(&self, dst: DevicePtr, src: DevicePtr, bytes: usize) -> Result<()> {
-        let (_, _, d, dlen) = self.get_allocation(dst)?;
-        let (_, _, s, slen) = self.get_allocation(src)?;
+        let (_, dst_memory, d, dlen, dst_memory_size, dst_coherent) = self.get_allocation(dst)?;
+        let (_, src_memory, s, slen, src_memory_size, src_coherent) = self.get_allocation(src)?;
         if bytes > dlen || bytes > slen {
             return Err(GpuError::InvalidPtr(dst).into());
         }
+        self.invalidate_if_needed(src_memory, src_memory_size, src_coherent)?;
         unsafe { std::ptr::copy_nonoverlapping(s, d, bytes) };
-        Ok(())
+        self.flush_if_needed(dst_memory, dst_memory_size, dst_coherent)
     }
 
     fn launch_kernel(&self, kernel: &CompiledKernel, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
@@ -381,7 +436,7 @@ impl GpuDevice for VulkanDevice {
         };
         match kernel.name.as_str() {
             "vector_add" | "vector_add_f32" => self.run_vector_add_spirv(spirv, &kernel.entry, cfg, args),
-            other => bail!("VulkanDevice v0.3 only implements vector_add/vector_add_f32; got `{other}`"),
+            other => bail!("VulkanDevice v0.3.5 only implements vector_add/vector_add_f32; got `{other}`"),
         }
     }
 
@@ -423,7 +478,7 @@ fn storage_binding(binding: u32) -> vk::DescriptorSetLayoutBinding {
         .build()
 }
 
-fn descriptor_write<'a>(set: vk::DescriptorSet, binding: u32, info: &'a [vk::DescriptorBufferInfo]) -> vk::WriteDescriptorSet<'a> {
+fn descriptor_write(set: vk::DescriptorSet, binding: u32, info: &[vk::DescriptorBufferInfo]) -> vk::WriteDescriptorSet {
     vk::WriteDescriptorSet::builder()
         .dst_set(set)
         .dst_binding(binding)

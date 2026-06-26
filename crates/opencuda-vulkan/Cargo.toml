@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Vulkan backend crate. v0.3 keeps the hardware-free simulator and adds an optional ash-based real Vulkan Compute path."
+description = "Vulkan backend crate. v0.3.5 keeps the hardware-free simulator and adds an optional ash-based real Vulkan Compute path."
 
 [dependencies]
 opencuda-core.workspace = true

@@ -1,6 +1,5 @@
 [workspace]
 resolver = "2"
-exclude = ["examples/vector_add_vulkan_real"]
 members = [
     "crates/opencuda-core",
     "crates/opencuda-cpu",
@@ -12,11 +11,13 @@ members = [
     "examples/vector_add",
     "examples/vector_add_vulkan",
     "examples/vector_add_omniir",
+    "examples/vector_add_vulkan_real",
+    "examples/vulkan_info",
     "examples/matmul",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.5"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["PHI"]

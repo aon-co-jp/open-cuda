@@ -1,4 +1,4 @@
-//! vector_add_vulkan_real: v0.3 の実Vulkan Compute最小サンプル。
+//! vector_add_vulkan_real: v0.3.5 の実Vulkan Compute最小サンプル。
 //!
 //! 事前に Vulkan SDK の `glslc` などで `shaders/vector_add.comp` を
 //! `shaders/vector_add.spv` にコンパイルしてから実行する。

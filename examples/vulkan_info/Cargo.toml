@@ -1,5 +1,5 @@
 [package]
-name = "vector_add_vulkan_real"
+name = "vulkan_info"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,5 +11,5 @@ opencuda-vulkan = { workspace = true, features = ["real-vulkan"] }
 anyhow.workspace = true
 
 [[bin]]
-name = "vector_add_vulkan_real"
+name = "vulkan_info"
 path = "src/main.rs"
