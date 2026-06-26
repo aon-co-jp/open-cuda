@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+exclude = ["examples/vector_add_vulkan_real"]
+members = [
+    "crates/opencuda-core",
+    "crates/opencuda-cpu",
+    "crates/opencuda-mock",
+    "crates/opencuda-vulkan",
+    "crates/opencuda-ir",
+    "crates/opencuda-blas",
+    "crates/opencuda-multidev",
+    "examples/vector_add",
+    "examples/vector_add_vulkan",
+    "examples/vector_add_omniir",
+    "examples/matmul",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["PHI"]
+repository = "https://github.com/PHI/opencuda"
+rust-version = "1.75"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+rayon = "1.10"
+tracing = "0.1"
+half = "2"
+
+# 内部crate
+opencuda-core = { path = "crates/opencuda-core" }
+opencuda-cpu = { path = "crates/opencuda-cpu" }
+opencuda-mock = { path = "crates/opencuda-mock" }
+opencuda-vulkan = { path = "crates/opencuda-vulkan" }
+opencuda-ir = { path = "crates/opencuda-ir" }
+opencuda-blas = { path = "crates/opencuda-blas" }
+opencuda-multidev = { path = "crates/opencuda-multidev" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

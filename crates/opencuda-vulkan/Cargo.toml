@@ -1,0 +1,24 @@
+[package]
+name = "opencuda-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vulkan backend crate. v0.3 keeps the hardware-free simulator and adds an optional ash-based real Vulkan Compute path."
+
+[dependencies]
+opencuda-core.workspace = true
+opencuda-ir.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+real-vulkan = ["dep:ash"]
+
+[dependencies.ash]
+version = "0.37"
+default-features = false
+features = ["loaded"]
+optional = true

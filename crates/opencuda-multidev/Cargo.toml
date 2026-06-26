@@ -1,0 +1,13 @@
+[package]
+name = "opencuda-multidev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Multi-GPU orchestration for OpenCUDA: pipeline parallelism, unified VRAM (Phase 3)."
+
+[dependencies]
+opencuda-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

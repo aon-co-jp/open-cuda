@@ -1,0 +1,17 @@
+[package]
+name = "vector_add_omniir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+opencuda-core.workspace = true
+opencuda-cpu.workspace = true
+opencuda-vulkan.workspace = true
+opencuda-ir.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "vector_add_omniir"
+path = "src/main.rs"

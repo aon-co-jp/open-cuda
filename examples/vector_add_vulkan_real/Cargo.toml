@@ -1,0 +1,11 @@
+[package]
+name = "vector_add_vulkan_real"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+opencuda-core = { path = "../../crates/opencuda-core" }
+opencuda-vulkan = { path = "../../crates/opencuda-vulkan", features = ["real-vulkan"] }
+anyhow = "1"
