@@ -47,6 +47,23 @@ impl LaunchConfig {
         }
     }
 
+    /// 2次元の簡便コンストラクタ(matmul等、行×列の出力を持つカーネル向け)。
+    ///
+    /// `cols`/`rows` は出力全体の要素数(スレッド総数)、`block_x`/`block_y` は
+    /// 1ワークグループ/1スレッドブロックあたりのスレッド数。
+    /// Vulkanバックエンドでは `grid` の値がそのまま `vkCmdDispatch` の
+    /// ワークグループ数になるため、シェーダの `local_size_x/y` と `block_x/y` を
+    /// 一致させる契約になっている。
+    pub fn grid2d(rows: u32, cols: u32, block_x: u32, block_y: u32) -> Self {
+        let groups_x = cols.div_ceil(block_x.max(1));
+        let groups_y = rows.div_ceil(block_y.max(1));
+        Self {
+            grid: (groups_x, groups_y, 1),
+            block: (block_x, block_y, 1),
+            shared_mem: 0,
+        }
+    }
+
     pub fn total_threads(&self) -> u64 {
         let g = self.grid.0 as u64 * self.grid.1 as u64 * self.grid.2 as u64;
         let b = self.block.0 as u64 * self.block.1 as u64 * self.block.2 as u64;

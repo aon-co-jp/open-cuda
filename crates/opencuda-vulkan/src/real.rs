@@ -284,10 +284,74 @@ impl VulkanDevice {
     }
 
     fn run_vector_add_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (a_buffer, b_buffer, c_buffer, n) = self.ensure_vector_add_args(args)?;
+        self.dispatch_spirv(spirv, entry, cfg, &[a_buffer, b_buffer, c_buffer], &n.to_ne_bytes())
+    }
+
+    /// `matmul` の引数契約を検証し、Vulkanバッファハンドルと push constant 用の
+    /// (m, k, n) を返す。CPU版 `examples/matmul` と同じ行優先(row-major)レイアウトを前提とする:
+    /// A は M行K列、B は K行N列、C は M行N列。
+    fn ensure_matmul_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer, u32, u32, u32)> {
+        if args.len() != 6 {
+            bail!("matmul expects 6 args: a, b, c, m, k, n");
+        }
+        let a = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 must be pointer"))?;
+        let b = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 must be pointer"))?;
+        let c = args[2].as_ptr().ok_or_else(|| anyhow!("arg2 must be pointer"))?;
+        let m = args[3].as_usize().ok_or_else(|| anyhow!("arg3 (m) must be usize/u32"))?;
+        let k = args[4].as_usize().ok_or_else(|| anyhow!("arg4 (k) must be usize/u32"))?;
+        let n = args[5].as_usize().ok_or_else(|| anyhow!("arg5 (n) must be usize/u32"))?;
+
+        let (abuf, _, _, alen, _, _) = self.get_allocation(a)?;
+        let (bbuf, _, _, blen, _, _) = self.get_allocation(b)?;
+        let (cbuf, _, _, clen, _, _) = self.get_allocation(c)?;
+
+        let f32_size = std::mem::size_of::<f32>();
+        let a_bytes = m.checked_mul(k).and_then(|v| v.checked_mul(f32_size)).ok_or_else(|| anyhow!("matmul A byte size overflow"))?;
+        let b_bytes = k.checked_mul(n).and_then(|v| v.checked_mul(f32_size)).ok_or_else(|| anyhow!("matmul B byte size overflow"))?;
+        let c_bytes = m.checked_mul(n).and_then(|v| v.checked_mul(f32_size)).ok_or_else(|| anyhow!("matmul C byte size overflow"))?;
+        if a_bytes > alen {
+            bail!("matmul buffer A too small: need {a_bytes} bytes, have {alen}");
+        }
+        if b_bytes > blen {
+            bail!("matmul buffer B too small: need {b_bytes} bytes, have {blen}");
+        }
+        if c_bytes > clen {
+            bail!("matmul buffer C too small: need {c_bytes} bytes, have {clen}");
+        }
+
+        let m_u32 = u32::try_from(m).context("matmul m does not fit in u32 push constant")?;
+        let k_u32 = u32::try_from(k).context("matmul k does not fit in u32 push constant")?;
+        let n_u32 = u32::try_from(n).context("matmul n does not fit in u32 push constant")?;
+        Ok((abuf, bbuf, cbuf, m_u32, k_u32, n_u32))
+    }
+
+    fn run_matmul_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (a_buffer, b_buffer, c_buffer, m, k, n) = self.ensure_matmul_args(args)?;
+        let mut push = Vec::with_capacity(12);
+        push.extend_from_slice(&m.to_ne_bytes());
+        push.extend_from_slice(&k.to_ne_bytes());
+        push.extend_from_slice(&n.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[a_buffer, b_buffer, c_buffer], &push)
+    }
+
+    /// SPIR-Vコンピュートシェーダを起動する共通経路。
+    ///
+    /// `buffers` の各要素は set=0 の連番 binding (STORAGE_BUFFER) に束ねられ、
+    /// `push_constants` は non-empty なら stage=COMPUTE のpush constant範囲として渡す。
+    /// `vector_add`(push=4byte, buffers=3) と `matmul`(push=12byte, buffers=3) はこの
+    /// 一本の経路を共有する。
+    fn dispatch_spirv(
+        &self,
+        spirv: &[u8],
+        entry: &str,
+        cfg: &LaunchConfig,
+        buffers: &[vk::Buffer],
+        push_constants: &[u8],
+    ) -> Result<()> {
         if !spirv.len().is_multiple_of(4) {
             bail!("SPIR-V byte length must be a multiple of 4");
         }
-        let (a_buffer, b_buffer, c_buffer, n) = self.ensure_vector_add_args(args)?;
         let words = bytes_to_u32_words(spirv)?;
 
         unsafe {
@@ -295,20 +359,21 @@ impl VulkanDevice {
             let shader_module = self.device.create_shader_module(&shader_info, None)
                 .context("vkCreateShaderModule failed")?;
 
-            let bindings = [
-                storage_binding(0),
-                storage_binding(1),
-                storage_binding(2),
-            ];
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> =
+                (0..buffers.len() as u32).map(storage_binding).collect();
             let set_layout_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
             let set_layout = self.device.create_descriptor_set_layout(&set_layout_info, None)
                 .context("vkCreateDescriptorSetLayout failed")?;
 
-            let push_ranges = [vk::PushConstantRange::builder()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .offset(0)
-                .size(std::mem::size_of::<u32>() as u32)
-                .build()];
+            let push_ranges = if push_constants.is_empty() {
+                Vec::new()
+            } else {
+                vec![vk::PushConstantRange::builder()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(0)
+                    .size(push_constants.len() as u32)
+                    .build()]
+            };
             let set_layouts = [set_layout];
             let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
                 .set_layouts(&set_layouts)
@@ -330,7 +395,7 @@ impl VulkanDevice {
 
             let pool_sizes = [vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 3,
+                descriptor_count: buffers.len() as u32,
             }];
             let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder()
                 .max_sets(1)
@@ -343,16 +408,15 @@ impl VulkanDevice {
             let descriptor_set = self.device.allocate_descriptor_sets(&alloc_info)
                 .context("vkAllocateDescriptorSets failed")?[0];
 
-            let infos = [
-                vk::DescriptorBufferInfo { buffer: a_buffer, offset: 0, range: vk::WHOLE_SIZE },
-                vk::DescriptorBufferInfo { buffer: b_buffer, offset: 0, range: vk::WHOLE_SIZE },
-                vk::DescriptorBufferInfo { buffer: c_buffer, offset: 0, range: vk::WHOLE_SIZE },
-            ];
-            let writes = [
-                descriptor_write(descriptor_set, 0, &infos[0..1]),
-                descriptor_write(descriptor_set, 1, &infos[1..2]),
-                descriptor_write(descriptor_set, 2, &infos[2..3]),
-            ];
+            let infos: Vec<vk::DescriptorBufferInfo> = buffers
+                .iter()
+                .map(|&buffer| vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE })
+                .collect();
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| descriptor_write(descriptor_set, i as u32, std::slice::from_ref(info)))
+                .collect();
             self.device.update_descriptor_sets(&writes, &[]);
 
             let alloc = vk::CommandBufferAllocateInfo::builder()
@@ -373,14 +437,15 @@ impl VulkanDevice {
                 &[descriptor_set],
                 &[],
             );
-            let n_bytes = n.to_ne_bytes();
-            self.device.cmd_push_constants(
-                cmd,
-                pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                &n_bytes,
-            );
+            if !push_constants.is_empty() {
+                self.device.cmd_push_constants(
+                    cmd,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push_constants,
+                );
+            }
             self.device.cmd_dispatch(cmd, cfg.grid.0, cfg.grid.1, cfg.grid.2);
             self.device.end_command_buffer(cmd).context("vkEndCommandBuffer failed")?;
 
@@ -497,7 +562,10 @@ impl GpuDevice for VulkanDevice {
         };
         match kernel.name.as_str() {
             "vector_add" | "vector_add_f32" => self.run_vector_add_spirv(spirv, &kernel.entry, cfg, args),
-            other => bail!("VulkanDevice v0.3.5 only implements vector_add/vector_add_f32; got `{other}`"),
+            "matmul" | "matmul_f32" => self.run_matmul_spirv(spirv, &kernel.entry, cfg, args),
+            other => bail!(
+                "VulkanDevice v0.4.0 only implements vector_add/vector_add_f32 and matmul/matmul_f32; got `{other}`"
+            ),
         }
     }
 

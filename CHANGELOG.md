@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.0
+
+### Added
+- Vulkan版 `matmul` の最小実装(`crates/opencuda-vulkan/src/real.rs`): `run_matmul_spirv` / `ensure_matmul_args` を追加し、`VulkanDevice::launch_kernel` が `matmul`/`matmul_f32` カーネルを受け付けるようにした。行優先(row-major)レイアウトで A(M×K)・B(K×N)・C(M×N) を扱い、push constantで (m, k, n) を渡す。
+- `vector_add` と `matmul` のパイプライン構築/ディスパッチ/後始末を共通化した `dispatch_spirv` ヘルパーを追加(記述量削減、正しさは実機で再検証済み)。
+- `opencuda-core::LaunchConfig::grid2d(rows, cols, block_x, block_y)` を追加。matmul等の2次元出力カーネル向けにワークグループ数を計算する。
+- `examples/matmul_vulkan_real`: CPUバックエンド(rayon naive matmul)と実Vulkan Compute(naive matmul shader)を同じ入力行列で実行し、ホスト側リファレンス値・CPU結果・Vulkan結果の3者を突き合わせる新サンプル。シェーダは `examples/matmul_vulkan_real/shaders/matmul.comp`(local_size 16x16)。
+- `tools/compile-vulkan-shaders.{ps1,cmd,sh}` が `vector_add.comp` と `matmul.comp` の両方をコンパイルするよう更新。
+
+### Verified
+- `cargo check --workspace --all-targets` / `cargo clippy --workspace --all-targets`: 警告・エラーなし。
+- `cargo test --workspace`: 全パス。
+- **実Vulkan環境あり(NVIDIA GeForce GT 730)**: `cargo run --release -p matmul_vulkan_real` で 64×64 * 64×64 の matmul を実行し、CPU結果・Vulkan結果・ホスト側リファレンス値が全て一致(誤差 1e-3 以内)することを確認。既存の `vector_add_vulkan_real` / `vulkan_info` も再実行し、`dispatch_spirv` へのリファクタ後も同じ結果になることを確認。
+- 性能計測は方針通り実施していない(正確性優先)。
+
 ## v0.3.6
 
 ### Changed
