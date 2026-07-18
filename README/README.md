@@ -100,7 +100,8 @@ This is the core of Phase 1: **validate the design on real hardware before buyin
    └──────────┴──────────┴──────────┴──────────┴──────────┘
                               │
         ┌──────────────────────────────────────────────┐
-        │  opencuda-blas      GEMM / Attention / Quant  │  ⏳ Phase 3
+        │  opencuda-blas      GEMM(CPU)/Attention(CPU)  │  🟡 Phase 3 (part 1)
+        │                     Quant / GPU paths         │  ⏳ Phase 3 (part 2)
         │  opencuda-multidev  Pipeline parallel / VRAM  │  ⏳ Phase 3
         └──────────────────────────────────────────────┘
 ```
@@ -123,7 +124,7 @@ opencuda/
 ├── crates/
 │   ├── opencuda-core/       backbone (traits, memory, kernel representation) ✅
 │   ├── opencuda-cpu/        CPU backend (rayon)                              ✅
-│   ├── opencuda-blas/       AI kernels (GEMM / Attention / quantization)     ⏳
+│   ├── opencuda-blas/       AI kernels (GEMM/Attention on CPU implemented; quant/GPU paths ⏳)  🟡
 │   └── opencuda-multidev/   multi-GPU partitioning and pipeline parallelism  ⏳
 └── examples/
     ├── vector_add/          C = A + B                                        ✅
@@ -146,7 +147,14 @@ opencuda/
   - [ ] Hook layer for major CUDA APIs (malloc/memcpy/free/launch)
   - [ ] NVIDIA / AMD backends
 - **Phase 3 (AI optimization)**
-  - [ ] `opencuda-blas`: GEMM / Flash Attention / quantization
+  - [x] `opencuda-blas`: `sgemm`'s `GemmPath::CpuNaive` path (a real kernel dispatched through
+        `opencuda_core::GpuDevice::launch_kernel`, computing `C = alpha*A·B + beta*C`; verified by 7 unit tests)
+  - [x] `opencuda-blas`: `scaled_dot_product_attention` (naive, non-tiled attention that actually
+        computes QKᵀ, softmax, and P·V. **This is not true Flash Attention** — no tiling, no online
+        softmax — so it is honestly named rather than called `flash_attention`, which remains a stub)
+  - [ ] `opencuda-blas`: GPU-vendor-specific paths (cuBLAS / rocBLAS / oneMKL / generic Vulkan)
+  - [ ] `opencuda-blas`: INT4/INT8 quantization (`quantize_int4`, still stubbed)
+  - [ ] `opencuda-blas`: true Flash Attention (tiled, online-softmax memory efficiency)
   - [ ] `opencuda-multidev`: pipeline parallelism and unified VRAM handling
   - [ ] Run LLM inference across two GPUs
 - **Phase 4 (extension)** — Intel oneAPI, nvcc-compatible driver, PyTorch backend

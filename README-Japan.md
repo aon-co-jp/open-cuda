@@ -210,7 +210,8 @@ SPIR-Vへコンパイルし、`VkShaderModule` → Compute Pipeline → Dispatch
    └──────────┴──────────┴──────────┴──────────┴──────────┘
                               │
         ┌──────────────────────────────────────────────┐
-        │  opencuda-blas      GEMM / Attention / Quant  │  ⏳ Phase 3
+        │  opencuda-blas      GEMM(CPU) / Attention(CPU)│  🟡 Phase 3前半
+        │                     / Quant・GPU経路           │  ⏳ Phase 3後半
         │  opencuda-multidev  Pipeline parallel / VRAM  │  ⏳ Phase 3
         └──────────────────────────────────────────────┘
 ```
@@ -237,7 +238,7 @@ opencuda/
 ├── crates/
 │   ├── opencuda-core/       背骨（trait・メモリ・カーネル表現）  ✅
 │   ├── opencuda-cpu/        CPUバックエンド（rayon）            ✅
-│   ├── opencuda-blas/       AIカーネル（GEMM/Attention/量子化）  ⏳
+│   ├── opencuda-blas/       AIカーネル（GEMM/Attention CPU実装済み・量子化/GPU経路は⏳）  🟡
 │   └── opencuda-multidev/   マルチGPU分割・パイプライン並列      ⏳
 └── examples/
     ├── vector_add/          C = A + B                          ✅
@@ -260,7 +261,14 @@ opencuda/
   - [ ] 主要 CUDA API（malloc/memcpy/free/launch）のフック層
   - [ ] NVIDIA / AMD バックエンド
 - **Phase 3（AI最適化）**
-  - [ ] `opencuda-blas`: GEMM / Flash Attention / 量子化
+  - [x] `opencuda-blas`: `sgemm`の`GemmPath::CpuNaive`経路（`opencuda_core::GpuDevice::launch_kernel`
+        経由の実カーネル、alpha/beta付きC=alpha*A·B+beta*Cを実装、単体テスト7件で検証済み）
+  - [x] `opencuda-blas`: `scaled_dot_product_attention`（素朴な非タイル化attention。
+        QKᵀ・softmax・P·Vを実際に計算。**真のFlash Attention(タイル化+オンラインsoftmax)ではない**、
+        誠実な命名として`flash_attention`という名前は使わずスタブとして残した）
+  - [ ] `opencuda-blas`: GPUベンダー別経路（cuBLAS/rocBLAS/oneMKL/Vulkan汎用）
+  - [ ] `opencuda-blas`: INT4/INT8量子化（`quantize_int4`、引き続きスタブ）
+  - [ ] `opencuda-blas`: 真のFlash Attention（タイル化・オンラインsoftmaxによるメモリ効率化）
   - [ ] `opencuda-multidev`: パイプライン並列・統合VRAM
   - [ ] LLM 推論を 2 枚の GPU にまたがって実行
 - **Phase 4（拡張）** — Intel oneAPI、nvcc 互換ドライバ、PyTorch backend
