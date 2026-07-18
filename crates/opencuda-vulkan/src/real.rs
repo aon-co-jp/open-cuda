@@ -38,9 +38,12 @@ pub struct VulkanDevice {
     _physical_device: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
-    _queue_family_index: u32,
+    queue_family_index: u32,
     command_pool: vk::CommandPool,
     info: DeviceInfo,
+    device_type: vk::PhysicalDeviceType,
+    api_version: u32,
+    driver_version: u32,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     allocations: Mutex<HashMap<u64, VulkanAllocation>>,
     next_handle: AtomicU64,
@@ -61,18 +64,36 @@ impl VulkanDevice {
             .api_version(vk::API_VERSION_1_1);
 
         let instance_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
-        let instance = unsafe { entry.create_instance(&instance_info, None) }
-            .context("vkCreateInstance failed")?;
+        let instance = unsafe { entry.create_instance(&instance_info, None) }.context(
+            "vkCreateInstance failed. Update the GPU driver, or verify the Vulkan Runtime/SDK install",
+        )?;
 
-        let physical_devices = unsafe { instance.enumerate_physical_devices() }
-            .context("vkEnumeratePhysicalDevices failed")?;
+        let physical_devices = match unsafe { instance.enumerate_physical_devices() }
+            .context("vkEnumeratePhysicalDevices failed")
+        {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { instance.destroy_instance(None) };
+                return Err(e);
+            }
+        };
         if physical_devices.is_empty() {
             unsafe { instance.destroy_instance(None) };
-            bail!("no Vulkan physical device found");
+            bail!(
+                "no Vulkan physical device found. Check that a GPU driver exposing Vulkan \
+                 (NVIDIA/AMD/Intel) is installed, and that no other process/VM is hiding the GPU"
+            );
         }
 
         let mut selected = None;
+        let mut seen_devices: Vec<String> = Vec::with_capacity(physical_devices.len());
         for &pd in &physical_devices {
+            let props = unsafe { instance.get_physical_device_properties(pd) };
+            let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            seen_devices.push(format!("{name} ({})", device_type_str(props.device_type)));
+
             let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
             if let Some((family_index, _)) = families
                 .iter()
@@ -88,7 +109,13 @@ impl VulkanDevice {
             Some(v) => v,
             None => {
                 unsafe { instance.destroy_instance(None) };
-                bail!("no Vulkan compute queue family found");
+                bail!(
+                    "no Vulkan compute queue family found on any enumerated device. \
+                     Enumerated devices: [{}]. A compute-capable queue family (VK_QUEUE_COMPUTE_BIT) \
+                     is required; this usually means the driver only exposes a graphics/present-only \
+                     queue, which is unexpected for a modern GPU driver",
+                    seen_devices.join(", ")
+                );
             }
         };
 
@@ -98,15 +125,32 @@ impl VulkanDevice {
             .queue_priorities(&priorities)
             .build()];
         let device_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
-        let device = unsafe { instance.create_device(physical_device, &device_info, None) }
-            .context("vkCreateDevice failed")?;
+        let device = match unsafe { instance.create_device(physical_device, &device_info, None) }
+            .context("vkCreateDevice failed")
+        {
+            Ok(d) => d,
+            Err(e) => {
+                unsafe { instance.destroy_instance(None) };
+                return Err(e);
+            }
+        };
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
         let pool_info = vk::CommandPoolCreateInfo::builder()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
-            .context("vkCreateCommandPool failed")?;
+        let command_pool = match unsafe { device.create_command_pool(&pool_info, None) }
+            .context("vkCreateCommandPool failed")
+        {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    device.destroy_device(None);
+                    instance.destroy_instance(None);
+                }
+                return Err(e);
+            }
+        };
 
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -122,7 +166,7 @@ impl VulkanDevice {
             _physical_device: physical_device,
             device,
             queue,
-            _queue_family_index: queue_family_index,
+            queue_family_index,
             command_pool,
             info: DeviceInfo {
                 id,
@@ -131,10 +175,27 @@ impl VulkanDevice {
                 total_memory,
                 compute_units: 1,
             },
+            device_type: props.device_type,
+            api_version: props.api_version,
+            driver_version: props.driver_version,
             memory_properties,
             allocations: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         }))
+    }
+
+    /// v0.3.6: `vulkan_info` 用の追加診断情報。
+    ///
+    /// `GpuDevice` トレイトの `DeviceInfo` はバックエンド共通の最小情報しか持たないため、
+    /// Vulkan固有の詳細（キューファミリ、デバイス種別、APIバージョン、ドライババージョン）は
+    /// `VulkanDevice` 側の専用メソッドとして公開する。
+    pub fn diagnostics(&self) -> VulkanDiagnostics {
+        VulkanDiagnostics {
+            queue_family_index: self.queue_family_index,
+            device_type: self.device_type,
+            api_version: self.api_version,
+            driver_version: self.driver_version,
+        }
     }
 
     fn get_allocation(&self, ptr: DevicePtr) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, usize, vk::DeviceSize, bool)> {
@@ -223,7 +284,7 @@ impl VulkanDevice {
     }
 
     fn run_vector_add_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
-        if spirv.len() % 4 != 0 {
+        if !spirv.len().is_multiple_of(4) {
             bail!("SPIR-V byte length must be a multiple of 4");
         }
         let (a_buffer, b_buffer, c_buffer, n) = self.ensure_vector_add_args(args)?;
@@ -469,6 +530,68 @@ pub fn enumerate_real(start_id: usize) -> Result<Vec<Arc<dyn GpuDevice>>> {
     Ok(vec![VulkanDevice::new(start_id)?])
 }
 
+/// Vulkan固有の診断情報（v0.3.6で `vulkan_info` の表示を厚くするために追加）。
+#[derive(Clone, Copy)]
+pub struct VulkanDiagnostics {
+    pub queue_family_index: u32,
+    pub device_type: vk::PhysicalDeviceType,
+    /// `VK_MAKE_API_VERSION` でエンコードされた生の値。
+    pub api_version: u32,
+    /// `VK_MAKE_API_VERSION` と同じエンコードだが、意味はベンダー依存
+    /// （NVIDIAは major(10)/minor(8)/patch(8)/build(6) の独自レイアウトを使う）。
+    pub driver_version: u32,
+}
+
+impl std::fmt::Debug for VulkanDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VulkanDiagnostics")
+            .field("queue_family_index", &self.queue_family_index)
+            .field("device_type", &self.device_type_str())
+            .field("api_version", &self.api_version_str())
+            .field("driver_version", &self.driver_version_str())
+            .finish()
+    }
+}
+
+impl VulkanDiagnostics {
+    pub fn device_type_str(&self) -> &'static str {
+        device_type_str(self.device_type)
+    }
+
+    /// `major.minor.patch` 形式。Vulkan標準エンコード（`VK_API_VERSION_*` マクロ相当）。
+    pub fn api_version_str(&self) -> String {
+        format!(
+            "{}.{}.{}",
+            vk::api_version_major(self.api_version),
+            vk::api_version_minor(self.api_version),
+            vk::api_version_patch(self.api_version)
+        )
+    }
+
+    /// 標準Vulkanエンコードでの `major.minor.patch` に加え、生の値も併記する。
+    /// NVIDIAドライバはこのフィールドを独自レイアウトで埋めるため、標準デコードが
+    /// 実際のドライババージョン表記（例: 5xx.xx）と一致しない場合がある。
+    pub fn driver_version_str(&self) -> String {
+        format!(
+            "{}.{}.{} (raw=0x{:08x})",
+            vk::api_version_major(self.driver_version),
+            vk::api_version_minor(self.driver_version),
+            vk::api_version_patch(self.driver_version),
+            self.driver_version
+        )
+    }
+}
+
+fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
+    match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "DISCRETE_GPU",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "INTEGRATED_GPU",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "VIRTUAL_GPU",
+        vk::PhysicalDeviceType::CPU => "CPU",
+        _ => "OTHER",
+    }
+}
+
 fn storage_binding(binding: u32) -> vk::DescriptorSetLayoutBinding {
     vk::DescriptorSetLayoutBinding::builder()
         .binding(binding)
@@ -488,7 +611,7 @@ fn descriptor_write(set: vk::DescriptorSet, binding: u32, info: &[vk::Descriptor
 }
 
 fn bytes_to_u32_words(bytes: &[u8]) -> Result<Vec<u32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         bail!("SPIR-V length must be multiple of 4");
     }
     Ok(bytes

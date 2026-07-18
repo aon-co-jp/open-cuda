@@ -245,4 +245,4 @@ pub fn compile_omniir_to_spirv_fixture(module: &IrModule) -> Result<Vec<u8>> {
 pub mod real;
 
 #[cfg(feature = "real-vulkan")]
-pub use real::{enumerate_real, VulkanDevice};
+pub use real::{enumerate_real, VulkanDevice, VulkanDiagnostics};

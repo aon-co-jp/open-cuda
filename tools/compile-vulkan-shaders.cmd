@@ -11,6 +11,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo glslc version:
+glslc --version
+
 glslc "%SRC%" -o "%OUT%"
 if errorlevel 1 exit /b %errorlevel%
 echo OK: compiled %SRC% -^> %OUT%

@@ -55,7 +55,9 @@ pub fn partition_layers(
             if i + 1 == devices.len() {
                 total_layers - offset
             } else {
-                ((total_layers as u128 * ratio) / total_mem) as usize
+                (total_layers as u128 * ratio)
+                    .checked_div(total_mem)
+                    .expect("total_mem != 0 in this branch") as usize
             }
         };
 

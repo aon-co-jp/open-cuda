@@ -89,7 +89,7 @@ impl IrModule {
 /// v0.2では `vector_add_f32` のみ。将来は命令列インタプリタまたはJITへ拡張する。
 pub fn lower_to_native(module: &IrModule) -> Result<CompiledKernel> {
     if module.ops.as_slice()
-        != &[IrOp::VectorAddF32 {
+        != [IrOp::VectorAddF32 {
             a_arg: 0,
             b_arg: 1,
             c_arg: 2,

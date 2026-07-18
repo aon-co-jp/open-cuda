@@ -8,5 +8,8 @@ if (-not (Get-Command glslc -ErrorAction SilentlyContinue)) {
     Write-Error "glslc が見つかりません。Vulkan SDK をインストールして、glslc に PATH を通して下さい。"
 }
 
+Write-Host "glslc version:"
+glslc --version
+
 glslc $src -o $out
 Write-Host "OK: compiled $src -> $out"

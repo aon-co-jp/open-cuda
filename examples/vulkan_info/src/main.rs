@@ -10,12 +10,17 @@ use opencuda_vulkan::VulkanDevice;
 fn main() -> Result<()> {
     let device = VulkanDevice::new(0)?;
     let info = device.info();
+    let diag = device.diagnostics();
 
     println!("OpenCUDA Vulkan info");
     println!("device: {}", info.name);
     println!("vendor: {:?}", info.vendor);
     println!("total_memory_bytes: {}", info.total_memory);
     println!("compute_units_reported: {}", info.compute_units);
+    println!("queue_family_index: {}", diag.queue_family_index);
+    println!("device_type: {}", diag.device_type_str());
+    println!("api_version: {}", diag.api_version_str());
+    println!("driver_version: {}", diag.driver_version_str());
     println!("OK: Vulkan loader, physical device, logical device, and compute queue are available");
     Ok(())
 }

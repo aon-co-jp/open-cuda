@@ -1,22 +1,16 @@
 # DEVELOPMENT NEXT
 
-## v0.3.5 現在地
+## v0.3.6 現在地
 
-v0.3.5 では、v0.3.4 で確認できた実機 Vulkan Compute `vector_add` 成功を受けて、配布物を使いやすく整理した。
+v0.3.6 では、実Vulkanのエラー診断とツールチェーン可視性を強化した。
 
-- `cargo check --workspace --all-targets` の対象に通常サンプル、Mock、実Vulkanサンプルを含める。
-- CPU Native、OmniIR、VulkanMock、実Vulkan `vector_add` の最小経路を維持。
-- PowerShell実行ポリシーで `.ps1` が止まるWindows環境向けに `.cmd` スクリプトを追加。
-- `VulkanDevice` の未使用フィールド警告を解消。
+- 実Vulkan `VulkanDevice::new` のエラー表示を改善（ヒント付き失敗理由、compute キュー不在時のデバイス列挙、`VkInstance`/`VkDevice` リーク防止の後始末）。
+- `vulkan_info` に queue family index、device type、API version、driver version を表示。
+- `tools/compile-vulkan-shaders.{ps1,cmd,sh}` 実行前に `glslc --version` を表示。
+- `cargo clippy --workspace --all-targets` の警告を0件に削減。
+- このセッションでは実Vulkan環境（NVIDIA GeForce GT 730）が利用可能で、`vulkan_info` と `vector_add_vulkan_real` の両方を実機で検証できた。
 
 ## 次の候補
-
-### v0.3.6
-
-- 実Vulkan `vector_add` のエラー表示をさらに改善。
-- `vulkan_info` に queue family index、device type、API version、driver version を表示。
-- `compile-vulkan-shaders` 実行前に `glslc --version` を表示。
-- `cargo clippy --workspace --all-targets` での警告削減。
 
 ### v0.4.0
 
