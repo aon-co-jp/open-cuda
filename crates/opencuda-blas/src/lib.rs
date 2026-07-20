@@ -123,9 +123,9 @@ fn launch_naive_gemm(
         anyhow::bail!("sgemm: c.len()={} != m*n={}", c.len(), m * n);
     }
 
-    let bytes_a = a.len() * std::mem::size_of::<f32>();
-    let bytes_b = b.len() * std::mem::size_of::<f32>();
-    let bytes_c = c.len() * std::mem::size_of::<f32>();
+    let bytes_a = std::mem::size_of_val(a);
+    let bytes_b = std::mem::size_of_val(b);
+    let bytes_c = std::mem::size_of_val(c);
 
     let da = ScopedAlloc::new(device, bytes_a)?;
     let db = ScopedAlloc::new(device, bytes_b)?;
@@ -204,6 +204,7 @@ fn launch_naive_gemm(
 /// 見つからなかった（`aruaru-llm` は `opencuda-core`/`opencuda-cpu` のみに
 /// 依存し、`opencuda-blas` 自体には依存していない）ため、破壊的変更の
 /// 影響範囲は無い。
+#[allow(clippy::too_many_arguments)]
 pub fn sgemm(
     device: &dyn GpuDevice,
     m: usize,
@@ -300,10 +301,183 @@ pub fn flash_attention(_device: &dyn GpuDevice) -> Result<()> {
     anyhow::bail!("flash_attention: true tiled/online-softmax flash attention not yet implemented; see scaled_dot_product_attention for the naive (non-tiled) implementation that IS implemented")
 }
 
-/// 量子化（INT4 / INT8、Phase 3）。aruaru-llm の Q4_K_M 系に対応予定。
-/// このパスでは対象外、引き続き未実装。
-pub fn quantize_int4(_device: &dyn GpuDevice) -> Result<()> {
-    anyhow::bail!("quantize_int4: not yet implemented (Phase 3)")
+/// INT4量子化済みテンソル（グループ単位の対称量子化）。
+///
+/// - `data`: 量子化値（4bit、[-8, 7]）を2値/バイトでニブルパックしたもの。
+///   偶数インデックスの値が下位ニブル、奇数インデックスが上位ニブル。
+///   各ニブルは「符号付き値 + 8」（0..=15）として格納する。
+/// - `scales`: グループごとのスケール（`dequant = (nibble - 8) as f32 * scale`）。
+/// - `group_size`: 1グループの要素数（スケールを共有する単位）。
+/// - `len`: 元の要素数（奇数の場合、最終バイトの上位ニブルはパディング）。
+#[derive(Debug, Clone)]
+pub struct QuantizedInt4Tensor {
+    pub data: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub group_size: usize,
+    pub len: usize,
+}
+
+/// INT8量子化済みテンソル（グループ単位の対称量子化、1値/バイト）。
+/// `dequant = q as f32 * scale`（qは[-127, 127]）。
+#[derive(Debug, Clone)]
+pub struct QuantizedInt8Tensor {
+    pub data: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub group_size: usize,
+    pub len: usize,
+}
+
+/// グループごとのスケールを計算する（`max_abs / q_max`）。全要素0の
+/// グループはスケール0とし、量子化値も0になる（0除算を避けるため
+/// 量子化側でスケール0を特別扱いする）。
+fn group_scales(input: &[f32], group_size: usize, q_max: f32) -> Vec<f32> {
+    input
+        .par_chunks(group_size)
+        .map(|chunk| {
+            let max_abs = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            if max_abs == 0.0 {
+                0.0
+            } else {
+                max_abs / q_max
+            }
+        })
+        .collect()
+}
+
+/// 要素ごとの対称量子化をデバイスカーネルとして起動する共通部。
+/// 出力は1値/バイトの符号付き量子化値（i8をu8バッファとして扱う）。
+/// INT4のニブルパッキングはバイト共有による書き込み競合を避けるため
+/// ホスト側で行う（カーネルは常に1値/バイトで書く）。
+fn launch_quantize_kernel(
+    device: &dyn GpuDevice,
+    input: &[f32],
+    scales: &[f32],
+    group_size: usize,
+    q_min: f32,
+    q_max: f32,
+) -> Result<Vec<i8>> {
+    let len = input.len();
+    let bytes_in = std::mem::size_of_val(input);
+    let bytes_scales = std::mem::size_of_val(scales);
+
+    let din = ScopedAlloc::new(device, bytes_in)?;
+    let dscales = ScopedAlloc::new(device, bytes_scales)?;
+    let dout = ScopedAlloc::new(device, len)?;
+
+    device.memcpy_h2d(din.ptr(), f32_to_bytes(input))?;
+    device.memcpy_h2d(dscales.ptr(), f32_to_bytes(scales))?;
+
+    let kernel = CompiledKernel::native("quantize_symmetric", move |ctx: ThreadCtx, args: &[ResolvedArg]| {
+        let idx = ctx.global_id_x() as usize;
+        let len = args[3].as_usize().unwrap();
+        if idx >= len {
+            return;
+        }
+        let group_size = args[4].as_usize().unwrap();
+        let q_min = args[5].as_f32().unwrap();
+        let q_max = args[6].as_f32().unwrap();
+        let (in_ptr, _) = args[0].as_ptr().unwrap();
+        let (scales_ptr, _) = args[1].as_ptr().unwrap();
+        let (out_ptr, _) = args[2].as_ptr().unwrap();
+        unsafe {
+            let x = (in_ptr as *const f32).add(idx).read();
+            let scale = (scales_ptr as *const f32).add(idx / group_size).read();
+            let q = if scale == 0.0 { 0.0 } else { (x / scale).round().clamp(q_min, q_max) };
+            (out_ptr as *mut i8).add(idx).write(q as i8);
+        }
+    });
+
+    let cfg = LaunchConfig::linear(len as u32, 256);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(din.ptr()),
+            KernelArg::Ptr(dscales.ptr()),
+            KernelArg::Ptr(dout.ptr()),
+            KernelArg::Usize(len),
+            KernelArg::Usize(group_size),
+            KernelArg::F32(q_min),
+            KernelArg::F32(q_max),
+        ],
+    )?;
+    device.synchronize()?;
+
+    let mut out = vec![0i8; len];
+    // SAFETY: i8スライスをu8スライスとして受けるだけ（f32_to_bytesと同じ最小パターン）。
+    let out_bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, len) };
+    device.memcpy_d2h(out_bytes, dout.ptr())?;
+    Ok(out)
+}
+
+fn validate_quantize_args(input: &[f32], group_size: usize) -> Result<()> {
+    if input.is_empty() {
+        anyhow::bail!("quantize: input must not be empty");
+    }
+    if group_size == 0 {
+        anyhow::bail!("quantize: group_size must be > 0");
+    }
+    Ok(())
+}
+
+/// INT4量子化（グループ単位の対称量子化、Phase 3）。
+///
+/// llama.cpp系のQ4量子化と同じ発想の「グループごとにスケールを持つ
+/// 対称量子化」: 各グループの`max_abs / 7`をスケールとし、
+/// `round(x / scale)`を[-7, 7]へクランプして4bit（+8オフセットの
+/// ニブル）に格納する。要素ごとの量子化は`GpuDevice::launch_kernel`経由の
+/// 実カーネルディスパッチで行い（CPUバックエンドではrayon並列）、
+/// ニブルパッキング（2値/バイト）はバイト共有の書き込み競合を避けるため
+/// ホスト側で行う。
+///
+/// 旧シグネチャ（`quantize_int4(device) -> Result<()>`）は入力を受け取る
+/// 手段が無いスタブだった。`sgemm`のシグネチャ修正と同じ経緯で、実データを
+/// 受け取る形へ変更した（ワークスペース内外に旧シグネチャの呼び出し元は
+/// 存在しない）。
+pub fn quantize_int4(device: &dyn GpuDevice, input: &[f32], group_size: usize) -> Result<QuantizedInt4Tensor> {
+    validate_quantize_args(input, group_size)?;
+    // 対称レンジ[-7, 7]を使う（-8を許すとmax_abs側の符号によって精度が
+    // 非対称になるため、Q4系の慣例に合わせて±7で対称にする）。
+    let scales = group_scales(input, group_size, 7.0);
+    let q = launch_quantize_kernel(device, input, &scales, group_size, -7.0, 7.0)?;
+
+    // ニブルパック: 偶数idx→下位、奇数idx→上位。格納値は q + 8（0..=15）。
+    let mut data = vec![0u8; input.len().div_ceil(2)];
+    for (i, &v) in q.iter().enumerate() {
+        let nibble = (v + 8) as u8 & 0x0F;
+        if i % 2 == 0 {
+            data[i / 2] |= nibble;
+        } else {
+            data[i / 2] |= nibble << 4;
+        }
+    }
+    Ok(QuantizedInt4Tensor { data, scales, group_size, len: input.len() })
+}
+
+/// [`quantize_int4`]の逆変換（ホスト側）。
+pub fn dequantize_int4(t: &QuantizedInt4Tensor) -> Vec<f32> {
+    (0..t.len)
+        .map(|i| {
+            let byte = t.data[i / 2];
+            let nibble = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            let q = nibble as i32 - 8;
+            q as f32 * t.scales[i / t.group_size]
+        })
+        .collect()
+}
+
+/// INT8量子化（グループ単位の対称量子化、Phase 3）。
+/// スケールは`max_abs / 127`、量子化値は[-127, 127]（1値/バイト）。
+pub fn quantize_int8(device: &dyn GpuDevice, input: &[f32], group_size: usize) -> Result<QuantizedInt8Tensor> {
+    validate_quantize_args(input, group_size)?;
+    let scales = group_scales(input, group_size, 127.0);
+    let data = launch_quantize_kernel(device, input, &scales, group_size, -127.0, 127.0)?;
+    Ok(QuantizedInt8Tensor { data, scales, group_size, len: input.len() })
+}
+
+/// [`quantize_int8`]の逆変換（ホスト側）。
+pub fn dequantize_int8(t: &QuantizedInt8Tensor) -> Vec<f32> {
+    (0..t.len).map(|i| t.data[i] as f32 * t.scales[i / t.group_size]).collect()
 }
 
 #[cfg(test)]
@@ -417,5 +591,94 @@ mod tests {
         let k = vec![1.0, 1.0, 1.0, 1.0];
         let v = vec![1.0, 1.0, 1.0, 1.0];
         assert!(scaled_dot_product_attention(device.as_ref(), &q, &k, &v, 2, 2).is_err());
+    }
+
+    #[test]
+    fn quantize_int4_roundtrip_error_is_bounded_by_half_scale() {
+        // 対称量子化の理論誤差上限は scale/2。グループごとにそれを検証する。
+        let device = cpu_device();
+        let input: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.37 - 11.0) * 0.5).collect();
+        let group_size = 16;
+        let t = quantize_int4(device.as_ref(), &input, group_size).unwrap();
+        let restored = dequantize_int4(&t);
+        assert_eq!(restored.len(), input.len());
+        for (i, (&x, &r)) in input.iter().zip(restored.iter()).enumerate() {
+            let scale = t.scales[i / group_size];
+            assert!(
+                (x - r).abs() <= scale * 0.5 + 1e-6,
+                "idx {i}: x={x}, restored={r}, scale={scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_int4_packs_two_values_per_byte_with_odd_len_padding() {
+        let device = cpu_device();
+        let input = vec![7.0, -7.0, 0.0, 3.5, 1.0]; // 奇数個（5要素→3バイト）
+        let t = quantize_int4(device.as_ref(), &input, input.len()).unwrap();
+        assert_eq!(t.data.len(), 3);
+        assert_eq!(t.len, 5);
+        // scale = 7.0/7 = 1.0。q = [7, -7, 0, 4(3.5切り上げ丸め), 1]
+        // 格納ニブル(+8): [15, 1, 8, 12, 9]
+        assert_eq!(t.data[0], (1 << 4) | 15); // 下位=15(q=7), 上位=1(q=-7)
+        assert_eq!(t.data[1], (12 << 4) | 8); // 下位=8(q=0), 上位=12(q=4)
+        assert_eq!(t.data[2], 9); // 下位=9(q=1), 上位=パディング0
+        let restored = dequantize_int4(&t);
+        assert_eq!(restored, vec![7.0, -7.0, 0.0, 4.0, 1.0]);
+    }
+
+    #[test]
+    fn quantize_int4_all_zero_group_stays_zero() {
+        let device = cpu_device();
+        let input = vec![0.0f32; 8];
+        let t = quantize_int4(device.as_ref(), &input, 4).unwrap();
+        assert_eq!(t.scales, vec![0.0, 0.0]);
+        assert_eq!(dequantize_int4(&t), input);
+    }
+
+    #[test]
+    fn quantize_int4_respects_group_boundaries() {
+        // グループ0は大きな値、グループ1は小さな値。グループ1のスケールが
+        // グループ0に汚染されない(=小さな値の分解能が保たれる)ことを検証。
+        let device = cpu_device();
+        let input = vec![700.0, -350.0, 0.007, -0.0035];
+        let t = quantize_int4(device.as_ref(), &input, 2).unwrap();
+        assert!((t.scales[0] - 100.0).abs() < 1e-4);
+        assert!((t.scales[1] - 0.001).abs() < 1e-7);
+        let restored = dequantize_int4(&t);
+        assert!((restored[2] - 0.007).abs() < 0.001 * 0.5 + 1e-7);
+    }
+
+    #[test]
+    fn quantize_int8_roundtrip_error_is_bounded_by_half_scale() {
+        let device = cpu_device();
+        let input: Vec<f32> = (0..100).map(|i| ((i as f32) - 50.0) * 1.3).collect();
+        let group_size = 25;
+        let t = quantize_int8(device.as_ref(), &input, group_size).unwrap();
+        let restored = dequantize_int8(&t);
+        for (i, (&x, &r)) in input.iter().zip(restored.iter()).enumerate() {
+            let scale = t.scales[i / group_size];
+            assert!((x - r).abs() <= scale * 0.5 + 1e-6, "idx {i}: x={x}, restored={r}");
+        }
+    }
+
+    #[test]
+    fn quantize_int8_is_more_precise_than_int4_on_same_input() {
+        let device = cpu_device();
+        let input: Vec<f32> = (0..32).map(|i| (i as f32 * 0.911).sin() * 10.0).collect();
+        let t4 = quantize_int4(device.as_ref(), &input, 32).unwrap();
+        let t8 = quantize_int8(device.as_ref(), &input, 32).unwrap();
+        let err4: f32 = input.iter().zip(dequantize_int4(&t4)).map(|(x, r)| (x - r).abs()).sum();
+        let err8: f32 = input.iter().zip(dequantize_int8(&t8)).map(|(x, r)| (x - r).abs()).sum();
+        assert!(err8 < err4, "int8 total err {err8} should be < int4 total err {err4}");
+    }
+
+    #[test]
+    fn quantize_rejects_empty_input_and_zero_group_size() {
+        let device = cpu_device();
+        assert!(quantize_int4(device.as_ref(), &[], 4).is_err());
+        assert!(quantize_int4(device.as_ref(), &[1.0], 0).is_err());
+        assert!(quantize_int8(device.as_ref(), &[], 4).is_err());
+        assert!(quantize_int8(device.as_ref(), &[1.0], 0).is_err());
     }
 }

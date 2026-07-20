@@ -139,8 +139,10 @@ opencuda/
   - [x] `opencuda-core`: traits, two-layer memory, `KernelSource`, `DeviceRegistry`
   - [x] `opencuda-cpu`: rayon multi-threaded execution
   - [x] `examples/vector_add`, `examples/matmul` (running on CPU)
-  - [ ] `opencuda-vulkan`: run SPIR-V kernels through Vulkan Compute
-  - [ ] Confirm that the same binary runs on NVIDIA / AMD / Intel GPUs
+  - [x] `opencuda-vulkan`: run SPIR-V kernels through Vulkan Compute (real `ash`-based
+        Vulkan backend; `vector_add` and `matmul` both verified on real hardware, see v0.4.0)
+  - [ ] Confirm that the same binary runs on NVIDIA / AMD / Intel GPUs (only verified on
+        NVIDIA so far)
 - **Phase 2 (CUDA compatibility)**
   - [ ] OmniIR (common intermediate representation) and SPIR-V output
   - [ ] CUDA C++ subset parser → OmniIR
@@ -153,7 +155,9 @@ opencuda/
         computes QKᵀ, softmax, and P·V. **This is not true Flash Attention** — no tiling, no online
         softmax — so it is honestly named rather than called `flash_attention`, which remains a stub)
   - [ ] `opencuda-blas`: GPU-vendor-specific paths (cuBLAS / rocBLAS / oneMKL / generic Vulkan)
-  - [ ] `opencuda-blas`: INT4/INT8 quantization (`quantize_int4`, still stubbed)
+  - [x] `opencuda-blas`: INT4/INT8 quantization (`quantize_int4`/`quantize_int8`, group-wise
+        symmetric quantization; element-wise quantization dispatched as a real kernel through
+        `GpuDevice::launch_kernel`, nibble-packing done host-side; verified by 8 unit tests)
   - [ ] `opencuda-blas`: true Flash Attention (tiled, online-softmax memory efficiency)
   - [ ] `opencuda-multidev`: pipeline parallelism and unified VRAM handling
   - [ ] Run LLM inference across two GPUs

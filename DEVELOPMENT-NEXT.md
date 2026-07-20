@@ -1,5 +1,23 @@
 # DEVELOPMENT NEXT
 
+## v0.4.1 現在地(未リリース)
+
+`opencuda-blas`にINT4/INT8量子化(`quantize_int4`/`quantize_int8`)を実装した。
+グループ単位の対称量子化で、要素ごとの量子化演算は`GpuDevice::launch_kernel`
+経由の実カーネルディスパッチ(CPUバックエンドでは`rayon`並列)、INT4のニブル
+パッキング(2値/バイト)はバイト共有の書き込み競合を避けるためホスト側で行う。
+`dequantize_int4`/`dequantize_int8`による逆変換も実装し、ラウンドトリップ誤差・
+奇数長パディング・全ゼログループ・グループ境界・INT4よりINT8が高精度なこと等を
+検証する単体テスト8件を追加(`opencuda-blas`のテストは計14件、全green)。
+`cargo clippy --workspace --all-targets`は引き続き警告0件。
+
+### 正直な制限
+
+- `quantize_int4`/`quantize_int8`はCPUバックエンド上の実装のみ。GPU側
+  (Vulkan/CUDA/ROCm)カーネルとしての量子化はまだ無い。
+- aruaru-llmの`scoring.rs`はまだこの量子化APIを使っていない(bag-of-words
+  ドット積スコアリングのまま)。
+
 ## v0.4.0 現在地
 
 v0.4.0 では、ローカルLLM推論の中核演算である matmul を実Vulkanで動かした。

@@ -267,7 +267,9 @@ opencuda/
         QKᵀ・softmax・P·Vを実際に計算。**真のFlash Attention(タイル化+オンラインsoftmax)ではない**、
         誠実な命名として`flash_attention`という名前は使わずスタブとして残した）
   - [ ] `opencuda-blas`: GPUベンダー別経路（cuBLAS/rocBLAS/oneMKL/Vulkan汎用）
-  - [ ] `opencuda-blas`: INT4/INT8量子化（`quantize_int4`、引き続きスタブ）
+  - [x] `opencuda-blas`: INT4/INT8量子化（`quantize_int4`/`quantize_int8`、グループ単位対称量子化、
+        要素ごとの量子化は`GpuDevice::launch_kernel`経由の実カーネルディスパッチ、
+        ニブルパッキングはホスト側。単体テスト8件で検証済み）
   - [ ] `opencuda-blas`: 真のFlash Attention（タイル化・オンラインsoftmaxによるメモリ効率化）
   - [ ] `opencuda-multidev`: パイプライン並列・統合VRAM
   - [ ] LLM 推論を 2 枚の GPU にまたがって実行
@@ -320,6 +322,15 @@ OpenCUDA v0.3.5 は「本物Vulkan実装」の直前に必要な、GPUなしで�
 - `CompiledKernel::omniir(...)`: core に OmniIR カーネル生成APIを追加。
 - `vector_add_omniir`: 同じ `IrModule::vector_add_f32()` を CPU Native と VulkanMock の両方で検証。
 - `opencuda-vulkan`: `KernelSource::OmniIr` を受け取り、v0.3.5 の fixture SPIR-V 経路へ下げるシミュレーションを追加。
+
+## v0.4.1 で追加したもの（未リリース）
+
+- `opencuda-blas`: `quantize_int4`/`quantize_int8` を実装。グループ単位の対称量子化
+  （`scale = max_abs / q_max`、INT4は±7、INT8は±127）で、要素ごとの量子化は
+  `GpuDevice::launch_kernel` 経由の実カーネル（CPUバックエンドでは`rayon`並列）。
+  INT4のニブルパッキング（2値/バイト）はバイト共有の書き込み競合を避けるためホスト側で行う。
+  `dequantize_int4`/`dequantize_int8` で逆変換も実装。単体テスト8件（ラウンドトリップ誤差の
+  範囲検証、奇数長パディング、全ゼログループ、グループ境界、INT4よりINT8が高精度なこと等）で検証済み。
 
 ### 正直な制限
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.4.1 (未リリース)
+
+### Added
+- `opencuda-blas`: `quantize_int4`/`quantize_int8`を実装(`crates/opencuda-blas/src/lib.rs`)。
+  グループ単位の対称量子化(`scale = max_abs / q_max`、INT4は±7、INT8は±127)。
+  要素ごとの量子化演算は`GpuDevice::launch_kernel`経由の実カーネルディスパッチ
+  (CPUバックエンドでは`rayon`並列)で行い、INT4のニブルパッキング(2値/バイト)は
+  バイト共有の書き込み競合を避けるためホスト側で行う。`QuantizedInt4Tensor`/
+  `QuantizedInt8Tensor`と、対応する`dequantize_int4`/`dequantize_int8`も追加。
+- 単体テスト8件を追加(ラウンドトリップ誤差の範囲検証、奇数長パディング、
+  全ゼログループ、グループ境界、空入力/group_size=0の拒否、INT4よりINT8が
+  高精度なこと)。`opencuda-blas`のテストは計14件、全green。
+
+### Verified
+- `cargo build --workspace --all-targets` / `cargo test --workspace`: 全パス。
+- `cargo clippy --workspace --all-targets`: 警告0件(既存の`manual_slice_size_calculation`
+  ×3・`too_many_arguments`×1を`sgemm`/`launch_naive_gemm`と同じ`size_of_val`/
+  `#[allow]`パターンで解消)。
+
+### 正直な制限
+- CPUバックエンドのみ。GPU側(Vulkan/CUDA/ROCm)量子化カーネルは未実装。
+- `aruaru-llm`はまだこのAPIを利用していない。
+
 ## v0.4.0
 
 ### Added
