@@ -224,6 +224,65 @@ pub fn sgemm(
     }
 }
 
+/// `GemmPath::VulkanGeneric` の実装: Vulkan Compute 上で naive matmul を
+/// 実行する（`C = A・B`、alpha/beta スケーリングは無し — シェーダ側が
+/// 対応していないため。必要ならホスト側で `sgemm` と同様に別途スケールする）。
+///
+/// `spirv` には事前コンパイル済みの matmul シェーダのバイト列を渡す
+/// （`crates/opencuda-blas/shaders/matmul.comp` を `glslc` 等でコンパイルした
+/// ものと同一契約。`*.spv` はビルド成果物のためリポジトリでは
+/// `.gitignore`（`**/*.spv`）で追跡していない — `examples/matmul_vulkan_real`
+/// や `tools/compile-vulkan-shaders.{ps1,cmd,sh}` と同じ理由・同じ運用。
+/// `include_bytes!` で埋め込むと、シェーダを事前コンパイルしていない
+/// クローン直後の環境で `cargo build` 自体が壊れてしまうため、あえて
+/// 呼び出し側にバイト列を渡させる設計にしてある）。
+///
+/// `device` には `opencuda-vulkan::real::VulkanDevice`（`real-vulkan`
+/// feature 有効時）のような、SpirVカーネルの `"matmul"` エントリを
+/// 実行できる `GpuDevice` 実装を渡す。CPUバックエンド（`opencuda-cpu`）
+/// はSpirVカーネルを実行できないため、この関数をCPUデバイスに渡すと
+/// エラーになる（[`sgemm`] の `GemmPath::CpuNaive` を使うこと）。
+///
+/// `a` は `m x k`、`b` は `k x n`（いずれも行優先）。ワークグループサイズは
+/// シェーダの `local_size_x/y = 16` に合わせて `LaunchConfig::grid2d` で
+/// `16x16` を指定する（`examples/matmul_vulkan_real` と同じ契約）。
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_vulkan_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize, a: &[f32], b: &[f32], spirv: &[u8]) -> Result<Vec<f32>> {
+    if a.len() != m * k {
+        anyhow::bail!("sgemm_vulkan_generic: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    if b.len() != k * n {
+        anyhow::bail!("sgemm_vulkan_generic: b.len()={} != k*n={}", b.len(), k * n);
+    }
+
+    let da = ScopedAlloc::new(device, std::mem::size_of_val(a))?;
+    let db = ScopedAlloc::new(device, std::mem::size_of_val(b))?;
+    let dc = ScopedAlloc::new(device, m * n * std::mem::size_of::<f32>())?;
+
+    device.memcpy_h2d(da.ptr(), f32_to_bytes(a))?;
+    device.memcpy_h2d(db.ptr(), f32_to_bytes(b))?;
+
+    let kernel = CompiledKernel::spirv("matmul", "main", spirv);
+    let cfg = LaunchConfig::grid2d(m as u32, n as u32, 16, 16);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(da.ptr()),
+            KernelArg::Ptr(db.ptr()),
+            KernelArg::Ptr(dc.ptr()),
+            KernelArg::Usize(m),
+            KernelArg::Usize(k),
+            KernelArg::Usize(n),
+        ],
+    )?;
+    device.synchronize()?;
+
+    let mut c = vec![0.0f32; m * n];
+    device.memcpy_d2h(f32_from_bytes_mut(&mut c), dc.ptr())?;
+    Ok(c)
+}
+
 /// 素朴な（非Flash）scaled dot-product attention。
 ///
 /// `q`/`k`/`v` はいずれも `seq_len x head_dim`（行優先、単一ヘッド分）。
@@ -294,11 +353,120 @@ pub fn scaled_dot_product_attention(
     Ok(output)
 }
 
-/// 真の Flash Attention（オンラインsoftmax + タイル化によりスコア行列を
-/// 全展開しない）は未実装（Phase 3の次増分）。
-/// 素朴な非タイル化実装は [`scaled_dot_product_attention`] を参照。
-pub fn flash_attention(_device: &dyn GpuDevice) -> Result<()> {
-    anyhow::bail!("flash_attention: true tiled/online-softmax flash attention not yet implemented; see scaled_dot_product_attention for the naive (non-tiled) implementation that IS implemented")
+/// 真の Flash Attention（タイル化 + オンラインsoftmax）。
+///
+/// [`scaled_dot_product_attention`] との違い: あちらは `seq_len x seq_len`
+/// の `scores`/`probs` 行列をまるごとメモリに展開してから softmax を取るが、
+/// こちらは Q を `Br` 行、K/V を `Bc` 行のブロックに分割し、ブロックごとに
+/// 部分的な attention スコアだけを計算・破棄しながら、実行中の最大値
+/// (`m_i`)・実行中の指数和 (`l_i`)・実行中の出力累積 (`acc`) だけを
+/// 保持する「オンラインsoftmax」で結果を組み立てる（Dao et al. 2022,
+/// FlashAttention のアルゴリズム1に相当）。これにより、どの時点でも
+/// メモリ上に存在するスコア行列は最大でも `Br x Bc` のブロック分だけで済み、
+/// `seq_len x seq_len` の全展開が要らない。
+///
+/// この実装は純粋なホスト側（CPU）Rustコードで、`GpuDevice` のカーネル
+/// ディスパッチは使わない（`launch_kernel`/`memcpy` 等を挟まないぶん
+/// タイル化アルゴリズムの正しさそのものに焦点を当てた実装で、GPU向け
+/// カーネル化は別増分）。そのため他の関数と異なり `device` 引数を取らない。
+///
+/// `q`/`k`/`v` はいずれも `seq_len x head_dim`（行優先、単一ヘッド分）。
+/// `block_size` は Q 側のブロック行数(`Br`)にも K/V 側のブロック行数(`Bc`)
+/// にも使う（両方同じ値を使う簡易版。`seq_len` を割り切らなくてもよい —
+/// 最終ブロックは残り行数に切り詰める）。`block_size == 0` はエラー。
+///
+/// 数学的には [`scaled_dot_product_attention`] と全く同じ結果を返す
+/// （タイル化とオンラインsoftmaxは結果を変えない、純粋なメモリアクセス
+/// パターンの最適化のため）。それは本クレートのテストで実際に検証している。
+pub fn flash_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+) -> Result<Vec<f32>> {
+    if q.len() != seq_len * head_dim {
+        anyhow::bail!("flash_attention: q.len()={} != seq_len*head_dim={}", q.len(), seq_len * head_dim);
+    }
+    if k.len() != seq_len * head_dim {
+        anyhow::bail!("flash_attention: k.len()={} != seq_len*head_dim={}", k.len(), seq_len * head_dim);
+    }
+    if v.len() != seq_len * head_dim {
+        anyhow::bail!("flash_attention: v.len()={} != seq_len*head_dim={}", v.len(), seq_len * head_dim);
+    }
+    if block_size == 0 {
+        anyhow::bail!("flash_attention: block_size must be > 0");
+    }
+
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    // Qの各行ブロックは他の行ブロックと完全に独立に計算できるため、rayonで
+    // 行ブロック単位に並列化する(ブロック内部はシーケンシャル、オンライン
+    // softmaxの漸化式そのままの実装)。
+    let row_blocks: Vec<(usize, usize)> = (0..seq_len)
+        .step_by(block_size)
+        .map(|start| (start, (start + block_size).min(seq_len)))
+        .collect();
+
+    let mut output = vec![0.0f32; seq_len * head_dim];
+    output
+        .par_chunks_mut(head_dim)
+        .enumerate()
+        .try_for_each(|(row, out_row)| -> Result<()> {
+            // このQ行が属するブロック開始位置は使わない(行単位で独立に
+            // オンラインsoftmaxを回すため)。ブロック分割はK/V側にのみ適用する。
+            let q_row = &q[row * head_dim..(row + 1) * head_dim];
+
+            // オンラインsoftmaxの実行中状態: 最大値・指数和・重み付き累積出力。
+            let mut m_i = f32::NEG_INFINITY;
+            let mut l_i = 0.0f32;
+            let mut acc = vec![0.0f32; head_dim];
+
+            for &(kv_start, kv_end) in &row_blocks {
+                let bc = kv_end - kv_start;
+
+                // このK/Vブロックに対するスコア: s_j = scale * q_row・k_j
+                let mut block_scores = vec![0.0f32; bc];
+                for (j, score) in block_scores.iter_mut().enumerate() {
+                    let k_row = &k[(kv_start + j) * head_dim..(kv_start + j + 1) * head_dim];
+                    let dot: f32 = q_row.iter().zip(k_row.iter()).map(|(a, b)| a * b).sum();
+                    *score = dot * scale;
+                }
+
+                let block_max = block_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let new_m = m_i.max(block_max);
+
+                // 既存の累積値を新しい最大値基準へ再スケール(オンラインsoftmaxの核心)。
+                let correction = if m_i == f32::NEG_INFINITY { 0.0 } else { (m_i - new_m).exp() };
+                l_i *= correction;
+                for a in acc.iter_mut() {
+                    *a *= correction;
+                }
+
+                // このブロック分の寄与を加算。
+                let mut block_l = 0.0f32;
+                for (j, &s) in block_scores.iter().enumerate() {
+                    let p = (s - new_m).exp();
+                    block_l += p;
+                    let v_row = &v[(kv_start + j) * head_dim..(kv_start + j + 1) * head_dim];
+                    for (a, &vv) in acc.iter_mut().zip(v_row.iter()) {
+                        *a += p * vv;
+                    }
+                }
+                l_i += block_l;
+                m_i = new_m;
+            }
+
+            if l_i > 0.0 {
+                for (o, a) in out_row.iter_mut().zip(acc.iter()) {
+                    *o = a / l_i;
+                }
+            }
+            Ok(())
+        })?;
+
+    Ok(output)
 }
 
 /// INT4量子化済みテンソル（グループ単位の対称量子化）。
@@ -671,6 +839,130 @@ mod tests {
         let err4: f32 = input.iter().zip(dequantize_int4(&t4)).map(|(x, r)| (x - r).abs()).sum();
         let err8: f32 = input.iter().zip(dequantize_int8(&t8)).map(|(x, r)| (x - r).abs()).sum();
         assert!(err8 < err4, "int8 total err {err8} should be < int4 total err {err4}");
+    }
+
+    #[test]
+    fn sgemm_vulkan_generic_matches_cpu_naive_on_real_hardware() {
+        // このテストは実Vulkan環境(このマシンではNVIDIA GeForce GT 730で
+        // `vulkaninfo --summary`で実機確認済み)と、事前コンパイル済みの
+        // matmul.spv(`examples/matmul_vulkan_real/shaders/matmul.spv`、
+        // `tools/compile-vulkan-shaders.*`で生成、.gitignoreの対象)の
+        // 両方が必要。どちらか欠けている環境(CI等)では誤魔化さず
+        // テストをスキップする(assertを偽装しない方針)。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping sgemm_vulkan_generic test: matmul.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping sgemm_vulkan_generic test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+
+        let m = 8;
+        let k = 6;
+        let n = 5;
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32).collect();
+
+        let mut c_cpu = vec![0.0f32; m * n];
+        let cpu_device = cpu_device();
+        sgemm(cpu_device.as_ref(), m, k, n, 1.0, &a, &b, 0.0, &mut c_cpu).unwrap();
+
+        let c_vulkan = sgemm_vulkan_generic(vulkan_device.as_ref(), m, k, n, &a, &b, &spirv).unwrap();
+
+        assert_eq!(c_vulkan.len(), c_cpu.len());
+        for (i, (&gv, &gc)) in c_vulkan.iter().zip(c_cpu.iter()).enumerate() {
+            assert!((gv - gc).abs() < 1e-3, "idx {i}: vulkan={gv}, cpu={gc}");
+        }
+    }
+
+    #[test]
+    fn flash_attention_matches_naive_attention_on_fixed_input() {
+        // 固定入力(乱数不要の再現可能な値)で、タイル化+オンラインsoftmaxの
+        // flash_attentionが、全展開版のscaled_dot_product_attentionと
+        // 数値的に一致することを検証する。block_sizeがseq_lenを割り切らない
+        // ケースも含める。
+        let device = cpu_device();
+        let seq_len = 7;
+        let head_dim = 5;
+        let q: Vec<f32> = (0..seq_len * head_dim).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let k: Vec<f32> = (0..seq_len * head_dim).map(|i| ((i as f32) * 0.29).cos()).collect();
+        let v: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32) * 0.05 - 1.0).collect();
+
+        let naive = scaled_dot_product_attention(device.as_ref(), &q, &k, &v, seq_len, head_dim).unwrap();
+
+        for block_size in [1usize, 2, 3, 4, seq_len, seq_len * 2] {
+            let flash = flash_attention(&q, &k, &v, seq_len, head_dim, block_size).unwrap();
+            assert_eq!(flash.len(), naive.len());
+            for (i, (&f, &n)) in flash.iter().zip(naive.iter()).enumerate() {
+                assert!(
+                    (f - n).abs() < 1e-4,
+                    "block_size={block_size}, idx {i}: flash={f}, naive={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flash_attention_matches_naive_attention_on_larger_random_input() {
+        // 手計算しやすい小さい入力だけでなく、もう少し大きいサイズでも
+        // 一致することを確認する(疑似乱数のかわりに決定的なLCGを使い、
+        // テストの再現性を保つ)。
+        let device = cpu_device();
+        let seq_len = 17;
+        let head_dim = 8;
+
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut next_f32 = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let bits = (state >> 33) as u32;
+            (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let q: Vec<f32> = (0..seq_len * head_dim).map(|_| next_f32()).collect();
+        let k: Vec<f32> = (0..seq_len * head_dim).map(|_| next_f32()).collect();
+        let v: Vec<f32> = (0..seq_len * head_dim).map(|_| next_f32()).collect();
+
+        let naive = scaled_dot_product_attention(device.as_ref(), &q, &k, &v, seq_len, head_dim).unwrap();
+        let flash = flash_attention(&q, &k, &v, seq_len, head_dim, 4).unwrap();
+
+        for (i, (&f, &n)) in flash.iter().zip(naive.iter()).enumerate() {
+            assert!((f - n).abs() < 1e-4, "idx {i}: flash={f}, naive={n}");
+        }
+    }
+
+    #[test]
+    fn flash_attention_seq_len_one_returns_v_unchanged() {
+        let head_dim = 4;
+        let q = vec![0.5, -1.0, 2.0, 0.25];
+        let k = vec![1.0, 1.0, 1.0, 1.0];
+        let v = vec![10.0, 20.0, 30.0, 40.0];
+        let out = flash_attention(&q, &k, &v, 1, head_dim, 3).unwrap();
+        assert_eq!(out, v);
+    }
+
+    #[test]
+    fn flash_attention_rejects_mismatched_dimensions_and_zero_block_size() {
+        let q = vec![1.0, 2.0];
+        let k = vec![1.0, 1.0, 1.0, 1.0];
+        let v = vec![1.0, 1.0, 1.0, 1.0];
+        assert!(flash_attention(&q, &k, &v, 2, 2, 1).is_err());
+
+        let q2 = vec![1.0, 2.0, 3.0, 4.0];
+        assert!(flash_attention(&q2, &k, &v, 2, 2, 0).is_err());
     }
 
     #[test]

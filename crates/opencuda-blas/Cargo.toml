@@ -16,3 +16,4 @@ rayon.workspace = true
 
 [dev-dependencies]
 opencuda-cpu.workspace = true
+opencuda-vulkan = { workspace = true, features = ["real-vulkan"] }
