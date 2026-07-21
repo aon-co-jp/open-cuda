@@ -4,6 +4,10 @@
 `CLAUDE.md`を正本とし、各プロジェクトへコピーして同期する方針に準じる。
 GitHubリポジトリ: [aon-co-jp/open-cuda](https://github.com/aon-co-jp/open-cuda)。
 
+**開発開始日: 2026-06-26**(このリポジトリのGitHub作成日)
+
+第二のCUDA。Windows＋MAC＋LINUX互換 ＆ INTEL＋AMD＋nVIDIA互換を開発途中です。
+
 ## このプロジェクトの役割
 
 GPU抽象化・計算基盤(`OmniGPU`設計、詳細は`OmniGPU-Design.md`参照)。
