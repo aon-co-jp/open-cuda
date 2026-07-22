@@ -572,6 +572,13 @@ impl GpuDevice for VulkanDevice {
     fn synchronize(&self) -> Result<()> {
         unsafe { self.device.device_wait_idle().context("vkDeviceWaitIdle failed") }
     }
+
+    fn supports_spirv(&self) -> bool {
+        // 実Vulkanデバイス: launch_kernel は KernelSource::SpirV のみを受理する
+        // （下記 launch_kernel 実装参照）。ベンダー別スタブ経路(cuBLAS等)より
+        // こちらを優先させるための能力フラグ。
+        true
+    }
 }
 
 impl Drop for VulkanDevice {

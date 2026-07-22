@@ -100,3 +100,48 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     未検証コードを実装済みと偽ることになるので着手しなかった)。
     `omnigpu-llm`(自己回帰デコーダ)は今回のスコープ外(指示通り、
     規模が大きすぎるため次回以降)。
+
+- **2026-07-22 `sgemm`自動選択にVulkanGenericフォールバックを配線**:
+  上記HANDOFFで次の増分として明示されていた「`select_gemm_path`の
+  自動選択ロジックの再設計」を実装した。
+  - `opencuda-core::GpuDevice`に`supports_spirv(&self) -> bool`を追加
+    (デフォルト`false`)。`DeviceInfo::vendor`だけでは「Vulkan経由で
+    アクセスしているデバイスか、将来のCUDA直叩き実装か」を区別できず
+    (実機NVIDIA機がVulkan経由だと`GpuVendor::Nvidia`を返すため)、
+    ベンダー情報とは別に明示的な能力フラグが必要だった。
+    `opencuda-vulkan::real::VulkanDevice`のみ`true`をオーバーライド
+    (SpirVカーネルのみ受理する`launch_kernel`実装と整合)。CPU/mock
+    デバイスは変更不要(デフォルトの`false`のまま)。
+  - `select_gemm_path`: ベンダー別専用経路(CuBlas/RocBlas/OneMkl)が
+    選ばれた場合でも、それが依然スタブであり、かつ渡された
+    `device.supports_spirv()`が`true`なら`GemmPath::VulkanGeneric`へ
+    フォールバックするよう変更(ベンダー判定ロジック自体は変更せず、
+    その後段にフォールバック判定を追加する形)。
+  - `sgemm`のシグネチャに`spirv: Option<&[u8]>`引数を追加(既存の
+    `CpuNaive`専用呼び出しは`None`で良い)。`GemmPath::VulkanGeneric`が
+    選ばれたとき、`spirv`が`Some`なら内部で`sgemm_vulkan_generic`を
+    呼び出し、その結果へホスト側で`alpha`/`beta`スケーリングを適用して
+    `CpuNaive`経路と同じセマンティクスを保つ。`None`ならエラーで
+    明示的に失敗させる(黙って別経路にフォールバックしたり誤った
+    結果を返したりしない)。ワークスペース内の既存呼び出し元
+    (`opencuda-bert`、本クレート内のattention実装・既存テスト)は
+    末尾に`None`を追加して更新。`sgemm_vulkan_generic`自体は変更なし
+    (引き続き直接呼び出し可能)。
+  - 新規テスト1件(`sgemm_auto_dispatch_uses_vulkan_path_on_real_nvidia_hardware_instead_of_cublas_stub`):
+    実機Vulkan環境で、`select_gemm_path(vulkan_device)`が
+    `GemmPath::VulkanGeneric`を返すこと(ベンダーは依然
+    `GpuVendor::Nvidia`であることも確認)、および自動選択の入口である
+    `sgemm`(`sgemm_vulkan_generic`の直接呼び出しではなく)がVulkan経路
+    経由でCPU版`sgemm`と数値一致する結果を返すことを検証。spv未
+    コンパイル/Vulkanデバイス無しの環境では既存テストと同様に
+    assertを誤魔化さず`eprintln!`してスキップ。
+  - 検証結果: `cargo build -p opencuda-blas --release`警告0件、
+    `cargo test -p opencuda-blas --release`は20件全passed(既存19件+
+    新規1件、実機でpassed、スキップではない)。
+    `cargo clippy -p opencuda-blas --all-targets --release`警告0件。
+    `cargo test --workspace --release`も全クレートで regression 無し。
+  - 正直な制限: cuBLAS/rocBLAS/oneMKLの実装自体は引き続きスタブの
+    まま(前回と同じ理由、このマシンでは検証手段が無い)。それらが
+    実装され次第、フォールバック優先順位(現状はスタブ<Vulkan)を
+    ベンダー専用経路優先へ戻す必要がある旨は`select_gemm_path`の
+    docコメントに明記した。

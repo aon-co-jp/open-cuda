@@ -22,9 +22,14 @@
 //!   全部メモリ上に展開して計算する。QKᵀ 部分は本クレートの GEMM系
 //!   カーネル（B転置版）を、softmax は行ごとにホスト側CPUで（rayonで
 //!   行並列に）、P·V 部分は `sgemm` をそのまま再利用して計算する。
-//! - `GemmPath::CuBlas` / `RocBlas` / `OneMkl` / `VulkanGeneric`
-//!   （GPUベンダー別の実装経路）と `quantize_int4`（INT4/INT8量子化）は
-//!   **このパスでは対象外、引き続きスタブのまま**。
+//! - `GemmPath::CuBlas` / `RocBlas` / `OneMkl`（GPUベンダー専用ライブラリ
+//!   経路）は引き続きスタブのまま。`GemmPath::VulkanGeneric`は
+//!   `sgemm_vulkan_generic`として実装済み。さらに`select_gemm_path`は、
+//!   ベンダー別専用経路がスタブのままの間、`device.supports_spirv()`が
+//!   `true`のデバイス（実Vulkanデバイス）に対しては自動的に
+//!   `VulkanGeneric`へフォールバックする（`sgemm`にオプションの`spirv`
+//!   引数を追加し、この経路で実際に計算できるようにした）。
+//!   `quantize_int4`（INT4/INT8量子化）は**このパスでは対象外**。
 //! - **`flash_attention`という名前の関数は実装していない**。文献上の
 //!   Flash Attention はオンラインsoftmax + タイル化により
 //!   seq_len×seq_len のスコア行列全体をメモリに展開しない、という
@@ -38,13 +43,33 @@ use opencuda_core::{CompiledKernel, GpuDevice, GpuVendor, KernelArg, LaunchConfi
 use rayon::prelude::*;
 
 /// GEMM のバックエンド選択。ベンダーごとに最速経路へ振り分ける。
+///
+/// ベンダー別専用経路（cuBLAS/rocBLAS/oneMKL）は現状すべてスタブ
+/// （[`sgemm`] に渡すと未実装エラーを返す）。そのスタブ経路へ振り分けて
+/// しまうと、実際にはVulkan経由で正しく計算できるデバイス上でも
+/// `sgemm`が使い物にならない（エラーになる、あるいは将来スタブが
+/// 「何もせず0を返す」ような実装になれば無言で誤った結果を返しかねない）。
+/// そのため、ベンダー別専用経路がスタブのままの間は、
+/// `device.supports_spirv()`（実Vulkanデバイスなら`true`、
+/// `opencuda-vulkan::real::VulkanDevice`参照）が`true`を返すデバイスに
+/// 対しては動く経路（`GemmPath::VulkanGeneric`）を優先する。
+/// cuBLAS等が実装され次第、この優先ロジックはベンダー別経路の方を
+/// 優先するよう改めればよい（スタブの実装済みへの置き換えに合わせて
+/// このコメントと分岐を更新すること）。
 pub fn select_gemm_path(device: &dyn GpuDevice) -> GemmPath {
-    match &device.info().vendor {
+    let vendor_path = match &device.info().vendor {
         GpuVendor::Nvidia { .. } => GemmPath::CuBlas,
         GpuVendor::Amd { .. } => GemmPath::RocBlas,
         GpuVendor::Intel { .. } => GemmPath::OneMkl,
         GpuVendor::Cpu => GemmPath::CpuNaive,
         GpuVendor::Unknown => GemmPath::VulkanGeneric,
+    };
+
+    let vendor_path_is_stub = matches!(vendor_path, GemmPath::CuBlas | GemmPath::RocBlas | GemmPath::OneMkl);
+    if vendor_path_is_stub && device.supports_spirv() {
+        GemmPath::VulkanGeneric
+    } else {
+        vendor_path
     }
 }
 
@@ -199,11 +224,19 @@ fn launch_naive_gemm(
 ///
 /// 旧シグネチャ（`sgemm(device, m, k, n)`）は次元だけを受け取り、実際の
 /// 行列データを渡す手段が無い不完全なものだった（何も計算できない）ため、
-/// このパスで実データを受け取る形に修正した。ワークスペース内・
-/// リポジトリ横断で `opencuda_blas::sgemm` を呼び出す既存コードは
-/// 見つからなかった（`aruaru-llm` は `opencuda-core`/`opencuda-cpu` のみに
-/// 依存し、`opencuda-blas` 自体には依存していない）ため、破壊的変更の
-/// 影響範囲は無い。
+/// このパスで実データを受け取る形に修正した。
+///
+/// `spirv`: `select_gemm_path`が`GemmPath::VulkanGeneric`を選んだ場合に
+/// `sgemm_vulkan_generic`へ渡すSPIR-Vバイト列（`examples/matmul_vulkan_real/
+/// shaders/matmul.spv`と同一契約、呼び出し側が用意する。理由は
+/// `sgemm_vulkan_generic`のdocコメント参照 — リポジトリに`.spv`を
+/// 埋め込むとシェーダ未コンパイル環境で`cargo build`自体が壊れるため）。
+/// `GemmPath::CpuNaive`が選ばれた場合は使われないので`None`で構わない。
+/// `GemmPath::VulkanGeneric`が選ばれたのに`None`だった場合はエラーを返す
+/// （黙って別経路にフォールバックしたり、誤った結果を返したりしない）。
+/// Vulkanシェーダはalpha/beta スケーリングに対応していないため、
+/// `sgemm_vulkan_generic`の結果に対しホスト側で`c = alpha*result +
+/// beta*c`を適用し、CPU経路と同じセマンティクスを保つ。
 #[allow(clippy::too_many_arguments)]
 pub fn sgemm(
     device: &dyn GpuDevice,
@@ -215,11 +248,29 @@ pub fn sgemm(
     b: &[f32],
     beta: f32,
     c: &mut [f32],
+    spirv: Option<&[u8]>,
 ) -> Result<()> {
     let path = select_gemm_path(device);
     tracing::debug!("sgemm path = {path:?}");
     match path {
         GemmPath::CpuNaive => launch_naive_gemm(device, m, k, n, alpha, a, b, false, beta, c),
+        GemmPath::VulkanGeneric => {
+            let spirv = spirv.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sgemm: GemmPath::VulkanGeneric selected (device.supports_spirv()==true, \
+                     vendor-specific path is still a stub) but no spirv bytes were provided; \
+                     pass the compiled matmul.spv bytes via the `spirv` argument"
+                )
+            })?;
+            if c.len() != m * n {
+                anyhow::bail!("sgemm: c.len()={} != m*n={}", c.len(), m * n);
+            }
+            let result = sgemm_vulkan_generic(device, m, k, n, a, b, spirv)?;
+            for (ci, ri) in c.iter_mut().zip(result.iter()) {
+                *ci = alpha * ri + beta * *ci;
+            }
+            Ok(())
+        }
         other => anyhow::bail!("sgemm: {other:?} backend not yet implemented (Phase 3)"),
     }
 }
@@ -348,7 +399,7 @@ pub fn scaled_dot_product_attention(
 
     // 3. output = probs・V （通常の GEMM、sgemm をそのまま再利用）
     let mut output = vec![0.0f32; seq_len * head_dim];
-    sgemm(device, seq_len, seq_len, head_dim, 1.0, &probs, v, 0.0, &mut output)?;
+    sgemm(device, seq_len, seq_len, head_dim, 1.0, &probs, v, 0.0, &mut output, None)?;
 
     Ok(output)
 }
@@ -665,7 +716,7 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0, 4.0];
         let b = vec![1.0, 0.0, 0.0, 1.0];
         let mut c = vec![0.0; 4];
-        sgemm(device.as_ref(), 2, 2, 2, 1.0, &a, &b, 0.0, &mut c).unwrap();
+        sgemm(device.as_ref(), 2, 2, 2, 1.0, &a, &b, 0.0, &mut c, None).unwrap();
         assert_eq!(c, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
@@ -680,7 +731,7 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0, 4.0];
         let b = vec![5.0, 6.0, 7.0, 8.0];
         let mut c = vec![1.0, 1.0, 1.0, 1.0];
-        sgemm(device.as_ref(), 2, 2, 2, 2.0, &a, &b, 3.0, &mut c).unwrap();
+        sgemm(device.as_ref(), 2, 2, 2, 2.0, &a, &b, 3.0, &mut c, None).unwrap();
         assert_eq!(c, vec![41.0, 47.0, 89.0, 103.0]);
     }
 
@@ -699,7 +750,7 @@ mod tests {
             7.0, 8.0, 9.0,
         ];
         let mut c = vec![0.0; 9];
-        sgemm(device.as_ref(), 3, 3, 3, 1.0, &a, &b, 0.0, &mut c).unwrap();
+        sgemm(device.as_ref(), 3, 3, 3, 1.0, &a, &b, 0.0, &mut c, None).unwrap();
         assert_eq!(c, b);
     }
 
@@ -710,7 +761,7 @@ mod tests {
         let b = vec![1.0, 0.0, 0.0, 1.0];
         let mut c = vec![0.0; 4];
         // a has only 2 elements but m*k=4 is expected.
-        assert!(sgemm(device.as_ref(), 2, 2, 2, 1.0, &a, &b, 0.0, &mut c).is_err());
+        assert!(sgemm(device.as_ref(), 2, 2, 2, 1.0, &a, &b, 0.0, &mut c, None).is_err());
     }
 
     #[test]
@@ -879,13 +930,79 @@ mod tests {
 
         let mut c_cpu = vec![0.0f32; m * n];
         let cpu_device = cpu_device();
-        sgemm(cpu_device.as_ref(), m, k, n, 1.0, &a, &b, 0.0, &mut c_cpu).unwrap();
+        sgemm(cpu_device.as_ref(), m, k, n, 1.0, &a, &b, 0.0, &mut c_cpu, None).unwrap();
 
         let c_vulkan = sgemm_vulkan_generic(vulkan_device.as_ref(), m, k, n, &a, &b, &spirv).unwrap();
 
         assert_eq!(c_vulkan.len(), c_cpu.len());
         for (i, (&gv, &gc)) in c_vulkan.iter().zip(c_cpu.iter()).enumerate() {
             assert!((gv - gc).abs() < 1e-3, "idx {i}: vulkan={gv}, cpu={gc}");
+        }
+    }
+
+    #[test]
+    fn sgemm_auto_dispatch_uses_vulkan_path_on_real_nvidia_hardware_instead_of_cublas_stub() {
+        // 上のテストは`sgemm_vulkan_generic`を明示的に呼んでいるだけで、
+        // 自動選択の入口である`sgemm`(select_gemm_path経由)が実際に
+        // VulkanGeneric経路を選ぶことまでは検証していなかった。このテストは
+        // その自動選択そのものを検証する: 実機VulkanDeviceは
+        // `GpuVendor::Nvidia`を返す(vendor_from_idがVendorID 0x10DEを
+        // Nvidiaにマップするため)ので、`select_gemm_path`が単純にベンダー
+        // だけで判定していれば`GemmPath::CuBlas`(未実装スタブ)を選び、
+        // `sgemm`はエラーを返してしまう。`device.supports_spirv()`による
+        // フォールバックが機能していれば、`sgemm`はVulkanGeneric経路を
+        // 選び、cuBLASスタブを経由せず正しい結果を返すはずである。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping sgemm_auto_dispatch test: matmul.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping sgemm_auto_dispatch test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+
+        // 実機がベンダー別スタブ経路(cuBLAS等)ではなくVulkanGenericへ
+        // フォールバックすると自動選択されていることをまず直接確認する。
+        assert_eq!(
+            select_gemm_path(vulkan_device.as_ref()),
+            GemmPath::VulkanGeneric,
+            "expected select_gemm_path to prefer VulkanGeneric over the still-stubbed \
+             vendor-specific path on this real Vulkan device"
+        );
+        assert!(matches!(vulkan_device.info().vendor, GpuVendor::Nvidia { .. }));
+
+        let m = 8;
+        let k = 6;
+        let n = 5;
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32).collect();
+
+        let mut c_cpu = vec![0.0f32; m * n];
+        let cpu_device = cpu_device();
+        sgemm(cpu_device.as_ref(), m, k, n, 1.0, &a, &b, 0.0, &mut c_cpu, None).unwrap();
+
+        // ここが本題: 明示的な `sgemm_vulkan_generic` ではなく、自動選択の
+        // 入口である `sgemm` 自体を、実機Vulkanデバイスに対して呼ぶ。
+        // spirvを渡しているのでVulkanGeneric経路が選ばれれば実行できるはず。
+        let mut c_auto = vec![0.0f32; m * n];
+        sgemm(vulkan_device.as_ref(), m, k, n, 1.0, &a, &b, 0.0, &mut c_auto, Some(&spirv)).unwrap();
+
+        assert_eq!(c_auto.len(), c_cpu.len());
+        for (i, (&ga, &gc)) in c_auto.iter().zip(c_cpu.iter()).enumerate() {
+            assert!((ga - gc).abs() < 1e-3, "idx {i}: sgemm(auto)={ga}, cpu={gc}");
         }
     }
 
