@@ -1,0 +1,18 @@
+[package]
+name = "opencuda-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "自己回帰デコーダ(GPT系、KVキャッシュ付き貪欲デコード)のforward pass実装。前回のマーケティング調査ロードマップで言う「1位vLLM相当」のMVP(バッチ処理・PagedAttention・連続バッチング等の本家vLLMの中核最適化は未実装、単一シーケンスの逐次デコードのみ)"
+
+[dependencies]
+opencuda-core.workspace = true
+opencuda-blas.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+opencuda-cpu.workspace = true
