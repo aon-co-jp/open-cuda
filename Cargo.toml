@@ -9,6 +9,7 @@ members = [
     "crates/opencuda-blas",
     "crates/opencuda-multidev",
     "crates/opencuda-bert",
+    "crates/opencuda-llm",
     "examples/vector_add",
     "examples/vector_add_vulkan",
     "examples/vector_add_omniir",

@@ -3,6 +3,12 @@
 ## v0.4.1 (未リリース)
 
 ### Added
+- `opencuda-llm`(新規クレート): GPT系自己回帰デコーダのMVP(KVキャッシュ付き
+  貪欲デコード)。マーケティング調査ロードマップ1位「vLLM相当」への着手。
+  学習済み重みは無く(決定的PRNG初期化のランダム重み)、本家vLLMの
+  PagedAttention/連続バッチングも未実装(単一シーケンス逐次デコードのみ)。
+  単体テスト4件(生成パイプライン疎通・決定性・KVキャッシュ数値一致等)、
+  全green。詳細は`CLAUDE.md`のHANDOFF参照。
 - `opencuda-blas`: `quantize_int4`/`quantize_int8`を実装(`crates/opencuda-blas/src/lib.rs`)。
   グループ単位の対称量子化(`scale = max_abs / q_max`、INT4は±7、INT8は±127)。
   要素ごとの量子化演算は`GpuDevice::launch_kernel`経由の実カーネルディスパッチ
