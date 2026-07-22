@@ -699,6 +699,73 @@ pub fn dequantize_int8(t: &QuantizedInt8Tensor) -> Vec<f32> {
     (0..t.len).map(|i| t.data[i] as f32 * t.scales[i / t.group_size]).collect()
 }
 
+/// AWQ（Activation-aware Weight Quantization、[Lin et al.](https://arxiv.org/abs/2306.00978)）
+/// 風のINT4量子化。既存の`quantize_int4`は全チャネルを均等に量子化するため、
+/// 重み自体は小さくても対応する活性化の振幅が大きい「重要チャネル」ほど、
+/// 量子化グループ内の他チャネルに埋もれて粗く量子化され相対誤差が大きくなる。
+/// この関数は`y = Wx = (W・diag(s)) ・ (diag(s)^-1・x)`という等価変換を使い、
+/// 重み行列（`rows`×`cols`、行優先）の各入力チャネル（列）`j`を
+/// `activation_scale[j]^alpha`でスケールアップしてから量子化することで、
+/// 重要チャネルがグループ内の他要素に埋もれず量子化スケールに寄与するように
+/// する。推論時は本来、量子化済み重みではなく入力活性化`x`側を`awq_scale`で
+/// 割ってから掛け合わせる必要がある（matmulへの配線は次の増分のスコープ、
+/// ここでは量子化APIの提供まで）。
+pub struct QuantizedInt4AwqTensor {
+    pub inner: QuantizedInt4Tensor,
+    /// 列（入力チャネル）ごとのAWQスケール係数。長さ = `cols`。
+    pub awq_scale: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+fn validate_awq_args(weight: &[f32], rows: usize, cols: usize, activation_scale: &[f32]) -> Result<()> {
+    if rows == 0 || cols == 0 {
+        anyhow::bail!("quantize_int4_awq: rows and cols must be > 0");
+    }
+    if weight.len() != rows * cols {
+        anyhow::bail!("quantize_int4_awq: weight.len() must equal rows*cols");
+    }
+    if activation_scale.len() != cols {
+        anyhow::bail!("quantize_int4_awq: activation_scale.len() must equal cols");
+    }
+    Ok(())
+}
+
+pub fn quantize_int4_awq(
+    device: &dyn GpuDevice,
+    weight: &[f32],
+    rows: usize,
+    cols: usize,
+    activation_scale: &[f32],
+    group_size: usize,
+    alpha: f32,
+) -> Result<QuantizedInt4AwqTensor> {
+    validate_awq_args(weight, rows, cols, activation_scale)?;
+    let awq_scale: Vec<f32> = activation_scale.iter().map(|&s| if s <= 0.0 { 1.0 } else { s.powf(alpha) }).collect();
+    let mut scaled = vec![0f32; weight.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            scaled[r * cols + c] = weight[r * cols + c] * awq_scale[c];
+        }
+    }
+    let inner = quantize_int4(device, &scaled, group_size)?;
+    Ok(QuantizedInt4AwqTensor { inner, awq_scale, rows, cols })
+}
+
+/// [`quantize_int4_awq`]の逆変換。AWQスケールを除去し元の重みスケールへ戻す
+/// （往復検証・デバッグ用途。実推論では代わりに活性化側を`awq_scale`で割る）。
+pub fn dequantize_int4_awq(t: &QuantizedInt4AwqTensor) -> Vec<f32> {
+    let scaled = dequantize_int4(&t.inner);
+    let mut out = vec![0f32; scaled.len()];
+    for r in 0..t.rows {
+        for c in 0..t.cols {
+            let s = t.awq_scale[c];
+            out[r * t.cols + c] = if s == 0.0 { 0.0 } else { scaled[r * t.cols + c] / s };
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +957,50 @@ mod tests {
         let err4: f32 = input.iter().zip(dequantize_int4(&t4)).map(|(x, r)| (x - r).abs()).sum();
         let err8: f32 = input.iter().zip(dequantize_int8(&t8)).map(|(x, r)| (x - r).abs()).sum();
         assert!(err8 < err4, "int8 total err {err8} should be < int4 total err {err4}");
+    }
+
+    #[test]
+    fn quantize_int4_awq_reduces_error_on_salient_low_magnitude_channel() {
+        // 1行4列。チャネル3(0-indexed)は重み自体は小さい(0.1)が活性化が
+        // 極端に大きい(=AWQ論文でいう「重要チャネル」)。group_size=4で
+        // 行全体を1グループにすると、素のquantize_int4はmax_abs(10.0)を
+        // 基準にスケールを決めるため0.1は丸めで0になり、そのチャネルの
+        // 情報が完全に失われる。AWQは活性化スケールでチャネル3の重みを
+        // 事前に引き上げることでこれを防ぐ。
+        let device = cpu_device();
+        let rows = 1;
+        let cols = 4;
+        let weight = vec![10.0f32, 10.0, 10.0, 0.1];
+        let activation_scale = vec![1.0f32, 1.0, 1.0, 100.0];
+        let group_size = 4;
+
+        let plain = quantize_int4(device.as_ref(), &weight, group_size).unwrap();
+        let plain_restored = dequantize_int4(&plain);
+        let plain_err_ch3 = (weight[3] - plain_restored[3]).abs();
+        assert_eq!(plain_restored[3], 0.0, "salient channel should be crushed to 0 without AWQ");
+
+        let awq = quantize_int4_awq(device.as_ref(), &weight, rows, cols, &activation_scale, group_size, 1.0).unwrap();
+        let awq_restored = dequantize_int4_awq(&awq);
+        let awq_err_ch3 = (weight[3] - awq_restored[3]).abs();
+
+        assert!(
+            awq_err_ch3 < plain_err_ch3,
+            "AWQ error {awq_err_ch3} should be < plain error {plain_err_ch3} on the salient channel"
+        );
+        // 非重要チャネル(0..3)はAWQでもほぼ同等の精度を保つ。
+        for i in 0..3 {
+            assert!((weight[i] - awq_restored[i]).abs() < 1.0, "channel {i} should stay reasonably precise");
+        }
+    }
+
+    #[test]
+    fn quantize_int4_awq_rejects_mismatched_shapes() {
+        let device = cpu_device();
+        let weight = vec![1.0f32; 6];
+        // activation_scale.len() != cols(3)
+        assert!(quantize_int4_awq(device.as_ref(), &weight, 2, 3, &[1.0, 1.0], 3, 1.0).is_err());
+        // weight.len() != rows*cols
+        assert!(quantize_int4_awq(device.as_ref(), &weight, 2, 4, &[1.0, 1.0, 1.0, 1.0], 4, 1.0).is_err());
     }
 
     #[test]
