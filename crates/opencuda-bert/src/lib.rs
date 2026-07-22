@@ -61,7 +61,7 @@ impl Linear {
     fn forward(&self, device: &dyn GpuDevice, x: &[f32], seq_len: usize) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), seq_len * self.in_dim);
         let mut out = vec![0.0f32; seq_len * self.out_dim];
-        opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out)?;
+        opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, None)?;
         for row in 0..seq_len {
             for c in 0..self.out_dim {
                 out[row * self.out_dim + c] += self.bias[c];

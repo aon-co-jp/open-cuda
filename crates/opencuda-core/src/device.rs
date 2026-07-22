@@ -92,4 +92,20 @@ pub trait GpuDevice: Send + Sync {
 
     // --- 同期 ---
     fn synchronize(&self) -> Result<()>;
+
+    /// この `GpuDevice` 実装が `CompiledKernel::spirv`（SPIR-V/Vulkan Compute
+    /// カーネル）の `launch_kernel` をサポートするかどうか。
+    ///
+    /// `DeviceInfo::vendor`（`GpuVendor::Nvidia`等）はハードウェアベンダーを
+    /// 表すだけで、その情報だけでは「Vulkan経由でアクセスしているのか、
+    /// 将来のCUDA直叩き実装なのか」を区別できない（`opencuda-blas`の
+    /// `select_gemm_path`がベンダー別スタブ経路とVulkan汎用経路のどちらを
+    /// 自動選択すべきか判断するのに、ベンダー情報だけでは不十分だった）。
+    /// このメソッドはその区別を明示的に行うための能力フラグ。
+    /// デフォルトは `false`（`CompiledKernel::native`のみを想定する既存の
+    /// バックエンドは変更不要）。SPIR-Vカーネルを実行できるバックエンド
+    /// （`opencuda-vulkan::real::VulkanDevice`）だけが `true` を返す。
+    fn supports_spirv(&self) -> bool {
+        false
+    }
 }
