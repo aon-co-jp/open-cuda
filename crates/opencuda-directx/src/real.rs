@@ -54,8 +54,41 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::core::Interface;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+
+/// 既知のPCIeベンダーID(DXGI_ADAPTER_DESC1::VendorId)。
+const VENDOR_ID_NVIDIA: u32 = 0x10DE;
+const VENDOR_ID_AMD_1: u32 = 0x1002;
+const VENDOR_ID_AMD_2: u32 = 0x1022;
+const VENDOR_ID_INTEL: u32 = 0x8086;
+
+/// DXGIでデフォルトアダプタ(インデックス0、通常は最も高性能な
+/// ディスクリートGPU)を列挙し、ベンダー判定に使う情報と、
+/// `D3D12CreateDevice`へそのまま渡せるアダプタハンドルを返す。
+/// 失敗した場合は`None`を返し、呼び出し側は`D3D12CreateDevice(None, ...)`
+/// (OS既定のアダプタ選択)へフォールバックする(DXGI列挙自体は本質的な
+/// 要件ではなく、ベンダー名を正しく表示するための付加情報のため)。
+fn enumerate_default_adapter() -> Option<(IDXGIAdapter1, GpuVendor, String, u64)> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+
+        let name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..name_len]);
+
+        let vendor = match desc.VendorId {
+            VENDOR_ID_NVIDIA => GpuVendor::Nvidia { compute_capability: (0, 0) },
+            VENDOR_ID_AMD_1 | VENDOR_ID_AMD_2 => GpuVendor::Amd { gfx_version: "unknown".to_string() },
+            VENDOR_ID_INTEL => GpuVendor::Intel { architecture: "unknown".to_string() },
+            _ => GpuVendor::Unknown,
+        };
+
+        Some((adapter, vendor, name, desc.DedicatedVideoMemory as u64))
+    }
+}
 
 /// DEFAULTヒープ上のGPU専用バッファ(UAVディスパッチに直接使える)。
 struct GpuBuffer {
@@ -104,10 +137,17 @@ impl DirectXDevice {
     /// コマンドキュー・コマンドアロケータ・コマンドリスト・フェンスまで
     /// 一式初期化する。
     pub fn new(id: usize) -> anyhow::Result<Arc<Self>> {
+        // DXGIアダプタ列挙(ベンダー名判定用、失敗してもOS既定選択へ
+        // フォールバックする——本質的な要件ではないため)。
+        let adapter_info = enumerate_default_adapter();
+
         let device: ID3D12Device = unsafe {
             let mut result: Option<ID3D12Device> = None;
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut result)
-                .context("D3D12CreateDevice failed (no DirectX 12 capable GPU/driver, or runtime unavailable)")?;
+            match &adapter_info {
+                Some((adapter, ..)) => D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &mut result),
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut result),
+            }
+            .context("D3D12CreateDevice failed (no DirectX 12 capable GPU/driver, or runtime unavailable)")?;
             result.ok_or_else(|| anyhow::anyhow!("D3D12CreateDevice succeeded but returned no device"))?
         };
 
@@ -136,14 +176,13 @@ impl DirectXDevice {
         let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE).context("CreateFence failed")? };
         let fence_event = unsafe { CreateEventW(None, false, false, None).context("CreateEventW failed")? };
 
+        let (vendor, name, total_memory) = match adapter_info {
+            Some((_, vendor, name, mem)) => (vendor, name, mem),
+            None => (GpuVendor::Unknown, "DirectX 12 Device (default adapter, feature level 11_0+)".to_string(), 0),
+        };
+
         Ok(Arc::new(Self {
-            info: DeviceInfo {
-                id,
-                vendor: GpuVendor::Unknown,
-                name: "DirectX 12 Device (default adapter, feature level 11_0+)".to_string(),
-                total_memory: 0,
-                compute_units: 0,
-            },
+            info: DeviceInfo { id, vendor, name, total_memory, compute_units: 0 },
             device,
             queue,
             allocator,
