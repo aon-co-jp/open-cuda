@@ -108,4 +108,12 @@ pub trait GpuDevice: Send + Sync {
     fn supports_spirv(&self) -> bool {
         false
     }
+
+    /// この `GpuDevice` 実装が `CompiledKernel::dxil`（DXIL/DirectX 12
+    /// Computeカーネル)の`launch_kernel`をサポートするかどうか。
+    /// `supports_spirv`と同じ設計判断(2026-07-23、DirectXバックエンド
+    /// 追加時に追加)。デフォルトは`false`。
+    fn supports_dxil(&self) -> bool {
+        false
+    }
 }

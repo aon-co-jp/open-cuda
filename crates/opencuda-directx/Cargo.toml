@@ -1,0 +1,29 @@
+[package]
+name = "opencuda-directx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "DirectX 12 Compute backend crate (Windows専用、opencuda-vulkanと並存するオプトインバックエンド). Phase 1: hardware-free mock + real D3D12 device/memory management. Compute pipeline (root signature/PSO dispatch) is Phase 2."
+
+[dependencies]
+opencuda-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+real-dx12 = ["dep:windows"]
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+optional = true
+features = [
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+]
