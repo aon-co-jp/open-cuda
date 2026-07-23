@@ -29,6 +29,36 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-07-23、RS-LinkFusionセッションからの引き継ぎ)
+
+- **ユーザーから「open-cudaはDirectXのプラグインとして開発中」との
+  認識が示されたが、実装調査の結果、現状は`Vulkan Compute`基盤
+  (`opencuda-vulkan`、`OmniGPU-Design.md`に明記の設計方針)であり、
+  DirectX/DirectCompute/DirectML/HLSLへの依存・実装は一切見つから
+  なかった**(RS-LinkFusion(`F:\runo\RS-LinkFusion`)側のGPU/NPU
+  暗号化・圧縮アクセラレーション調査中に発覚、コード変更はまだ
+  行っていない)。
+- ユーザーは「DirectX版として仕切り直したい」との意向。これは
+  `opencuda-vulkan`をDirectX/DirectComputeへ置き換える(または並存
+  させる)大きな方針転換であり、`aruaru-llm`(既存の実装例・利用元)
+  への影響も及ぶため、**次回はopen-cuda専用のセッションとして
+  スコープを切って着手すべき**(RS-LinkFusion側のセッションに
+  詰め込まず、別タスクとして丁寧に検証しながら進める)。
+- 検討時の技術的懸念(RS-LinkFusion側調査で判明、DirectX移行時にも
+  該当しうる): 汎用`GpuDevice`(alloc/memcpy/launch_kernel)の抽象化
+  自体はバイト列を扱えるが、圧縮・暗号化カーネル(ChaCha20-Poly1305等)
+  は既存の`opencuda-blas`/`opencuda-bert`(ML専用、GEMM/Attention/
+  量子化)には一切存在せず、新規に書く必要がある。また小サイズ
+  ペイロード(例: ネットワークMTU程度の数百〜数千バイト)では
+  Host↔Device間のメモリ転送オーバーヘッドがGPU側の演算優位性を
+  相殺し、実利益が出ない可能性がある——DirectX版でも同じトレード
+  オフを検証すべき。
+- 次回セッションの最初のタスク候補: (1) DirectX/DirectCompute採用の
+  妥当性を日英Web検索で裏取り(Vulkan Computeとの比較、Windows専用に
+  絞ることの得失)、(2) 既存`opencuda-vulkan`との共存/置換方針の決定、
+  (3) 小規模な実験実装(DirectComputeシェーダーでの単純な演算)で
+  実行可能性を先に検証してから本格移行するかどうかの判断。
+
 ## エコシステム全体マップ
 
 同時並行開発の対象プロジェクト一覧・詳細は
