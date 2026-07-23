@@ -53,11 +53,54 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   Host↔Device間のメモリ転送オーバーヘッドがGPU側の演算優位性を
   相殺し、実利益が出ない可能性がある——DirectX版でも同じトレード
   オフを検証すべき。
-- 次回セッションの最初のタスク候補: (1) DirectX/DirectCompute採用の
-  妥当性を日英Web検索で裏取り(Vulkan Computeとの比較、Windows専用に
-  絞ることの得失)、(2) 既存`opencuda-vulkan`との共存/置換方針の決定、
-  (3) 小規模な実験実装(DirectComputeシェーダーでの単純な演算)で
-  実行可能性を先に検証してから本格移行するかどうかの判断。
+- **2026-07-23(続き) 日英Web検索での裏取り結果、方針決定、
+  `opencuda-directx`クレート新設・実機検証まで完了**:
+  1. **裏取り結果**: DXVK/vkd3d-proton(Valve社Protonが実際に使う、
+     Linux上でDirectX 12ゲームを動かす技術)を調査した結果、いずれも
+     「DirectX(Windows専用API)→Vulkan(クロスプラットフォームAPI)」
+     という変換方向であり、逆方向(DirectXを他OSへネイティブ移植)の
+     実例は見つからなかった。Vulkanは既にWindows/Linux/Androidへ
+     ネイティブ対応し、macOS/iOSも[MoltenVK](https://github.com/KhronosGroup/MoltenVK)
+     経由で対応可能——**クロスプラットフォーム対応という目標に
+     対しては、既存の`opencuda-vulkan`の方が技術的に近道**という
+     結論をユーザーへ報告した。
+  2. **ユーザー決定**: 上記を踏まえ「Vulkanは残しつつ、Windows向けに
+     別途DirectXバックエンドを追加する」(両方維持、共存)方針を選択。
+  3. **`opencuda-directx`クレート新設**(`opencuda-vulkan`の「Phase 1.5
+     モック→実機」パターンを踏襲): `opencuda-core::KernelSource`へ
+     `Dxil(Vec<u8>)`バリアント(非破壊追加)・`GpuDevice::supports_dxil()`
+     能力フラグ(既定`false`)を追加。`DirectXMockDevice`(GPUなしで
+     DXIL経路の契約を検証、DXBCコンテナマジックバイト検証・
+     `vector_add`シミュレーション、3テストgreen)+`real-dx12` feature
+     配下の実`DirectXDevice`(`windows` crate 0.58、`D3D12CreateDevice`
+     でのデバイス作成・UPLOADヒープ経由の実メモリ確保・h2d/d2h/d2dの
+     実装)。
+  4. **実機検証(このマシンのNVIDIA GT 730で実施、型チェックのみで
+     完了と報告しない方針を徹底)**: `real_d3d12_device_roundtrips_h2d_and_d2h_on_real_hardware`
+     テストが実際に`D3D12CreateDevice`でデバイスを作成し、UPLOADヒープ
+     上に実リソースを確保、CPU→D3D12マップ済みメモリへの書き込み・
+     読み戻しが完全一致することを実証(スキップメッセージなし、
+     実機パスが実行されたことを`--nocapture`で確認済み)。
+  5. **正直な開示・スコープの区切り**: カーネルディスパッチ
+     (ルートシグネチャ・Compute PSO・ディスクリプタヒープ・コマンド
+     リスト記録)は**Phase 2として未実装**——`DirectXDevice::launch_kernel`
+     は明示的に`UnsupportedKernel`エラーを返し、`supports_dxil()`も
+     `false`を返す(「対応している」という誤ったシグナルを出さない)。
+     `Vulkan`側の`dispatch_spirv`に相当する処理を次回実装する。
+     デバイス列挙もDXGIアダプタ列挙を経ず`D3D12CreateDevice(None, ...)`
+     でデフォルトアダプタ決め打ちのため、`GpuVendor`は`Unknown`のまま
+     (Vulkan側のようなベンダーID判定は未実装)。
+  6. **検証**: `cargo build --workspace`/`cargo test --workspace
+     --features opencuda-directx/real-dx12`ともリグレッション無し、
+     全テストgreen(`opencuda-directx`は4件、モック3件+実機1件)。
+  - 次にすべきこと: (1) Phase 2(DXILカーネルディスパッチの実装、
+    `vector_add`をDXILシェーダーで実際にGPU実行し、CPU版との数値
+    一致を検証——`opencuda-vulkan`の`sgemm_vulkan_generic_matches_cpu_naive_on_real_hardware`
+    と同型のテストパターンを踏襲)、(2) DXGIアダプタ列挙による
+    `GpuVendor`判定の実装、(3) 圧縮・暗号化カーネル(RS-LinkFusion側の
+    要望)をDXIL/HLSLで新規実装するかどうかの判断(Phase 2完了後に
+    検討、小サイズペイロードでのH2D/D2Hオーバーヘッドが実利益を
+    相殺する懸念は既存HANDOFF参照)。
 
 ## エコシステム全体マップ
 

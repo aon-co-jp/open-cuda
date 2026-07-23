@@ -21,6 +21,9 @@ pub enum KernelSource {
     Ptx(String),
     /// JIT変換用の共通中間表現。v0.2 は opencuda-ir の最小fixtureを格納する。
     OmniIr(Vec<u8>),
+    /// 事前コンパイル済み DXIL（DirectX 12 Compute、`opencuda-directx`向け、
+    /// 2026-07-23追加)。DXBCコンテナ形式(先頭4バイトが`b"DXBC"`)を想定。
+    Dxil(Vec<u8>),
 }
 
 impl KernelSource {
@@ -30,6 +33,7 @@ impl KernelSource {
             KernelSource::SpirV(_) => "SpirV",
             KernelSource::Ptx(_) => "Ptx",
             KernelSource::OmniIr(_) => "OmniIr",
+            KernelSource::Dxil(_) => "Dxil",
         }
     }
 }
@@ -186,6 +190,23 @@ impl CompiledKernel {
             name: name.into(),
             entry: entry.into(),
             source: KernelSource::OmniIr(bytes.into()),
+        }
+    }
+
+    /// 事前コンパイル済み DXIL カーネルを作る簡便コンストラクタ。
+    ///
+    /// 実DirectX 12バックエンドでは、この `source` を`ID3D12PipelineState`
+    /// (Compute PSO)に渡す。`opencuda-directx`のモック実装では、GPUなしで
+    /// `Dxil`経路だけを検証する(Vulkanの`VulkanMockDevice`と同じ設計)。
+    pub fn dxil(
+        name: impl Into<String>,
+        entry: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            entry: entry.into(),
+            source: KernelSource::Dxil(bytes.into()),
         }
     }
 
