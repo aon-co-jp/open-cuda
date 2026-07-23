@@ -93,14 +93,58 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   6. **検証**: `cargo build --workspace`/`cargo test --workspace
      --features opencuda-directx/real-dx12`ともリグレッション無し、
      全テストgreen(`opencuda-directx`は4件、モック3件+実機1件)。
-  - 次にすべきこと: (1) Phase 2(DXILカーネルディスパッチの実装、
-    `vector_add`をDXILシェーダーで実際にGPU実行し、CPU版との数値
-    一致を検証——`opencuda-vulkan`の`sgemm_vulkan_generic_matches_cpu_naive_on_real_hardware`
-    と同型のテストパターンを踏襲)、(2) DXGIアダプタ列挙による
-    `GpuVendor`判定の実装、(3) 圧縮・暗号化カーネル(RS-LinkFusion側の
-    要望)をDXIL/HLSLで新規実装するかどうかの判断(Phase 2完了後に
-    検討、小サイズペイロードでのH2D/D2Hオーバーヘッドが実利益を
-    相殺する懸念は既存HANDOFF参照)。
+  - ~~次にすべきこと(1) Phase 2~~ **完了(2026-07-23、同日中)**、
+    下記エントリ参照。
+
+- **2026-07-23(続き2) Phase 2完了: DXILカーネルディスパッチを実装・
+  実機検証**:
+  1. **HLSL埋め込みルートシグネチャを採用**(日英Web検索で裏取り):
+     `[RootSignature("UAV(u0), UAV(u1), UAV(u2), RootConstants(...)")]`
+     属性をHLSL側に書くと、dxcがコンパイルしたDXILバイト列自体に
+     ルートシグネチャが同梱される。Rust側は`ID3D12Device::
+     CreateRootSignature(0, dxil_bytes)`へそのバイト列をそのまま渡す
+     だけでよく、C++/Rustコードでの手動ルートシグネチャ記述子構築が
+     不要になった。
+  2. **ディスクリプタヒープを使わずルートUAVディスクリプタで直接
+     バインド**: `SetComputeRootUnorderedAccessView(index, gpu_addr)`を
+     3つのUAVバッファそれぞれに使い、`CreateDescriptorHeap`/
+     `CreateUnorderedAccessView`/ディスクリプタテーブル管理を丸ごと
+     回避——実装量・バグの温床を大幅に削減する設計判断。
+  3. **メモリ管理をPhase 1のUPLOAD直接マップ方式から、DEFAULTヒープ
+     (UAV対応)+UPLOAD/READBACKステージングバッファ経由のコピー方式へ
+     刷新**(UAVバインドにはDEFAULTヒープが必須、UPLOADヒープは
+     UAVを許可しないというD3D12の制約による)。
+  4. **実際に遭遇したバグ**: READBACKヒープのリソースにUPLOADヒープ用
+     の初期状態`D3D12_RESOURCE_STATE_GENERIC_READ`を流用していた
+     ため`CreateCommittedResource`が`E_INVALIDARG`(0x80070057)を
+     返す実バグが発生(型チェックのみで通ってしまう類のバグ、実際に
+     `cargo test`を実機で回して発覚)。READBACKヒープは初期状態
+     `D3D12_RESOURCE_STATE_COPY_DEST`固定という仕様に修正して解決。
+  5. **`tools/compile-dx12-shaders.sh`/`.ps1`新設**
+     (`tools/compile-vulkan-shaders.*`と同じ命名パターン)。dxc
+     (Windows SDK付属、`C:\Program Files (x86)\Windows Kits\10\bin\
+     *\x64\dxc.exe`)で`shaders/vector_add.hlsl`→`vector_add.dxil`
+     (DXBCコンテナ形式)をコンパイル。`.dxil`は`.gitignore`対象
+     (Vulkanの`.spv`と同じ扱い)。
+  6. **実機検証(NVIDIA GT 730、型チェックのみで完了と報告しない
+     方針を徹底)**: `real_d3d12_dispatches_vector_add_and_matches_cpu_reference`
+     テストが実際に(a) DXILからルートシグネチャ+Compute PSOを作成、
+     (b) 256要素のfloat配列2本をDEFAULTヒープバッファへh2dコピー、
+     (c) ルートUAVディスクリプタでバインドしDispatch実行、
+     (d) 結果をd2hコピーしCPU参照値(単純な加算)と1e-3精度で一致、
+     を実証。`opencuda-vulkan`のGEMM実機テストと同型のパターンで
+     検証した。
+  7. **検証**: `cargo build --workspace`/`cargo test --workspace
+     --features opencuda-directx/real-dx12`ともリグレッション無し、
+     全テストgreen(`opencuda-directx`は5件: モック3件+実機2件
+     〈メモリ往復+カーネルディスパッチ〉)。
+  - 次にすべきこと: (1) `matmul`等、`vector_add`以外のカーネルへの
+    対応拡大、(2) DXGIアダプタ列挙による`GpuVendor`判定の実装、
+    (3) 圧縮・暗号化カーネル(RS-LinkFusion側の要望)をDXIL/HLSLで
+    新規実装するかどうかの判断(小サイズペイロードでのH2D/D2H
+    オーバーヘッドが実利益を相殺する懸念は既存HANDOFF参照)、
+    (4) コマンドリストのバッチ化によるスループット改善(現状は
+    操作ごとに同期的にフェンス待機する設計、正しさ優先のMVP)。
 
 ## エコシステム全体マップ
 

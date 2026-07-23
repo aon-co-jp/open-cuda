@@ -272,6 +272,68 @@ mod real_hardware_tests {
         buf.copy_to_host(&mut out).unwrap();
         assert_eq!(&out, data);
     }
+
+    /// 実機でのDXILカーネルディスパッチ(Phase 2)。事前コンパイル済み
+    /// `vector_add.dxil`が無い場合(`tools/compile-dx12-shaders.sh`未実行)
+    /// は`eprintln!`でスキップする(Vulkanの`matmul_vulkan_real`テストと
+    /// 同じパターン)。
+    #[test]
+    fn real_d3d12_dispatches_vector_add_and_matches_cpu_reference() {
+        let dxil_path = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/vector_add.dxil");
+        let dxil = match std::fs::read(dxil_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("skipping real D3D12 dispatch test: cannot read {dxil_path}: {e} (run tools/compile-dx12-shaders.sh first)");
+                return;
+            }
+        };
+
+        let device = match DirectXDevice::new(0) {
+            Ok(dev) => dev,
+            Err(e) => {
+                eprintln!("skipping real D3D12 dispatch test: {e}");
+                return;
+            }
+        };
+        let dev: std::sync::Arc<dyn opencuda_core::GpuDevice> = device;
+
+        let n = 256usize;
+        let av: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let bv: Vec<f32> = (0..n).map(|i| (i as f32) * 2.0).collect();
+        let expected: Vec<f32> = av.iter().zip(bv.iter()).map(|(a, b)| a + b).collect();
+
+        let a = alloc_buffer(&dev, n * 4).unwrap();
+        let b = alloc_buffer(&dev, n * 4).unwrap();
+        let c = alloc_buffer(&dev, n * 4).unwrap();
+        a.copy_from_host(f32_slice_as_bytes(&av)).unwrap();
+        b.copy_from_host(f32_slice_as_bytes(&bv)).unwrap();
+
+        let kernel = opencuda_core::CompiledKernel::dxil("vector_add", "main", dxil);
+        let cfg = opencuda_core::LaunchConfig::linear(n as u32, 64);
+        dev.launch_kernel(
+            &kernel,
+            &cfg,
+            &[
+                opencuda_core::KernelArg::Ptr(a.as_ptr()),
+                opencuda_core::KernelArg::Ptr(b.as_ptr()),
+                opencuda_core::KernelArg::Ptr(c.as_ptr()),
+                opencuda_core::KernelArg::Usize(n),
+            ],
+        )
+        .unwrap();
+
+        let mut out = vec![0u8; n * 4];
+        c.copy_to_host(&mut out).unwrap();
+        let result: Vec<f32> = out.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+        for (r, e) in result.iter().zip(expected.iter()) {
+            assert!((r - e).abs() < 1e-3, "GPU result {r} does not match CPU reference {e}");
+        }
+    }
+
+    fn f32_slice_as_bytes(values: &[f32]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) }
+    }
 }
 
 #[cfg(test)]
