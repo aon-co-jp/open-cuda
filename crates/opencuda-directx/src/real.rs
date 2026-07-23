@@ -290,6 +290,149 @@ impl DirectXDevice {
         pipelines.insert(name.to_string(), Pipeline { root_signature, pso });
         Ok(())
     }
+
+    /// パイプラインを設定し、コマンドリストへ積んでから同期実行する
+    /// 共通部分(`vector_add`/`matmul`で共有)。
+    fn dispatch_with_pipeline(
+        &self, kernel_name: &str, uav_resources: &[ID3D12Resource], root_constants: &[u32], group_count: (u32, u32, u32),
+    ) -> anyhow::Result<()> {
+        let pipelines = self.pipelines.lock().unwrap();
+        let pipeline = pipelines.get(kernel_name).expect("pipeline_for must be called before dispatch_with_pipeline");
+        let root_signature = pipeline.root_signature.clone();
+        let pso = pipeline.pso.clone();
+        drop(pipelines);
+
+        let uav_addrs: Vec<u64> = uav_resources.iter().map(|r| unsafe { r.GetGPUVirtualAddress() }).collect();
+
+        self.execute_and_wait(|cl| {
+            unsafe {
+                cl.SetPipelineState(&pso);
+                cl.SetComputeRootSignature(&root_signature);
+                for (i, addr) in uav_addrs.iter().enumerate() {
+                    cl.SetComputeRootUnorderedAccessView(i as u32, *addr);
+                }
+                let constants_root_index = uav_addrs.len() as u32;
+                for (offset, value) in root_constants.iter().enumerate() {
+                    cl.SetComputeRoot32BitConstant(constants_root_index, *value, offset as u32);
+                }
+                cl.Dispatch(group_count.0.max(1), group_count.1.max(1), group_count.2.max(1));
+            }
+            Ok(())
+        })
+    }
+
+    fn dispatch_vector_add(&self, kernel: &CompiledKernel, dxil: &[u8], cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        if args.len() != 4 {
+            return Err(GpuError::LaunchFailed("vector_add expects 4 args: a, b, c, n".to_string()).into());
+        }
+        let a = args[0].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg0 must be a device pointer".to_string()))?;
+        let b = args[1].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg1 must be a device pointer".to_string()))?;
+        let c = args[2].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg2 must be a device pointer".to_string()))?;
+        let n = args[3].as_usize().ok_or_else(|| GpuError::LaunchFailed("arg3 must be usize/u32".to_string()))?;
+        let n_u32 = u32::try_from(n).map_err(|_| GpuError::LaunchFailed("n does not fit in u32".to_string()))?;
+
+        self.pipeline_for(&kernel.name, dxil)?;
+        let (a_res, b_res, c_res) = {
+            let map = self.allocations.lock().unwrap();
+            (
+                map.get(&a.addr).ok_or(GpuError::InvalidPtr(a))?.resource.clone(),
+                map.get(&b.addr).ok_or(GpuError::InvalidPtr(b))?.resource.clone(),
+                map.get(&c.addr).ok_or(GpuError::InvalidPtr(c))?.resource.clone(),
+            )
+        };
+
+        self.dispatch_with_pipeline(&kernel.name, &[a_res, b_res, c_res], &[n_u32], (cfg.grid.0, 1, 1))?;
+        Ok(())
+    }
+
+    /// `matmul`(行優先、C[m×n] = A[m×k] × B[k×n])。引数契約は
+    /// `opencuda-vulkan::real::VulkanDevice::ensure_matmul_args`と同一
+    /// (a, b, c, m, k, n の6個)。
+    fn dispatch_matmul(&self, kernel: &CompiledKernel, dxil: &[u8], cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        if args.len() != 6 {
+            return Err(GpuError::LaunchFailed("matmul expects 6 args: a, b, c, m, k, n".to_string()).into());
+        }
+        let a = args[0].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg0 must be a device pointer".to_string()))?;
+        let b = args[1].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg1 must be a device pointer".to_string()))?;
+        let c = args[2].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg2 must be a device pointer".to_string()))?;
+        let m = args[3].as_usize().ok_or_else(|| GpuError::LaunchFailed("arg3 (m) must be usize/u32".to_string()))?;
+        let k = args[4].as_usize().ok_or_else(|| GpuError::LaunchFailed("arg4 (k) must be usize/u32".to_string()))?;
+        let n = args[5].as_usize().ok_or_else(|| GpuError::LaunchFailed("arg5 (n) must be usize/u32".to_string()))?;
+
+        let f32_size = std::mem::size_of::<f32>();
+        let a_bytes = m.checked_mul(k).and_then(|v| v.checked_mul(f32_size)).ok_or_else(|| GpuError::LaunchFailed("matmul A byte size overflow".to_string()))?;
+        let b_bytes = k.checked_mul(n).and_then(|v| v.checked_mul(f32_size)).ok_or_else(|| GpuError::LaunchFailed("matmul B byte size overflow".to_string()))?;
+        let c_bytes = m.checked_mul(n).and_then(|v| v.checked_mul(f32_size)).ok_or_else(|| GpuError::LaunchFailed("matmul C byte size overflow".to_string()))?;
+
+        self.pipeline_for(&kernel.name, dxil)?;
+        let (a_res, b_res, c_res) = {
+            let map = self.allocations.lock().unwrap();
+            let a_alloc = map.get(&a.addr).ok_or(GpuError::InvalidPtr(a))?;
+            if a_alloc.len < a_bytes {
+                return Err(GpuError::LaunchFailed(format!("matmul buffer A too small: need {a_bytes} bytes, have {}", a_alloc.len)).into());
+            }
+            let b_alloc = map.get(&b.addr).ok_or(GpuError::InvalidPtr(b))?;
+            if b_alloc.len < b_bytes {
+                return Err(GpuError::LaunchFailed(format!("matmul buffer B too small: need {b_bytes} bytes, have {}", b_alloc.len)).into());
+            }
+            let c_alloc = map.get(&c.addr).ok_or(GpuError::InvalidPtr(c))?;
+            if c_alloc.len < c_bytes {
+                return Err(GpuError::LaunchFailed(format!("matmul buffer C too small: need {c_bytes} bytes, have {}", c_alloc.len)).into());
+            }
+            (a_alloc.resource.clone(), b_alloc.resource.clone(), c_alloc.resource.clone())
+        };
+
+        let m_u32 = u32::try_from(m).map_err(|_| GpuError::LaunchFailed("m does not fit in u32".to_string()))?;
+        let k_u32 = u32::try_from(k).map_err(|_| GpuError::LaunchFailed("k does not fit in u32".to_string()))?;
+        let n_u32 = u32::try_from(n).map_err(|_| GpuError::LaunchFailed("n does not fit in u32".to_string()))?;
+
+        self.dispatch_with_pipeline(&kernel.name, &[a_res, b_res, c_res], &[m_u32, k_u32, n_u32], (cfg.grid.0, cfg.grid.1, 1))?;
+        Ok(())
+    }
+
+    /// ChaCha20ストリーム暗号(RFC 8439)のGPUディスパッチ。引数は
+    /// `[data, key(8 x U32), nonce(3 x U32), counter_base]`の13個。
+    /// `data`バッファへin-placeでキーストリームをXORする(暗号化・
+    /// 復号は同一演算)。**正直な開示**: Poly1305認証タグは計算しない
+    /// (`chacha20.hlsl`モジュールdoc参照、ChaCha20暗号化部分のみの
+    /// デモンストレーション実装)。
+    fn dispatch_chacha20(&self, kernel: &CompiledKernel, dxil: &[u8], args: &[KernelArg]) -> Result<()> {
+        if args.len() != 13 {
+            return Err(GpuError::LaunchFailed("chacha20 expects 13 args: data, key[8], nonce[3], counter".to_string()).into());
+        }
+        let data_ptr = args[0].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg0 (data) must be a device pointer".to_string()))?;
+        let mut key = [0u32; 8];
+        for (i, slot) in key.iter_mut().enumerate() {
+            *slot = args[1 + i].as_u32().ok_or_else(|| GpuError::LaunchFailed(format!("arg{} (key[{i}]) must be u32", 1 + i)))?;
+        }
+        let mut nonce = [0u32; 3];
+        for (i, slot) in nonce.iter_mut().enumerate() {
+            *slot = args[9 + i].as_u32().ok_or_else(|| GpuError::LaunchFailed(format!("arg{} (nonce[{i}]) must be u32", 9 + i)))?;
+        }
+        let counter = args[12].as_u32().ok_or_else(|| GpuError::LaunchFailed("arg12 (counter) must be u32".to_string()))?;
+
+        self.pipeline_for(&kernel.name, dxil)?;
+        let (data_res, length_words) = {
+            let map = self.allocations.lock().unwrap();
+            let alloc = map.get(&data_ptr.addr).ok_or(GpuError::InvalidPtr(data_ptr))?;
+            if alloc.len % 4 != 0 {
+                return Err(GpuError::LaunchFailed("chacha20 data buffer length must be a multiple of 4 bytes".to_string()).into());
+            }
+            (alloc.resource.clone(), (alloc.len / 4) as u32)
+        };
+
+        let mut root_constants = Vec::with_capacity(13);
+        root_constants.extend_from_slice(&key);
+        root_constants.extend_from_slice(&nonce);
+        root_constants.push(counter);
+        root_constants.push(length_words);
+
+        let num_blocks = length_words.div_ceil(16);
+        let group_count = num_blocks.div_ceil(64); // シェーダー側のnumthreads(64,1,1)と一致させる
+
+        self.dispatch_with_pipeline(&kernel.name, &[data_res], &root_constants, (group_count, 1, 1))?;
+        Ok(())
+    }
 }
 
 fn buffer_desc(bytes: usize, flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
@@ -408,49 +551,15 @@ impl GpuDevice for DirectXDevice {
             KernelSource::Dxil(bytes) => bytes,
             other => return Err(GpuError::UnsupportedKernel(other.kind()).into()),
         };
-        if !matches!(kernel.name.as_str(), "vector_add" | "vector_add_f32") {
-            return Err(GpuError::UnsupportedKernel("DirectXDevice only dispatches vector_add/vector_add_f32").into());
+        match kernel.name.as_str() {
+            "vector_add" | "vector_add_f32" => self.dispatch_vector_add(kernel, dxil, cfg, args),
+            "matmul" | "matmul_f32" => self.dispatch_matmul(kernel, dxil, cfg, args),
+            "chacha20" | "chacha20_encrypt" => self.dispatch_chacha20(kernel, dxil, args),
+            _ => Err(GpuError::UnsupportedKernel(
+                "DirectXDevice only dispatches vector_add/vector_add_f32, matmul/matmul_f32, chacha20/chacha20_encrypt",
+            )
+            .into()),
         }
-        if args.len() != 4 {
-            return Err(GpuError::LaunchFailed("vector_add expects 4 args: a, b, c, n".to_string()).into());
-        }
-        let a = args[0].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg0 must be a device pointer".to_string()))?;
-        let b = args[1].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg1 must be a device pointer".to_string()))?;
-        let c = args[2].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg2 must be a device pointer".to_string()))?;
-        let n = args[3].as_usize().ok_or_else(|| GpuError::LaunchFailed("arg3 must be usize/u32".to_string()))?;
-
-        self.pipeline_for(&kernel.name, dxil)?;
-
-        let (a_res, b_res, c_res) = {
-            let map = self.allocations.lock().unwrap();
-            let a_res = map.get(&a.addr).ok_or(GpuError::InvalidPtr(a))?.resource.clone();
-            let b_res = map.get(&b.addr).ok_or(GpuError::InvalidPtr(b))?.resource.clone();
-            let c_res = map.get(&c.addr).ok_or(GpuError::InvalidPtr(c))?.resource.clone();
-            (a_res, b_res, c_res)
-        };
-
-        let pipelines = self.pipelines.lock().unwrap();
-        let pipeline = pipelines.get(&kernel.name).expect("pipeline_for just inserted this key");
-        let root_signature = pipeline.root_signature.clone();
-        let pso = pipeline.pso.clone();
-        drop(pipelines);
-
-        let group_count_x = cfg.grid.0.max(1);
-        let n_u32 = u32::try_from(n).map_err(|_| GpuError::LaunchFailed("n does not fit in u32".to_string()))?;
-
-        self.execute_and_wait(|cl| {
-            unsafe {
-                cl.SetPipelineState(&pso);
-                cl.SetComputeRootSignature(&root_signature);
-                cl.SetComputeRootUnorderedAccessView(0, a_res.GetGPUVirtualAddress());
-                cl.SetComputeRootUnorderedAccessView(1, b_res.GetGPUVirtualAddress());
-                cl.SetComputeRootUnorderedAccessView(2, c_res.GetGPUVirtualAddress());
-                cl.SetComputeRoot32BitConstant(3, n_u32, 0);
-                cl.Dispatch(group_count_x, 1, 1);
-            }
-            Ok(())
-        })?;
-        Ok(())
     }
 
     fn synchronize(&self) -> Result<()> {

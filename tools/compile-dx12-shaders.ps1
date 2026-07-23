@@ -23,3 +23,9 @@ Write-Host "using dxc: $dxc"
 $shaderDir = Join-Path $root "crates\opencuda-directx\shaders"
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add.hlsl") -Fo (Join-Path $shaderDir "vector_add.dxil")
 Write-Host "OK: compiled vector_add.hlsl -> vector_add.dxil"
+
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "matmul.hlsl") -Fo (Join-Path $shaderDir "matmul.dxil")
+Write-Host "OK: compiled matmul.hlsl -> matmul.dxil"
+
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "chacha20.hlsl") -Fo (Join-Path $shaderDir "chacha20.dxil")
+Write-Host "OK: compiled chacha20.hlsl -> chacha20.dxil"
