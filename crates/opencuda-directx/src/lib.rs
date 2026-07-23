@@ -351,8 +351,153 @@ mod real_hardware_tests {
         }
     }
 
+    /// 実機でのmatmul(行優先、C = A × B)ディスパッチ。`vector_add.dxil`
+    /// と同じくコンパイル済み`matmul.dxil`が無い場合はスキップする。
+    #[test]
+    fn real_d3d12_dispatches_matmul_and_matches_cpu_reference() {
+        let dxil_path = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/matmul.dxil");
+        let dxil = match std::fs::read(dxil_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("skipping real D3D12 matmul test: cannot read {dxil_path}: {e} (run tools/compile-dx12-shaders.sh first)");
+                return;
+            }
+        };
+
+        let device = match DirectXDevice::new(0) {
+            Ok(dev) => dev,
+            Err(e) => {
+                eprintln!("skipping real D3D12 matmul test: {e}");
+                return;
+            }
+        };
+        let dev: std::sync::Arc<dyn opencuda_core::GpuDevice> = device;
+
+        // A: 4x3, B: 3x5, C: 4x5 (行優先)。
+        let (m, k, n) = (4usize, 3usize, 5usize);
+        let av: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.5).collect();
+        let bv: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.25).collect();
+        let mut expected = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for i in 0..k {
+                    sum += av[row * k + i] * bv[i * n + col];
+                }
+                expected[row * n + col] = sum;
+            }
+        }
+
+        let a = alloc_buffer(&dev, m * k * 4).unwrap();
+        let b = alloc_buffer(&dev, k * n * 4).unwrap();
+        let c = alloc_buffer(&dev, m * n * 4).unwrap();
+        a.copy_from_host(f32_slice_as_bytes(&av)).unwrap();
+        b.copy_from_host(f32_slice_as_bytes(&bv)).unwrap();
+
+        let kernel = opencuda_core::CompiledKernel::dxil("matmul", "main", dxil);
+        let cfg = opencuda_core::LaunchConfig::grid2d(m as u32, n as u32, 8, 8);
+        dev.launch_kernel(
+            &kernel,
+            &cfg,
+            &[
+                opencuda_core::KernelArg::Ptr(a.as_ptr()),
+                opencuda_core::KernelArg::Ptr(b.as_ptr()),
+                opencuda_core::KernelArg::Ptr(c.as_ptr()),
+                opencuda_core::KernelArg::Usize(m),
+                opencuda_core::KernelArg::Usize(k),
+                opencuda_core::KernelArg::Usize(n),
+            ],
+        )
+        .unwrap();
+
+        let mut out = vec![0u8; m * n * 4];
+        c.copy_to_host(&mut out).unwrap();
+        let result: Vec<f32> = out.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+        for (r, e) in result.iter().zip(expected.iter()) {
+            assert!((r - e).abs() < 1e-3, "GPU matmul result {r} does not match CPU reference {e}");
+        }
+    }
+
     fn f32_slice_as_bytes(values: &[f32]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) }
+    }
+
+    /// 実機でのChaCha20ディスパッチ。RustCrypto製`chacha20`クレート
+    /// (CPU参照実装)と同一の鍵・ノンス・カウンタ・平文で暗号化した
+    /// 結果がバイト単位で完全一致することを検証する(自己記憶頼りの
+    /// RFCテストベクタ転記ミスのリスクを避けるため、信頼できる既存
+    /// 実装との突き合わせという方法を採用)。
+    #[test]
+    fn real_d3d12_dispatches_chacha20_and_matches_rustcrypto_reference() {
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
+        use chacha20::ChaCha20;
+
+        let dxil_path = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/chacha20.dxil");
+        let dxil = match std::fs::read(dxil_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("skipping real D3D12 chacha20 test: cannot read {dxil_path}: {e} (run tools/compile-dx12-shaders.sh first)");
+                return;
+            }
+        };
+
+        let device = match DirectXDevice::new(0) {
+            Ok(dev) => dev,
+            Err(e) => {
+                eprintln!("skipping real D3D12 chacha20 test: {e}");
+                return;
+            }
+        };
+        let dev: std::sync::Arc<dyn opencuda_core::GpuDevice> = device;
+
+        let key_bytes: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let nonce_bytes: [u8; 12] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00];
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it. Extra padding to span multiple 64-byte ChaCha20 blocks for a more thorough test!!";
+
+        // CPU参照実装(RustCrypto)
+        let mut cpu_buf = plaintext.to_vec();
+        // 64バイト境界に揃える(GPU側はブロック単位でのみ処理するため、
+        // 端数が出ないようテストデータ自体を4の倍数長にしてある)。
+        let mut cipher = ChaCha20::new(&key_bytes.into(), &nonce_bytes.into());
+        cipher.apply_keystream(&mut cpu_buf);
+
+        // GPU実装
+        let mut key_words = [0u32; 8];
+        for (i, chunk) in key_bytes.chunks_exact(4).enumerate() {
+            key_words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        let mut nonce_words = [0u32; 3];
+        for (i, chunk) in nonce_bytes.chunks_exact(4).enumerate() {
+            nonce_words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+
+        // データ長を4バイト境界へパディング(GPUカーネルはu32ワード単位)。
+        let mut gpu_buf = plaintext.to_vec();
+        while gpu_buf.len() % 4 != 0 {
+            gpu_buf.push(0);
+        }
+
+        let data = alloc_buffer(&dev, gpu_buf.len()).unwrap();
+        data.copy_from_host(&gpu_buf).unwrap();
+
+        let kernel = opencuda_core::CompiledKernel::dxil("chacha20", "main", dxil);
+        let cfg = opencuda_core::LaunchConfig::linear(1, 1); // dispatch_chacha20は独自にgroup countを計算するため未使用
+        let mut launch_args = vec![opencuda_core::KernelArg::Ptr(data.as_ptr())];
+        for k in key_words {
+            launch_args.push(opencuda_core::KernelArg::U32(k));
+        }
+        for n in nonce_words {
+            launch_args.push(opencuda_core::KernelArg::U32(n));
+        }
+        launch_args.push(opencuda_core::KernelArg::U32(0)); // counter_base = 0 (RustCrypto ChaCha20::newの既定開始位置と一致させる)
+
+        dev.launch_kernel(&kernel, &cfg, &launch_args).unwrap();
+
+        let mut gpu_result = vec![0u8; gpu_buf.len()];
+        data.copy_to_host(&mut gpu_result).unwrap();
+
+        assert_eq!(&gpu_result[..plaintext.len()], &cpu_buf[..], "GPU ChaCha20 output does not match RustCrypto CPU reference");
     }
 }
 

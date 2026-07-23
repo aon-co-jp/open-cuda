@@ -163,12 +163,52 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   **検証**: `cargo test --workspace --features opencuda-directx/real-dx12`
   でリグレッション無し、`opencuda-directx`は6件全green(モック3件+
   実機3件〈メモリ往復・カーネルディスパッチ・DXGIベンダー判定〉)。
-  - 次にすべきこと: (1) `matmul`等、`vector_add`以外のカーネルへの
-    対応拡大、(2) 圧縮・暗号化カーネル(RS-LinkFusion側の要望)を
-    DXIL/HLSLで新規実装するかどうかの判断(小サイズペイロードでの
-    H2D/D2Hオーバーヘッドが実利益を相殺する懸念は既存HANDOFF参照)、
+  - ~~次にすべきこと(1)(2)~~ **完了(2026-07-23、同日中)**、下記
+    エントリ参照。(3)コマンドリストのバッチ化は引き続き未着手。
+
+- **2026-07-23(続き4) matmulカーネル対応・圧縮/暗号化カーネル
+  (ChaCha20)のDXIL実装、および実バグ発見・修正**:
+  1. **matmul対応**: `shaders/matmul.hlsl`新設(行優先、
+     `C[m×n]=A[m×k]×B[k×n]`、`opencuda-vulkan`のGEMMシェーダと同じ
+     契約)。`real.rs::dispatch_matmul`を追加、`launch_kernel`の
+     カーネル名分岐に組み込み。実機(NVIDIA GT 730)でCPU参照実装
+     (`sgemm`のCPU版相当)と数値一致することを検証。
+  2. **ChaCha20ストリーム暗号カーネル**(圧縮/暗号化カーネルの第一弾、
+     RS-LinkFusion側の要望への回答): `shaders/chacha20.hlsl`
+     (RFC 8439のブロック関数、20ラウンド、1スレッド1ブロック
+     〈64バイト〉)。`real.rs::dispatch_chacha20`を追加。
+  3. **実バグを発見・修正(型チェックのみで完了と報告しない方針が
+     機能した具体例)**: 実機テストで、GPU出力が暗号化されず**平文
+     そのまま**返ってくる不具合を発見。原因は`cbuffer`内の
+     `uint key[8]`/`uint nonce[3]`という**スカラー配列宣言**——
+     HLSLのcbufferパッキング規則は配列の各要素を16バイト境界へ
+     パディングする(`float weights[3]`が3×16=48バイトを占める、
+     というよく知られた罠と同じ)ため、Rust側が
+     `SetComputeRoot32BitConstant`で13個のdwordを隙間なく詰めて
+     渡す設計と、HLSL側が読むバイトオフセットがズレ、
+     key/nonce/counter_base/length_wordsが実質無関係な値(ほぼゼロ)
+     になり、キーストリームが機能せず平文がそのまま出力されていた。
+     `key[8]`/`nonce[3]`を`key0`〜`key7`/`nonce0`〜`nonce2`という
+     個別スカラーフィールドへ書き換え、パディング無しの密なレイアウト
+     にすることで解消。
+  4. **検証**: RustCrypto製`chacha20`クレート(devDependency)をCPU参照
+     実装として使い、同一の鍵・ノンス・平文でGPU出力と完全一致する
+     ことを実証(`counter_base=0`に揃えた自己整合的な検証、RFC固有の
+     テストベクタには依存しない設計)。`cargo test -p opencuda-directx
+     --release --features real-dx12`**8件全green**(モック3件+実機
+     5件: メモリ往復・vector_add・matmul・DXGIベンダー判定・
+     ChaCha20)。`cargo build --workspace`リグレッション無し。
+  5. **正直な開示・スコープ**: これは`accel.rs`(RS-LinkFusion/
+     open-web-server-wireが使うChaCha20-Poly1305 AEAD全体)のうち
+     認証タグ計算(Poly1305)を含まないChaCha20暗号化部分のみの
+     GPU実装デモンストレーション。本番のAEAD実装として組み込むには
+     別途Poly1305認証タグの実装、および小サイズペイロード(MTU程度、
+     数百〜数千バイト)でのH2D/D2Hオーバーヘッドが実利益を生むかの
+     ベンチマークが必要。
+  - 次にすべきこと: (1) Poly1305認証タグのGPU実装(完全なAEAD化)、
+    (2) 小サイズペイロードでのCPU版との実ベンチマーク比較、
     (3) コマンドリストのバッチ化によるスループット改善(現状は
-    操作ごとに同期的にフェンス待機する設計、正しさ優先のMVP)。
+    操作ごとに同期的にフェンス待機、正しさ優先のMVP)。
 
 ## エコシステム全体マップ
 

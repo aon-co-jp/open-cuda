@@ -12,6 +12,11 @@ opencuda-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# ChaCha20 GPUカーネルの正しさを検証するためのCPU参照実装
+# (RustCrypto製、監査実績のあるクレート。テストコードのみで使用)。
+chacha20 = "0.9"
+
 [features]
 default = []
 real-dx12 = ["dep:windows"]
