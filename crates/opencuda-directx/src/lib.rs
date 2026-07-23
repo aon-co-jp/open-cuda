@@ -273,6 +273,26 @@ mod real_hardware_tests {
         assert_eq!(&out, data);
     }
 
+    /// DXGIアダプタ列挙によるベンダー判定(2026-07-23追加)。実機で
+    /// `GpuVendor::Unknown`のまま(=DXGI列挙が機能していない)になって
+    /// いないか、デバイス名がプレースホルダ文字列のままになっていない
+    /// かを検証する。
+    #[test]
+    fn real_d3d12_device_reports_a_real_adapter_name_and_known_vendor_via_dxgi() {
+        let device = match DirectXDevice::new(0) {
+            Ok(dev) => dev,
+            Err(e) => {
+                eprintln!("skipping real D3D12 test: {e}");
+                return;
+            }
+        };
+        let dev: std::sync::Arc<dyn opencuda_core::GpuDevice> = device;
+        let info = dev.info();
+        println!("DXGI adapter: name={:?} vendor={:?} total_memory={}", info.name, info.vendor, info.total_memory);
+        assert_ne!(info.name, "DirectX 12 Device (default adapter, feature level 11_0+)", "DXGI enumeration did not run; fell back to the generic placeholder name");
+        assert!(!matches!(info.vendor, opencuda_core::GpuVendor::Unknown), "DXGI enumeration did not resolve a known vendor ID");
+    }
+
     /// 実機でのDXILカーネルディスパッチ(Phase 2)。事前コンパイル済み
     /// `vector_add.dxil`が無い場合(`tools/compile-dx12-shaders.sh`未実行)
     /// は`eprintln!`でスキップする(Vulkanの`matmul_vulkan_real`テストと

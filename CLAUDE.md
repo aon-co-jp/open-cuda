@@ -138,12 +138,36 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      --features opencuda-directx/real-dx12`ともリグレッション無し、
      全テストgreen(`opencuda-directx`は5件: モック3件+実機2件
      〈メモリ往復+カーネルディスパッチ〉)。
+  - ~~次にすべきこと(2) DXGIアダプタ列挙~~ **完了(2026-07-23、
+    同日中)**、下記エントリ参照。
+
+- **2026-07-23(続き3) DXGIアダプタ列挙による`GpuVendor`判定を実装**:
+  `IDXGIFactory1::EnumAdapters1(0)`でデフォルトアダプタ(通常は最も
+  高性能なディスクリートGPU)を列挙し、`DXGI_ADAPTER_DESC1`から
+  `VendorId`(0x10DE=NVIDIA/0x1002・0x1022=AMD/0x8086=Intel)・
+  `Description`(アダプタ名、UTF-16→Rust文字列変換)・
+  `DedicatedVideoMemory`を取得。取得したアダプタハンドルはそのまま
+  `D3D12CreateDevice`へ渡す(従来の`None`=OS既定選択から変更、実際に
+  列挙したアダプタでデバイスを作る)。DXGI列挙が失敗した場合は
+  `None`パスへ安全にフォールバックする設計(付加情報であり必須要件
+  ではないため)。**正直な開示**: `compute_capability`/`gfx_version`/
+  `architecture`はDXGIからは取得できない詳細情報のため
+  `(0,0)`/`"unknown"`のプレースホルダのまま(CUDA/ROCm等ベンダー
+  固有APIでの取得が必要、今回スコープ外)。
+  **実機検証**: `real_d3d12_device_reports_a_real_adapter_name_and_known_vendor_via_dxgi`
+  テストが実際に`name="NVIDIA GeForce GT 730"`・
+  `vendor=Nvidia { compute_capability: (0, 0) }`・
+  `total_memory=2104819712`(約2GB)を取得できることを確認
+  (プレースホルダ名のままになっていないこと・`Unknown`のままに
+  なっていないことを明示的にassert)。
+  **検証**: `cargo test --workspace --features opencuda-directx/real-dx12`
+  でリグレッション無し、`opencuda-directx`は6件全green(モック3件+
+  実機3件〈メモリ往復・カーネルディスパッチ・DXGIベンダー判定〉)。
   - 次にすべきこと: (1) `matmul`等、`vector_add`以外のカーネルへの
-    対応拡大、(2) DXGIアダプタ列挙による`GpuVendor`判定の実装、
-    (3) 圧縮・暗号化カーネル(RS-LinkFusion側の要望)をDXIL/HLSLで
-    新規実装するかどうかの判断(小サイズペイロードでのH2D/D2H
-    オーバーヘッドが実利益を相殺する懸念は既存HANDOFF参照)、
-    (4) コマンドリストのバッチ化によるスループット改善(現状は
+    対応拡大、(2) 圧縮・暗号化カーネル(RS-LinkFusion側の要望)を
+    DXIL/HLSLで新規実装するかどうかの判断(小サイズペイロードでの
+    H2D/D2Hオーバーヘッドが実利益を相殺する懸念は既存HANDOFF参照)、
+    (3) コマンドリストのバッチ化によるスループット改善(現状は
     操作ごとに同期的にフェンス待機する設計、正しさ優先のMVP)。
 
 ## エコシステム全体マップ
