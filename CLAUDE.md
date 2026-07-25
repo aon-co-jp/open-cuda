@@ -455,3 +455,17 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     実装され次第、フォールバック優先順位(現状はスタブ<Vulkan)を
     ベンダー専用経路優先へ戻す必要がある旨は`select_gemm_path`の
     docコメントに明記した。
+
+- **2026-07-25 Android-Vulkan互換性の監査(`opencuda-vulkan`)+ 実際にaarch64-linux-android向けクロスコンパイル成功まで確認**:
+  1. **ソース監査**: `crates/opencuda-vulkan/src/real.rs`を精査した結果、Windows/Linuxデスクトップ専有の前提は見つからなかった——サーフェス/ウィンドウイングAPI(`VK_KHR_surface`/`VK_KHR_win32_surface`/`VK_KHR_xlib_surface`等)への依存は一切無く、`Entry::load()`(`ash`の動的ロード、`vulkan-1.dll`/`libvulkan.so`をプラットフォームに応じて自動選択)から`vkCreateInstance`→物理デバイス列挙→論理デバイス作成という、完全にヘッドレスなCompute専用の初期化のみ。`Cargo.toml`も`ash = { version = "0.37", default-features = false, features = ["loaded"] }`で、`cfg(windows)`/`cfg(target_os = "linux")`等のプラットフォーム分岐は`opencuda-vulkan`のソース中に1つも存在しない。
+  2. **実クロスコンパイル検証(型チェックだけで完了と報告しない方針を徹底、このマシンに実際にAndroid NDK 27.1.12297006とRust向け`aarch64-linux-android`ターゲットがインストール済みであることを確認した上で実施)**:
+     ```
+     $ cargo build -p opencuda-vulkan --target aarch64-linux-android --features real-vulkan
+     Compiling ash v0.37.3+1.3.251
+     Compiling opencuda-vulkan v0.4.1 (F:\runo\open-cuda\crates\opencuda-vulkan)
+     Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.68s
+     ```
+     (`AR_aarch64_linux_android`/`CC_aarch64_linux_android`/`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER`をNDKのclangラッパーへ設定した上で実行、`file`コマンドで生成された`libopencuda_vulkan.rlib`が実際にar archiveとして出力されていることも確認)。
+  3. **正直な開示・確認できていないこと**: 上記はあくまで**クロスコンパイルの成功**(ビルドが通ること)の確認であり、実Android端末/エミュレータ上での実行(`vkCreateInstance`が実際に成功しVulkanデバイスを列挙できるか、`.so`としてリンクしAPKへ組み込んで動作するか)は未検証(実機/エミュレータでの検証環境がこのセッションには無い)。既知の懸念点として: (a) AndroidはVulkanドライバの実装差異(特に古い端末・エミュレータ)が大きく、`vkCreateInstance`自体は成功してもGPU固有の挙動差が実機でしか分からない、(b) このクレートは`cdylib`としてのビルド設定(JNI経由で呼び出す場合に必要な`crate-type`)が現状無い(`rlib`のみ)ため、実際にAndroidアプリへ組み込むにはJNIブリッジ層(または`aruaru-llm/android`のようなHTTPクライアント構成に倣う)が別途必要。
+  4. **結論**: Android-Vulkan対応の**アーキテクチャ上の明確なブロッカーは見つからなかった**(ヘッドレスCompute専用設計がAndroidのVulkanネイティブ対応と自然に噛み合う)。ただし「Android対応が完了した」と主張するものではなく、あくまで「クロスコンパイルが実際に通ることを確認した」段階の報告である。
+  - 次にすべきこと: (1) `cdylib`ビルド設定の追加+JNIブリッジ(またはaruaru-llm/android方式のHTTPクライアント経由での間接利用)の設計、(2) 実Android端末/エミュレータでの`vkCreateInstance`実行検証(環境が整い次第)、(3) `opencuda-directx`(D3D12、Windows専用)側は今回のスコープ外のまま。
