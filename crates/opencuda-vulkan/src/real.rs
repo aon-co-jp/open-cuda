@@ -700,6 +700,14 @@ fn vendor_from_id(vendor_id: u32) -> GpuVendor {
         0x10DE => GpuVendor::Nvidia { compute_capability: (0, 0) },
         0x1002 | 0x1022 => GpuVendor::Amd { gfx_version: "unknown".to_string() },
         0x8086 => GpuVendor::Intel { architecture: "unknown".to_string() },
+        // 2026-07-25追加: Android/モバイルGPUベンダー(先行するAndroid-Vulkan
+        // クロスコンパイル監査が実機Vulkan列挙で未対応と指摘した箇所)。
+        // ベンダーIDはpci-ids.ucw.cz/Web検索で裏取り済み(このマシンの
+        // 実機はNVIDIA GT 730のみのため、これらの分岐は型チェックのみで
+        // 実機Vulkan列挙では未検証)。
+        0x5143 => GpuVendor::Qualcomm { architecture: "unknown".to_string() },
+        0x13B5 => GpuVendor::Arm { architecture: "unknown".to_string() },
+        0x1010 => GpuVendor::ImaginationPowerVr { architecture: "unknown".to_string() },
         _ => GpuVendor::Unknown,
     }
 }

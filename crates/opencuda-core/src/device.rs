@@ -13,6 +13,19 @@ pub enum GpuVendor {
     Nvidia { compute_capability: (u32, u32) },
     Amd { gfx_version: String },
     Intel { architecture: String },
+    /// Qualcomm Adreno(モバイルGPU、PCI/VulkanベンダーID`0x5143`、
+    /// pci-ids.ucw.czで"Qualcomm Inc"と確認済み——2026-07-25、
+    /// Android-Vulkan監査の続きとして追加)。
+    Qualcomm { architecture: String },
+    /// ARM Mali(モバイルGPU、PCI/VulkanベンダーID`0x13B5`、
+    /// pci-ids.ucw.czで"ARM"と確認済み)。
+    Arm { architecture: String },
+    /// Imagination Technologies PowerVR(モバイル/組込みGPU、PCI/Vulkan
+    /// ベンダーID`0x1010`。pci-ids.ucw.czでは"Video Logic, Ltd."名義だが、
+    /// これはImagination Technologies設立前の旧社名(PowerVR部門の前身、
+    /// Wikipedia "PowerVR"項目で"formerly VideoLogic"と裏付け済み)であり
+    /// 同一のPCIベンダーIDが引き継がれている)。
+    ImaginationPowerVr { architecture: String },
     /// CPUバックエンド（Phase 1 の最初の実行ターゲット）。
     Cpu,
     Unknown,
