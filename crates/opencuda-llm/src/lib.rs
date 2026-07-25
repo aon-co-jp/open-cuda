@@ -14,20 +14,19 @@
 //!   〈continuous batching〉、複数リクエストの同時処理)を一切実装して
 //!   いない**。単一シーケンスを1件ずつ、KVキャッシュを使って逐次デコード
 //!   するだけの素朴な実装(いわば「vLLMが最適化する前のベースライン」)。
-//! - **学習済みの重みは無い**。実在するGPT系モデルの`safetensors`を
-//!   読み込むローダーは(`opencuda-bert`のBERT版と違い)まだ実装しておらず、
-//!   決定的な疑似乱数(`SplitMix64`)で初期化したランダム重みのみを使う。
-//!   したがって生成されるテキストは意味を持たない——本クレートが検証
-//!   しているのは「言語モデルとして自然な文章を生成できるか」ではなく
-//!   「トークン埋め込み→複数デコーダ層(Self-Attention+FFN)→KVキャッシュ
-//!   による逐次デコード→貪欲サンプリング、という自己回帰生成パイプライン
-//!   の配線が正しく動くか」である。実在の学習済み重み(GPT-2小型版等の
-//!   `safetensors`)を読み込むローダーの追加は次の増分。
-//! - **トークナイザはUTF-8バイト単位の素朴なもの**(`tokenizers`クレート
-//!   による本格的なBPE/SentencePieceではない)。外部ファイル・追加の
-//!   数百MB級モデルダウンロードを要さずに端から端まで動く最小構成を
-//!   優先した設計判断(このタスクの制約「大きすぎる依存関係を避ける」
-//!   に沿った選択)。
+//! - **2026-07-25追記: 実在の学習済み重み(GPT-2 124M、`openai-community/gpt2`)
+//!   を読み込む`GptModel::load`を追加した**(`opencuda-bert::BertModel::load`
+//!   と同じ設計、safetensorsを直接パース)。デフォルトのコンストラクタは
+//!   引き続き決定的な疑似乱数(`SplitMix64`)による`load_random`(既存の
+//!   最小構成テスト・KVキャッシュ数値一致テストはこちらを使い続ける、
+//!   後方互換)。実重みを使うにはGPT-2自身のBPE語彙に対応した
+//!   `GptTokenizer`(下記)が必要——`ByteTokenizer`(バイト値=トークンID)を
+//!   実重みと組み合わせても、GPT-2のBPE語彙とは無関係なIDを渡すことに
+//!   なるため意味のある出力は得られない。
+//! - **トークナイザ**: 従来通り既定は`ByteTokenizer`(UTF-8バイト単位、
+//!   外部ファイル不要)。実重みでの検証用に`tokenizers`クレートによる
+//!   本格的なBPE/SentencePiece対応`GptTokenizer`(GPT-2の`tokenizer.json`を
+//!   読み込む)も追加した。
 //! - Attentionは`opencuda-bert`と同じく`opencuda-blas::scaled_dot_product_attention`
 //!   (非タイル化の素朴な実装)をそのまま使う。KVキャッシュ付きの1トークン
 //!   ずつの生成では、クエリ行を`n`回複製して`n x n`のattentionを計算し
@@ -36,8 +35,11 @@
 //!   本来必要な計算量よりO(n)倍無駄が多い——専用のcausal-attention
 //!   カーネルを`opencuda-blas`に追加するのが次の最適化)。
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use opencuda_core::GpuDevice;
+use serde::Deserialize;
 
 /// デコーダの設定(GPT系アーキテクチャの最小構成)。
 #[derive(Debug, Clone)]
@@ -64,6 +66,134 @@ impl GptConfig {
             layer_norm_eps: 1e-5,
         }
     }
+}
+
+/// `config.json`(Hugging Face GPT-2形式)の生パース用構造体。
+/// `GptConfig`と1対1ではない(フィールド名が異なる、`n_ctx`と
+/// `n_positions`のどちらか一方しか無いモデルもある)ため、変換関数
+/// `GPT2Config::into_gpt_config`を介する。
+#[derive(Debug, Deserialize)]
+struct GPT2Config {
+    vocab_size: usize,
+    n_embd: usize,
+    n_layer: usize,
+    n_head: usize,
+    #[serde(default)]
+    n_ctx: Option<usize>,
+    #[serde(default)]
+    n_positions: Option<usize>,
+    #[serde(default = "default_gpt2_eps")]
+    layer_norm_epsilon: f32,
+}
+
+fn default_gpt2_eps() -> f32 {
+    1e-5
+}
+
+impl GPT2Config {
+    fn into_gpt_config(self) -> Result<GptConfig> {
+        let max_seq_len = self
+            .n_positions
+            .or(self.n_ctx)
+            .context("opencuda-llm: config.json must have n_positions or n_ctx")?;
+        anyhow::ensure!(self.n_embd % self.n_head == 0, "opencuda-llm: n_embd {} not divisible by n_head {}", self.n_embd, self.n_head);
+        Ok(GptConfig {
+            vocab_size: self.vocab_size,
+            hidden_size: self.n_embd,
+            num_layers: self.n_layer,
+            num_heads: self.n_head,
+            intermediate_size: 4 * self.n_embd,
+            max_seq_len,
+            layer_norm_eps: self.layer_norm_epsilon,
+        })
+    }
+}
+
+fn tensor_f32(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>> {
+    let view = tensors.tensor(name).with_context(|| format!("opencuda-llm: missing tensor '{name}'"))?;
+    anyhow::ensure!(
+        view.dtype() == safetensors::Dtype::F32,
+        "opencuda-llm: tensor '{name}' has unexpected dtype {:?} (expected F32)",
+        view.dtype()
+    );
+    let bytes = view.data();
+    anyhow::ensure!(bytes.len() % 4 == 0, "opencuda-llm: tensor '{name}' byte length not a multiple of 4");
+    let mut out = vec![0.0f32; bytes.len() / 4];
+    for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+        *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    Ok(out)
+}
+
+/// `[out_dim, in_dim]`(行優先)を`[in_dim, out_dim]`へ転置する
+/// (`opencuda-bert`の同名ヘルパーと同じ用途。GPT-2のトークン埋め込み
+/// `wte.weight`は`[vocab_size, hidden]`で保存されており、重み共有
+/// 〈weight tying〉される`lm_head`としては`[hidden, vocab_size]`
+/// レイアウトが必要なため転置する)。
+fn transpose(src: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; src.len()];
+    for o in 0..out_dim {
+        for i in 0..in_dim {
+            out[i * out_dim + o] = src[o * in_dim + i];
+        }
+    }
+    out
+}
+
+/// GPT-2の`Conv1D`層(`nn.Linear`と違い`[in_dim, out_dim]`のまま保存、
+/// 転置不要)から`Linear`を組み立てる。
+fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
+    let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
+    anyhow::ensure!(
+        weight.len() == in_dim * out_dim,
+        "opencuda-llm: '{prefix}.weight' has {} elements, expected {}x{}",
+        weight.len(),
+        in_dim,
+        out_dim
+    );
+    let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
+    Ok(Linear { weight_t: weight, bias, in_dim, out_dim })
+}
+
+/// GPT-2はQ/K/Vを1本の`c_attn`(`[hidden, 3*hidden]`)へ融合して保存する。
+/// `Linear::forward`はヘッドごとに独立した`Linear`を要求するため、
+/// 出力次元(列)方向に3分割してQ/K/Vそれぞれの`Linear`を作る。
+fn load_fused_qkv(tensors: &safetensors::SafeTensors, prefix: &str, hidden: usize) -> Result<(Linear, Linear, Linear)> {
+    let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
+    anyhow::ensure!(
+        weight.len() == hidden * 3 * hidden,
+        "opencuda-llm: '{prefix}.weight' has {} elements, expected {}x{}",
+        weight.len(),
+        hidden,
+        3 * hidden
+    );
+    let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
+    anyhow::ensure!(bias.len() == 3 * hidden, "opencuda-llm: '{prefix}.bias' has {} elements, expected {}", bias.len(), 3 * hidden);
+
+    let split = |idx: usize| -> (Vec<f32>, Vec<f32>) {
+        let col_start = idx * hidden;
+        let mut w = vec![0.0f32; hidden * hidden];
+        for (dst_row, src_row) in w.chunks_exact_mut(hidden).zip(weight.chunks_exact(3 * hidden)) {
+            dst_row.copy_from_slice(&src_row[col_start..col_start + hidden]);
+        }
+        let b = bias[col_start..col_start + hidden].to_vec();
+        (w, b)
+    };
+
+    let (qw, qb) = split(0);
+    let (kw, kb) = split(1);
+    let (vw, vb) = split(2);
+    Ok((
+        Linear { weight_t: qw, bias: qb, in_dim: hidden, out_dim: hidden },
+        Linear { weight_t: kw, bias: kb, in_dim: hidden, out_dim: hidden },
+        Linear { weight_t: vw, bias: vb, in_dim: hidden, out_dim: hidden },
+    ))
+}
+
+fn load_layer_norm(tensors: &safetensors::SafeTensors, prefix: &str, eps: f32) -> Result<LayerNorm> {
+    let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
+    let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
+    Ok(LayerNorm { weight, bias, eps })
 }
 
 /// 決定的な疑似乱数生成器(SplitMix64)。学習済み重みが無い現段階で、
@@ -148,52 +278,49 @@ impl LayerNorm {
     }
 }
 
+/// `gelu_new`(GPT-2のHugging Face実装が使うtanh近似GELU、
+/// `config.json`の`activation_function: "gelu_new"`に対応)。
+/// `0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))`。
 fn gelu_inplace(x: &mut [f32]) {
+    const SQRT_2_OVER_PI: f64 = 0.7978845608028654;
     for v in x.iter_mut() {
         let xf = *v as f64;
-        *v = (0.5 * xf * (1.0 + libm_erf_approx(xf * std::f64::consts::FRAC_1_SQRT_2))) as f32;
+        let inner = SQRT_2_OVER_PI * (xf + 0.044715 * xf.powi(3));
+        *v = (0.5 * xf * (1.0 + inner.tanh())) as f32;
     }
 }
 
-/// `libm`に依存させないための簡易erf近似(Abramowitz&Stegun 7.1.26、
-/// 最大誤差約1.5e-7)。厳密なerfではないが、本クレートは重み自体が
-/// ランダムで学習済みではないため、この程度の近似精度で十分。
-fn libm_erf_approx(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-    let t = 1.0 / (1.0 + p * x);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
-    sign * y
-}
-
+/// **アーキテクチャ注記(2026-07-25、safetensorsローダー追加時に変更)**:
+/// 当初は(BERT/GPT-1系と同じ)post-LN——Attention/FFNの後に残差加算+LN——
+/// だったが、実在のGPT-2の学習済み重みをそのまま読み込んで意味のある
+/// 出力を得るには、GPT-2が採用しているpre-LN(Attention/FFNの「前」に
+/// 正規化を適用し、残差加算は正規化前の`hidden`に対して行う)へ構造を
+/// 合わせる必要があったため変更した。ランダム初期化パス(`load_random`)
+/// はpre-LN/post-LNどちらでも数学的な整合性(KVキャッシュ増分計算と
+/// フルスクラッチ再計算の一致)に影響しないため、既存テストへの
+/// 悪影響は無い。
 struct DecoderLayer {
+    ln_1: LayerNorm,
     query: Linear,
     key: Linear,
     value: Linear,
     attn_out: Linear,
-    attn_ln: LayerNorm,
+    ln_2: LayerNorm,
     intermediate: Linear,
     output: Linear,
-    output_ln: LayerNorm,
 }
 
 impl DecoderLayer {
     fn random(rng: &mut SplitMix64, hidden: usize, intermediate: usize, eps: f32) -> Self {
         Self {
+            ln_1: LayerNorm::identity(hidden, eps),
             query: Linear::random(rng, hidden, hidden),
             key: Linear::random(rng, hidden, hidden),
             value: Linear::random(rng, hidden, hidden),
             attn_out: Linear::random(rng, hidden, hidden),
-            attn_ln: LayerNorm::identity(hidden, eps),
+            ln_2: LayerNorm::identity(hidden, eps),
             intermediate: Linear::random(rng, hidden, intermediate),
             output: Linear::random(rng, intermediate, hidden),
-            output_ln: LayerNorm::identity(hidden, eps),
         }
     }
 
@@ -201,50 +328,56 @@ impl DecoderLayer {
     /// このレイヤーの`cache`へ今回のk/vを追加した上で出力を返す
     /// (causalマスクは「まだキャッシュに存在しない未来のトークンは
     /// そもそも追加されていない」ことで自然に実現される、明示的な
-    /// マスク行列は不要)。
+    /// マスク行列は不要)。pre-LN(GPT-2方式、上記構造体docコメント参照)。
     fn forward_step(&self, device: &dyn GpuDevice, hidden: &[f32], cache: &mut [KvCacheHead], hidden_size: usize, num_heads: usize) -> Result<Vec<f32>> {
         let head_dim = hidden_size / num_heads;
 
-        let q = self.query.forward(device, hidden, 1)?;
-        let k = self.key.forward(device, hidden, 1)?;
-        let v = self.value.forward(device, hidden, 1)?;
+        let mut normed = hidden.to_vec();
+        self.ln_1.forward(&mut normed, 1, hidden_size);
+
+        let q = self.query.forward(device, &normed, 1)?;
+        let k = self.key.forward(device, &normed, 1)?;
+        let v = self.value.forward(device, &normed, 1)?;
 
         let mut context = vec![0.0f32; hidden_size];
-        for h in 0..num_heads {
+        for (h, cache_head) in cache.iter_mut().enumerate().take(num_heads) {
             let col_start = h * head_dim;
             let q_h = &q[col_start..col_start + head_dim];
             let k_h = &k[col_start..col_start + head_dim];
             let v_h = &v[col_start..col_start + head_dim];
 
-            cache[h].push(k_h, v_h);
-            let n = cache[h].n;
+            cache_head.push(k_h, v_h);
+            let n = cache_head.n;
 
             // qを n 回複製して n x n の attention を計算し、先頭行(全行
             // 同一)だけを使う(モジュールdocコメント参照、素朴だが正しい)。
             let mut q_full = vec![0.0f32; n * head_dim];
-            for row in 0..n {
-                q_full[row * head_dim..(row + 1) * head_dim].copy_from_slice(q_h);
+            for row in q_full.chunks_exact_mut(head_dim) {
+                row.copy_from_slice(q_h);
             }
-            let out = opencuda_blas::scaled_dot_product_attention(device, &q_full, &cache[h].k, &cache[h].v, n, head_dim)?;
+            let out = opencuda_blas::scaled_dot_product_attention(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim)?;
             context[col_start..col_start + head_dim].copy_from_slice(&out[0..head_dim]);
         }
 
-        let mut attn_dense = self.attn_out.forward(device, &context, 1)?;
-        for i in 0..attn_dense.len() {
-            attn_dense[i] += hidden[i];
+        let attn_dense = self.attn_out.forward(device, &context, 1)?;
+        let mut hidden2 = hidden.to_vec();
+        for (a, b) in hidden2.iter_mut().zip(attn_dense.iter()) {
+            *a += b; // residual(正規化前のhiddenへ加算、pre-LN方式)
         }
-        self.attn_ln.forward(&mut attn_dense, 1, hidden_size);
 
-        let mut intermediate = self.intermediate.forward(device, &attn_dense, 1)?;
+        let mut normed2 = hidden2.clone();
+        self.ln_2.forward(&mut normed2, 1, hidden_size);
+
+        let mut intermediate = self.intermediate.forward(device, &normed2, 1)?;
         gelu_inplace(&mut intermediate);
 
-        let mut ffn_out = self.output.forward(device, &intermediate, 1)?;
-        for i in 0..ffn_out.len() {
-            ffn_out[i] += attn_dense[i];
+        let ffn_out = self.output.forward(device, &intermediate, 1)?;
+        let mut hidden3 = hidden2.clone();
+        for (a, b) in hidden3.iter_mut().zip(ffn_out.iter()) {
+            *a += b; // residual
         }
-        self.output_ln.forward(&mut ffn_out, 1, hidden_size);
 
-        Ok(ffn_out)
+        Ok(hidden3)
     }
 }
 
@@ -298,6 +431,74 @@ impl GptModel {
         Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head }
     }
 
+    /// `dir`配下の`config.json`・`model.safetensors`(Hugging Face GPT-2形式、
+    /// 例: `openai-community/gpt2`)を読み込む。`opencuda-bert::BertModel::load`
+    /// と同じ設計(config.json→safetensorsの順で読み、レイヤーごとに
+    /// テンソル名`h.{i}.*`を辿る)。
+    ///
+    /// アーキテクチャ上の注意点(`BertModel::load`との違い):
+    /// - GPT-2は`Conv1D`層(`[in_dim, out_dim]`のまま保存、転置不要)を使う。
+    ///   `nn.Linear`(`[out_dim, in_dim]`、転置が必要)のBERTとは逆。
+    /// - Q/K/Vは`c_attn`という1本の融合`Conv1D`(`[hidden, 3*hidden]`)に
+    ///   まとまっているため、列方向に3分割する(`load_fused_qkv`)。
+    /// - `lm_head`はトークン埋め込み`wte.weight`と重み共有(weight tying)
+    ///   されており、safetensors内に別テンソルとして存在しない
+    ///   ——`wte.weight`(`[vocab, hidden]`)を転置して使う。
+    pub fn load(dir: &Path) -> Result<Self> {
+        let config_json = std::fs::read_to_string(dir.join("config.json"))
+            .with_context(|| format!("opencuda-llm: failed to read config.json in {dir:?}"))?;
+        let raw_config: GPT2Config = serde_json::from_str(&config_json).context("opencuda-llm: failed to parse config.json")?;
+        let config = raw_config.into_gpt_config()?;
+
+        let weights_bytes = std::fs::read(dir.join("model.safetensors"))
+            .with_context(|| format!("opencuda-llm: failed to read model.safetensors in {dir:?}"))?;
+        let tensors = safetensors::SafeTensors::deserialize(&weights_bytes).context("opencuda-llm: failed to parse model.safetensors")?;
+
+        let hidden = config.hidden_size;
+        let word_embeddings = tensor_f32(&tensors, "wte.weight")?;
+        anyhow::ensure!(
+            word_embeddings.len() == config.vocab_size * hidden,
+            "opencuda-llm: 'wte.weight' has {} elements, expected {}x{}",
+            word_embeddings.len(),
+            config.vocab_size,
+            hidden
+        );
+        let position_embeddings = tensor_f32(&tensors, "wpe.weight")?;
+        anyhow::ensure!(
+            position_embeddings.len() == config.max_seq_len * hidden,
+            "opencuda-llm: 'wpe.weight' has {} elements, expected {}x{}",
+            position_embeddings.len(),
+            config.max_seq_len,
+            hidden
+        );
+
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for i in 0..config.num_layers {
+            let p = format!("h.{i}");
+            let (query, key, value) = load_fused_qkv(&tensors, &format!("{p}.attn.c_attn"), hidden)?;
+            layers.push(DecoderLayer {
+                ln_1: load_layer_norm(&tensors, &format!("{p}.ln_1"), config.layer_norm_eps)?,
+                query,
+                key,
+                value,
+                attn_out: load_conv1d(&tensors, &format!("{p}.attn.c_proj"), hidden, hidden)?,
+                ln_2: load_layer_norm(&tensors, &format!("{p}.ln_2"), config.layer_norm_eps)?,
+                intermediate: load_conv1d(&tensors, &format!("{p}.mlp.c_fc"), hidden, config.intermediate_size)?,
+                output: load_conv1d(&tensors, &format!("{p}.mlp.c_proj"), config.intermediate_size, hidden)?,
+            });
+        }
+
+        let final_ln = load_layer_norm(&tensors, "ln_f", config.layer_norm_eps)?;
+        let lm_head = Linear {
+            weight_t: transpose(&word_embeddings, config.vocab_size, hidden),
+            bias: vec![0.0; config.vocab_size], // GPT-2のlm_headはbias無し(weight tying)
+            in_dim: hidden,
+            out_dim: config.vocab_size,
+        };
+
+        Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head })
+    }
+
     /// 新規のKVキャッシュ集合(レイヤー数 x ヘッド数)を作る。
     fn new_caches(&self) -> Vec<Vec<KvCacheHead>> {
         (0..self.config.num_layers).map(|_| (0..self.config.num_heads).map(|_| KvCacheHead::empty()).collect()).collect()
@@ -310,10 +511,9 @@ impl GptModel {
         let tok = token_id as usize;
         anyhow::ensure!(tok < self.config.vocab_size, "opencuda-llm: token id {tok} out of vocab range");
 
-        let mut hidden = vec![0.0f32; hidden_size];
-        for c in 0..hidden_size {
-            hidden[c] = self.word_embeddings[tok * hidden_size + c] + self.position_embeddings[pos * hidden_size + c];
-        }
+        let word_row = &self.word_embeddings[tok * hidden_size..(tok + 1) * hidden_size];
+        let pos_row = &self.position_embeddings[pos * hidden_size..(pos + 1) * hidden_size];
+        let mut hidden: Vec<f32> = word_row.iter().zip(pos_row.iter()).map(|(w, p)| w + p).collect();
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
             hidden = layer.forward_step(device, &hidden, cache, hidden_size, self.config.num_heads)?;
@@ -385,6 +585,35 @@ impl ByteTokenizer {
     pub fn decode(ids: &[u32]) -> String {
         let bytes: Vec<u8> = ids.iter().filter(|&&id| id < 256).map(|&id| id as u8).collect();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// GPT-2の`tokenizer.json`(Hugging Face fast tokenizer形式、バイトレベルBPE)を
+/// ロードする薄いラッパー(`opencuda-bert::BertTokenizer`と同じ設計)。
+/// `GptModel::load`で読み込んだ実重みは、GPT-2自身のBPE語彙で学習された
+/// ものなので、意味のある出力を得るには`ByteTokenizer`(語彙0..256=生バイト)
+/// ではなく本トークナイザを使う必要がある——**正直な開示**: `ByteTokenizer`の
+/// トークンIDはGPT-2のBPE語彙IDとは無関係(たまたま小さい整数という以外
+/// 対応関係が無い)ため、実重み+`ByteTokenizer`の組み合わせでは意味のある
+/// 生成は期待できない。実重みを試す場合は必ず本`GptTokenizer`を使うこと。
+pub struct GptTokenizer {
+    inner: tokenizers::Tokenizer,
+}
+
+impl GptTokenizer {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let inner = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("opencuda-llm: failed to load tokenizer.json: {e}"))?;
+        Ok(Self { inner })
+    }
+
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let encoding = self.inner.encode(text, false).map_err(|e| anyhow::anyhow!("opencuda-llm: tokenizer encode failed: {e}"))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        self.inner.decode(ids, true).map_err(|e| anyhow::anyhow!("opencuda-llm: tokenizer decode failed: {e}"))
     }
 }
 
@@ -473,5 +702,138 @@ mod tests {
                 assert!((a - b).abs() < 1e-4, "position {pos}: incremental={a} vs full-recompute={b}");
             }
         }
+    }
+
+    fn gpt2_model_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/gpt2")
+    }
+
+    /// 合成(ランダムだが正しい形状の)safetensorsファイルを作り、
+    /// `GptModel::load`がテンソル名・形状の契約通りに読み込めることを検証する。
+    /// 実GPT-2重み(500MB超)が無い環境でもローダーのロジック自体を
+    /// 検証できるようにするための単体テスト(モジュールdocコメント/
+    /// タスク指示の「ネットワーク不到達時は単体テストに留めてよい」に対応)。
+    #[test]
+    fn load_parses_gpt2_shaped_safetensors_and_config_without_panicking() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use std::collections::HashMap;
+
+        let vocab = 37usize;
+        let hidden = 8usize;
+        let n_head = 2usize;
+        let n_layer = 1usize;
+        let n_positions = 16usize;
+        let inner = 4 * hidden;
+
+        // 決定的な適当な値で埋めた各テンソルを用意する(数値の意味は無い、
+        // 形状・テンソル名がGPT-2の契約と一致するかだけを検証する)。
+        let mut rng = SplitMix64::new(1234);
+        let mut buffers: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        let mut push = |name: &str, shape: Vec<usize>, rng: &mut SplitMix64| {
+            let len: usize = shape.iter().product();
+            let data = random_vec(rng, len, 0.1);
+            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            buffers.push((name.to_string(), shape, bytes));
+        };
+        push("wte.weight", vec![vocab, hidden], &mut rng);
+        push("wpe.weight", vec![n_positions, hidden], &mut rng);
+        for i in 0..n_layer {
+            push(&format!("h.{i}.ln_1.weight"), vec![hidden], &mut rng);
+            push(&format!("h.{i}.ln_1.bias"), vec![hidden], &mut rng);
+            push(&format!("h.{i}.attn.c_attn.weight"), vec![hidden, 3 * hidden], &mut rng);
+            push(&format!("h.{i}.attn.c_attn.bias"), vec![3 * hidden], &mut rng);
+            push(&format!("h.{i}.attn.c_proj.weight"), vec![hidden, hidden], &mut rng);
+            push(&format!("h.{i}.attn.c_proj.bias"), vec![hidden], &mut rng);
+            push(&format!("h.{i}.ln_2.weight"), vec![hidden], &mut rng);
+            push(&format!("h.{i}.ln_2.bias"), vec![hidden], &mut rng);
+            push(&format!("h.{i}.mlp.c_fc.weight"), vec![hidden, inner], &mut rng);
+            push(&format!("h.{i}.mlp.c_fc.bias"), vec![inner], &mut rng);
+            push(&format!("h.{i}.mlp.c_proj.weight"), vec![inner, hidden], &mut rng);
+            push(&format!("h.{i}.mlp.c_proj.bias"), vec![hidden], &mut rng);
+        }
+        push("ln_f.weight", vec![hidden], &mut rng);
+        push("ln_f.bias", vec![hidden], &mut rng);
+
+        let mut views: HashMap<String, TensorView> = HashMap::new();
+        for (name, shape, bytes) in &buffers {
+            views.insert(name.clone(), TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap());
+        }
+        let serialized = safetensors::serialize(&views, &None).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("opencuda-llm-synthetic-gpt2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), serialized).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"vocab_size":{vocab},"n_embd":{hidden},"n_layer":{n_layer},"n_head":{n_head},"n_positions":{n_positions},"layer_norm_epsilon":1e-5}}"#
+            ),
+        )
+        .unwrap();
+
+        let model = GptModel::load(&dir).unwrap();
+        assert_eq!(model.config().vocab_size, vocab);
+        assert_eq!(model.config().hidden_size, hidden);
+        assert_eq!(model.config().num_layers, n_layer);
+        assert_eq!(model.layers.len(), n_layer);
+
+        // ロードしたモデルで実際に生成が(パニックせず)動くことも確認する
+        // (形状が正しいだけでなく、forward_step一式が最後まで通ることの検証)。
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 4).unwrap();
+        assert_eq!(generated.len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 実GPT-2(124M、`openai-community/gpt2`のsafetensors)がこのマシンに
+    /// ダウンロード済みの場合のみ実行する検証。**正直な開示**: 完全に流暢な
+    /// 文章生成を検証しているのではなく、(a) 実重みが実際にロードできる
+    /// こと、(b) ランダム初期化(`load_random`)と実重み(`load`)とで、
+    /// 同一プロンプトに対する貪欲デコードの出力トークン列が異なる
+    /// (=重みが実際に使われている、配線ミスで常に同じ出力になっていない)
+    /// ことを確認するに留める。GPT-2自身のBPEトークナイザ(`GptTokenizer`)
+    /// を使う。
+    #[test]
+    fn real_gpt2_weights_load_and_produce_output_distinct_from_random_init() {
+        let dir = gpt2_model_dir();
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: real GPT-2 weights not present at {dir:?} (see CLAUDE.md HANDOFF for download instructions)");
+            return;
+        }
+
+        let model = GptModel::load(&dir).unwrap();
+        assert_eq!(model.config().vocab_size, 50257);
+        assert_eq!(model.config().hidden_size, 768);
+        assert_eq!(model.config().num_layers, 12);
+        assert_eq!(model.config().num_heads, 12);
+
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let prompt_ids = tokenizer.encode("The quick brown fox").unwrap();
+        assert!(!prompt_ids.is_empty());
+
+        let device = device();
+        let real_out = model.generate(&device, &prompt_ids, 12).unwrap();
+        let real_text = tokenizer.decode(&real_out).unwrap();
+        eprintln!("real GPT-2 weights greedy continuation: {real_text:?} (token ids: {real_out:?})");
+
+        // 同じプロンプト・同じトークナイザ語彙空間で、ランダム初期化モデルと
+        // 生成結果が異なることを確認する(重みが実際に効いていることの
+        // 最低限の裏付け——出力が「流暢」であることまでは主張しない)。
+        let random_config = GptConfig {
+            vocab_size: model.config().vocab_size,
+            hidden_size: model.config().hidden_size,
+            num_layers: model.config().num_layers,
+            num_heads: model.config().num_heads,
+            intermediate_size: model.config().intermediate_size,
+            max_seq_len: model.config().max_seq_len,
+            layer_norm_eps: model.config().layer_norm_eps,
+        };
+        let random_model = GptModel::load_random(random_config, 42);
+        let random_out = random_model.generate(&device, &prompt_ids, 12).unwrap();
+        let random_text = tokenizer.decode(&random_out).unwrap();
+        eprintln!("random-init weights greedy continuation: {random_text:?} (token ids: {random_out:?})");
+
+        assert_ne!(real_out, random_out, "real GPT-2 weights should produce different greedy output than random init for the same prompt");
     }
 }

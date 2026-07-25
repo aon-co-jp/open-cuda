@@ -225,6 +225,84 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-07-25 `opencuda-llm`にsafetensorsローダー追加(実GPT-2重みで検証)
+  + `needless_range_loop`警告2件解消**: 前回HANDOFFの「次にすべきこと」
+  (1)(2)に着手。
+  1. **safetensorsローダー**: `opencuda-bert::BertModel::load`と同じ設計
+     (config.json→safetensorsの順で読み、テンソル名を辿る)で
+     `GptModel::load(dir: &Path) -> Result<Self>`を実装。GPT-2は
+     BERTと重みレイアウトが異なる点への対応が必要だった:
+     (a) `Conv1D`層(`[in_dim, out_dim]`のまま保存、`nn.Linear`と違い
+     転置不要)、(b) Q/K/Vが`c_attn`という1本の融合`Conv1D`
+     (`[hidden, 3*hidden]`)にまとまっている(列方向に3分割)、
+     (c) `lm_head`はトークン埋め込み`wte.weight`と重み共有(weight
+     tying)されており、safetensors内に別テンソルとして存在しない
+     (`wte.weight`を転置して代用)。
+  2. **アーキテクチャ変更(重要)**: 当初の`DecoderLayer`はpost-LN
+     (BERT/GPT-1系、Attention/FFNの後に残差加算+LN)だったが、実際の
+     GPT-2はpre-LN(Attention/FFNの「前」に正規化を適用し、残差加算は
+     正規化前の`hidden`に対して行う)を採用しているため、実重みを
+     読み込んで意味のある出力を得るにはpre-LNへの構造変更が必須だった
+     (`ln_1`/`ln_2`フィールドへ改名)。あわせてGELU近似も、GPT-2の
+     `activation_function: "gelu_new"`(tanh近似)に合わせて既存の
+     erfベース近似から差し替えた。ランダム初期化パス(`load_random`)は
+     この変更後もKVキャッシュ増分計算とフルスクラッチ再計算の数値一致
+     テストに影響なし(pre-LN/post-LNどちらでも自己無矛盾性は保たれる
+     ため)。
+  3. **実機検証(ネットワーク到達性を確認の上、実際にダウンロード・
+     ロード・生成まで実施——型チェックのみで完了と報告しない方針を
+     徹底)**: `huggingface.co`への到達性を`curl`で確認後、
+     GPT-2 124M(`openai-community/gpt2`)の`model.safetensors`
+     (548MB)・`config.json`・`tokenizer.json`を実際にダウンロード
+     (`crates/opencuda-llm/models/gpt2/`、`.gitignore`対象、リポジトリ
+     には含めない)。`GptModel::load`で実際にロードでき
+     (`vocab_size=50257`/`hidden_size=768`/`num_layers=12`/
+     `num_heads=12`を実際に検証)、GPT-2自身のBPE語彙に対応した
+     `GptTokenizer`(`tokenizers`クレート、`tokenizer.json`を読む)で
+     "The quick brown fox"を継続生成させたところ、**貪欲デコードで
+     "es are a great way to get a little bit of a"という文法的に
+     自然な英語が出力された**(同一プロンプト・同一トークナイザで
+     ランダム初期化モデルを走らせると"Kraken cluster cluster cluster
+     Kraken Kraken..."という無意味な反復になる、テスト
+     `real_gpt2_weights_load_and_produce_output_distinct_from_random_init`
+     の`--nocapture`出力で両方を記録・比較済み)。**正直な評価**:
+     これは「完全に流暢な文章生成」を主張するものではない(GPT-2 124M
+     自体が小型モデルであり、本クレートの実装もPagedAttention等の
+     本家vLLM最適化を持たない単一シーケンス逐次デコードのまま)が、
+     「配線が正しく機能しているか」という当初の検証目的に対しては、
+     ランダム重みの無意味な反復出力から明確に区別できる、文法的に
+     妥当な英語への変化を実際に確認できた。
+  4. **合成safetensorsによる単体テストも追加**(実重みが無い環境でも
+     ローダーのロジック自体を検証できるように、モジュールdocコメント/
+     タスク指示に沿って): `load_parses_gpt2_shaped_safetensors_and_config_without_panicking`
+     が、GPT-2契約通りのテンソル名・形状を持つ合成safetensorsファイルを
+     その場で構築し、`GptModel::load`が正しくパースできること・
+     生成処理が最後まで通ることを検証する(実重みの有無に関わらず常に
+     実行される)。
+  5. **`GptTokenizer`新設**: 実重みでの意味のある検証には、
+     `ByteTokenizer`(バイト値=トークンID)ではなくGPT-2自身のBPE語彙
+     ベースのトークナイザが必要だったため、`opencuda-bert::BertTokenizer`
+     と同じ設計で`tokenizers`クレートによる`GptTokenizer`(`tokenizer.json`
+     読み込み)を追加した。**正直な開示**: `ByteTokenizer`は既定のまま
+     残しており(既存4テストは変更無し、後方互換)、実重みと
+     `ByteTokenizer`を組み合わせても意味のある出力は得られない
+     (GPT-2のBPE語彙IDとは無関係なため)——ドキュメントに明記済み。
+  6. **`needless_range_loop`警告2件の解消**: `DecoderLayer::forward_step`の
+     ヘッドループ(`enumerate().take(num_heads)`へ)、`load_fused_qkv`の
+     QKV分割ループ(`chunks_exact`/`chunks_exact_mut`のzipへ)を
+     イテレータベースへ書き換え。
+  7. **検証結果**: `cargo build -p opencuda-llm --release`警告0件、
+     `cargo test -p opencuda-llm --release`**6件全green**(既存4件+
+     新規2件〈合成safetensors検証・実GPT-2重み検証〉、実機で実際に
+     GPT-2重みをロード・生成し記録)。`cargo test --workspace --release`
+     も全クレートでregression無し(全て`test result: ok`)。
+     `cargo clippy --workspace --all-targets --release`**警告0件**
+     (対象2件を含め全て解消)。
+  - 次にすべきこと: (1) 本家vLLMの核心的最適化(PagedAttention・連続
+    バッチング)への着手検討、(2) 残り4目標(PyTorch互換/scikit-learn/
+    Whisper相当)のうち次に着手するものの選定(前回HANDOFFの推奨
+    〈Whisper相当〉のまま)。
+
 - **2026-07-22 `opencuda-llm`新設(1位vLLM相当のMVP着手)**: `open-raid-z`
   CLAUDE.mdの「Python製AIライブラリのRust移植ハイブリッド/トライブリッド版」
   構想(マーケティング調査1〜6位: vLLM/Transformers/NumPy/PyTorch互換/
