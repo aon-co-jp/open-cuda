@@ -62,6 +62,14 @@ pub fn select_gemm_path(device: &dyn GpuDevice) -> GemmPath {
         GpuVendor::Amd { .. } => GemmPath::RocBlas,
         GpuVendor::Intel { .. } => GemmPath::OneMkl,
         GpuVendor::Cpu => GemmPath::CpuNaive,
+        // Qualcomm Adreno/ARM Mali/Imagination PowerVRにはベンダー専用GEMM
+        // ライブラリのstub経路が無い(cuBLAS/rocBLAS/oneMKLに相当する
+        // モバイル向け専用実装は本クレートで未着手)。これらのベンダーは
+        // Vulkan Compute経由でしか到達しない設計のため、最初からVulkan
+        // 汎用経路を返す(スタブ経由の遠回りを避ける、2026-07-25追加)。
+        GpuVendor::Qualcomm { .. } | GpuVendor::Arm { .. } | GpuVendor::ImaginationPowerVr { .. } => {
+            GemmPath::VulkanGeneric
+        }
         GpuVendor::Unknown => GemmPath::VulkanGeneric,
     };
 

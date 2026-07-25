@@ -469,3 +469,60 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   3. **正直な開示・確認できていないこと**: 上記はあくまで**クロスコンパイルの成功**(ビルドが通ること)の確認であり、実Android端末/エミュレータ上での実行(`vkCreateInstance`が実際に成功しVulkanデバイスを列挙できるか、`.so`としてリンクしAPKへ組み込んで動作するか)は未検証(実機/エミュレータでの検証環境がこのセッションには無い)。既知の懸念点として: (a) AndroidはVulkanドライバの実装差異(特に古い端末・エミュレータ)が大きく、`vkCreateInstance`自体は成功してもGPU固有の挙動差が実機でしか分からない、(b) このクレートは`cdylib`としてのビルド設定(JNI経由で呼び出す場合に必要な`crate-type`)が現状無い(`rlib`のみ)ため、実際にAndroidアプリへ組み込むにはJNIブリッジ層(または`aruaru-llm/android`のようなHTTPクライアント構成に倣う)が別途必要。
   4. **結論**: Android-Vulkan対応の**アーキテクチャ上の明確なブロッカーは見つからなかった**(ヘッドレスCompute専用設計がAndroidのVulkanネイティブ対応と自然に噛み合う)。ただし「Android対応が完了した」と主張するものではなく、あくまで「クロスコンパイルが実際に通ることを確認した」段階の報告である。
   - 次にすべきこと: (1) `cdylib`ビルド設定の追加+JNIブリッジ(またはaruaru-llm/android方式のHTTPクライアント経由での間接利用)の設計、(2) 実Android端末/エミュレータでの`vkCreateInstance`実行検証(環境が整い次第)、(3) `opencuda-directx`(D3D12、Windows専用)側は今回のスコープ外のまま。
+
+- **2026-07-25(続き) `GpuVendor`にQualcomm/ARM/Imagination PowerVRを追加
+  + `OmniGPU-Design.md`にベンダー対応状況マトリクスを新設(INTEL/AMD/
+  nVIDIA統合というユーザー指示への、正直に検証可能な範囲での増分)**:
+  1. **このマシンの実環境を再確認**: `vulkaninfo --summary`実行結果、
+     実機GPUは依然**NVIDIA GeForce GT 730の1台のみ**(`vendorID=0x10de`、
+     `deviceType=DISCRETE_GPU`)——統合Intel GPU等の第二のGPUは存在しない
+     ため、複数実ベンダーでのVulkan列挙の実機検証はこのマシンでは不可能
+     と確認(false claimを避けるため、着手前に確認)。CUDA Toolkitは
+     `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA`に存在するが、
+     AMD ROCm・Intel oneAPI/oneMKLは未インストール(前回HANDOFFの
+     「検証手段が無い」は依然事実のまま)。
+  2. **`opencuda-core::device::GpuVendor`にバリアント追加**(非破壊、
+     既存の`Nvidia`/`Amd`/`Intel`/`Cpu`/`Unknown`は変更なし):
+     `Qualcomm { architecture: String }`/`Arm { architecture: String }`/
+     `ImaginationPowerVr { architecture: String }`。PCI/Vulkanベンダー
+     ID(Web検索+pci-ids.ucw.czで裏取り: Qualcomm`0x5143`〈"Qualcomm Inc"
+     と確認〉、ARM`0x13B5`〈"ARM"と確認〉、Imagination Technologies
+     `0x1010`〈pci-ids上は"Video Logic, Ltd."名義——PowerVR部門の前身の
+     旧社名、Wikipedia "PowerVR"項目で"formerly VideoLogic"と裏付け〉)。
+     `opencuda-vulkan::real::vendor_from_id`のmatchへ3分岐追加。
+     `opencuda-blas::select_gemm_path`も、これら3ベンダーには
+     cuBLAS/rocBLAS/oneMKLに相当するベンダー専用GEMMスタブが存在しない
+     ため、最初から`GemmPath::VulkanGeneric`を返すよう分岐を追加
+     (スタブ経由の遠回りを避ける設計判断)。
+  3. **正直な開示**: 追加したQualcomm/ARM/Imagination分岐は**型チェック・
+     ビルド成功のみ確認**——実機Qualcomm Adreno/ARM Mali/Imagination
+     PowerVR GPU上での`vkEnumeratePhysicalDevices`実行検証は、この
+     マシンにそれらのGPUが存在しないため不可能(前述の`vulkaninfo`
+     確認結果より)。既存のNVIDIA実機テスト(`opencuda-blas`の
+     `sgemm_vulkan_generic_matches_cpu_naive_on_real_hardware`等)には
+     影響しないことのみ確認済み。
+  4. **`OmniGPU-Design.md`「8.5. ベンダー対応状況マトリクス」節を新設**:
+     Vulkan Compute統合(実働・主要な統合機構、ディスパッチ経路自体には
+     ベンダー分岐が無いことを`real.rs`の実装から確認済み)/`GpuVendor`
+     列挙(報告用の情報層、今回拡張)/ベンダー専用最適化ライブラリ経路
+     (cuBLAS/rocBLAS/oneMKL、引き続きスタブ・検証不能)の3層を表形式で
+     区別し、「統合の実体はVulkanであり、ベンダー専用ライブラリ層は
+     前提条件ではなく将来の追加最適化」であることを明記(誇張防止)。
+  5. **検証結果**: `cargo build --workspace`警告0件・成功。
+     `cargo test --workspace --release`全クレートregression無し
+     (`opencuda-blas`は既存21件+実機Vulkanテスト2件を含む22件全green、
+     実機NVIDIA GT 730でスキップ無しで実行されたことを確認)。
+     `cargo clippy --workspace --all-targets`警告0件。
+  6. **正直な結論**: 「実機でVulkan経由の複数ベンダー統合を新たに検証
+     できた」という増分ではない(このマシンにはNVIDIA 1台しか無い
+     ため、その種の検証は原理的に不可能)。今回の増分は
+     (a)`GpuVendor`の分類粒度を実世界のモバイル/組込みGPUベンダーまで
+     広げたこと、(b)Vulkan統合という「実際に機能している統合機構」と
+     ベンダー専用スタブ層との違いを設計書に正直に文書化したこと、
+     の2点に限定される。これ以上、このマシンの制約(GPU1台・
+     ROCm/oneMKL未導入)の中で正直に主張できる新規の実機検証項目は
+     見当たらなかった。
+  - 次にすべきこと: (1) 実Qualcomm/ARM/Imagination GPU環境
+    (実Android端末等)が用意でき次第、`vendor_from_id`の3分岐の実機
+    検証、(2) AMD ROCm/Intel oneAPIのインストール手段が得られ次第、
+    `select_gemm_path`のスタブ実装への着手。

@@ -359,6 +359,27 @@ CUDA/HIP/SYCL のカーネルを一旦この中間表現に落とし、各バッ
 
 ---
 
+## 8.5. ベンダー対応状況マトリクス（2026-07-25追記、正直な現状）
+
+「INTEL＋AMD＋nVIDIA互換」という目標に対する、実際の仕組みと検証状況を
+誤解の無いよう明記する。
+
+| 層 | 実体 | 検証状況 |
+|---|---|---|
+| **Vulkan Compute統合（実働・主要な統合機構）** | `opencuda-vulkan`が`ash`経由でVulkan 1.x Computeを呼ぶ。ディスパッチ経路（`real.rs`の`launch_kernel`/`dispatch_matmul`相当）に**ベンダー分岐は一切無い**（`vendor_from_id`はデバイス情報の"報告"用途のみで、実行経路はSPIR-Vカーネルを渡すだけの単一コードパス）。Vulkan Computeに対応するGPUなら理論上NVIDIA/AMD/Intel/Qualcomm Adreno/ARM Mali/Imagination PowerVRのどれでも同じコードで動く。 | **実機検証はNVIDIA GeForce GT 730のみ**（このマシンの唯一のGPU、`vulkaninfo --summary`で確認、vendorID`0x10de`）。このマシンに統合Intel GPU等の第二のGPUは存在しない（`vulkaninfo`の`Devices`列挙がGPU0〈NVIDIA〉の1台のみ）ため、AMD/Intel/モバイルGPUでの実機Vulkan列挙・実行は**未検証**。 |
+| **`GpuVendor`列挙（報告用の情報層）** | `opencuda-core::device::GpuVendor`に`Nvidia`/`Amd`/`Intel`/`Cpu`/`Unknown`に加え、2026-07-25に`Qualcomm`/`Arm`/`ImaginationPowerVr`を追加。`opencuda-vulkan::real::vendor_from_id`がPCI/VulkanベンダーID（`0x10DE`=NVIDIA、`0x1002`/`0x1022`=AMD、`0x8086`=Intel、`0x5143`=Qualcomm、`0x13B5`=ARM、`0x1010`=Imagination Technologies〈旧称VideoLogic〉、いずれもpci-ids.ucw.cz/Web検索で裏取り済み）から変換する。 | ID→列挙の変換ロジック自体は`cargo test -p opencuda-core`ではテスト対象外の純関数（既存の実機テストはNVIDIAの実IDでしか通らない）。追加した3ベンダーのマッチ分岐は型チェック・ビルド成功のみ確認、実機Qualcomm/ARM/Imagination GPUでの検証手段はこのマシンには無い。 |
+| **ベンダー専用最適化ライブラリ経路（cuBLAS/rocBLAS/oneMKL）** | `opencuda-blas::select_gemm_path`が`GemmPath::CuBlas`/`RocBlas`/`OneMkl`を返しうるが、いずれも実装はスタブ（`sgemm`に渡すと未実装エラー）。実機でVulkan経由アクセスの場合は`GpuDevice::supports_spirv()`により自動的に動く`VulkanGeneric`へフォールバックする設計（2026-07-22実装済み）。 | **検証不能、既知の限界のまま**——このマシンにはCUDA Toolkitのみ存在し（`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA`確認済み）、AMD ROCm・Intel oneAPI/oneMKLは未インストール。ROCm/oneMKLを実際にコンパイル・検証する手段がこのマシンには無いため、これらのスタブを「動く」と主張することはしない。 |
+
+**結論（誇張を避けるための明記）**: 「Intel/AMD/nVIDIA互換の統合」という
+目標に対する**実際に機能している統合機構はVulkan Computeであり、これは
+ベンダー中立設計としてすでに実装済み**。ベンダー専用ライブラリ層は
+将来の追加最適化であって、統合そのものの前提条件ではない。今回追加した
+`GpuVendor`のQualcomm/ARM/Imagination対応は、Android/モバイルGPUという
+より広いベンダー分類をVulkan統合の枠組みへ正しく載せるための土台整備
+であり、実機検証済みの新機能ではない。
+
+---
+
 ## 9. 現実的なリスクと正直な見積もり
 
 - **規模**: フル機能（真のCUDA完全互換）は1人で5〜10年、10人チームで2〜4年。GPUベンダークラスの仕事量。本ロードマップは「完全互換」ではなく「実用的に動くサブセット」を各Phaseのゴールにしている。
