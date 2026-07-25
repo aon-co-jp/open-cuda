@@ -24,7 +24,13 @@
 - **`opencuda-blas`**: NumPy相当(GEMM/Attention/量子化)。
 - **`opencuda-bert`**: BERT系エンコーダのforward pass
   (multilingual-e5-small対応)。
-- **`opencuda-llm`**: vLLM相当(KVキャッシュ付き貪欲デコード)。
+- **`opencuda-llm`**: vLLM相当(KVキャッシュ付き貪欲デコード)。GPT-2
+  (Hugging Face `openai-community/gpt2`)の`safetensors`を読み込む
+  `GptModel::load`実装済み(2026-07-25、`opencuda-bert::BertModel::load`
+  と同じ設計)。実機でGPT-2 124Mの実重みをダウンロード・ロードし、
+  ランダム初期化(意味を持たない出力)と比べて明確に流暢な英語の
+  貪欲デコード継続("The quick brown fox" → "es are a great way to
+  get a little bit of a")を確認済み——詳細は`CLAUDE.md`HANDOFF参照。
 
 ## なぜDirectXとVulkanを両方持つか(2026-07-23の技術判断)
 
