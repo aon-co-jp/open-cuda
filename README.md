@@ -1,5 +1,13 @@
 # open-cuda
 
+> **Updated 2026-07-25**: The dev-policy file (`CLAUDE.md`) heading was
+> renamed from "Development Policy & Dev Environment Rules" to
+> "Design Philosophy & Development Policy & Dev Environment Rules",
+> to more clearly separate the project's design philosophy (what we
+> value), development policy (how we work), and dev environment rules
+> (concrete operational conventions). See `CLAUDE.md` for details.
+
+
 **開発開始日: 2026-06-26**(このリポジトリのGitHub作成日)
 
 「第二のCUDA」——Windows・macOS・Linux互換、Intel・AMD・NVIDIA互換を
