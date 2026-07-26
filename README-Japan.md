@@ -272,12 +272,19 @@ opencuda/
         経由の実カーネル、alpha/beta付きC=alpha*A·B+beta*Cを実装、単体テスト7件で検証済み）
   - [x] `opencuda-blas`: `scaled_dot_product_attention`（素朴な非タイル化attention。
         QKᵀ・softmax・P·Vを実際に計算。**真のFlash Attention(タイル化+オンラインsoftmax)ではない**、
-        誠実な命名として`flash_attention`という名前は使わずスタブとして残した）
-  - [ ] `opencuda-blas`: GPUベンダー別経路（cuBLAS/rocBLAS/oneMKL/Vulkan汎用）
-  - [x] `opencuda-blas`: INT4/INT8量子化（`quantize_int4`/`quantize_int8`、グループ単位対称量子化、
-        要素ごとの量子化は`GpuDevice::launch_kernel`経由の実カーネルディスパッチ、
-        ニブルパッキングはホスト側。単体テスト8件で検証済み）
-  - [ ] `opencuda-blas`: 真のFlash Attention（タイル化・オンラインsoftmaxによるメモリ効率化）
+        誠実な命名として`flash_attention`とは別関数として残した）
+  - [x] `opencuda-blas`: `GemmPath::VulkanGeneric`（`sgemm_vulkan_generic`、実機NVIDIA GT 730で
+        `sgemm`のCPU版との数値一致を検証、`select_gemm_path`経由で自動選択にも配線済み）。
+        cuBLAS/rocBLAS/oneMKL（GPUベンダー専用ライブラリ経路）は引き続きスタブのまま
+        （このマシンにはCUDA/ROCm/oneAPIのツールチェインが無く検証手段が無いため）
+  - [x] `opencuda-blas`: INT4/INT8量子化（`quantize_int4`/`quantize_int8`/AWQ風の
+        `quantize_int4_awq`、グループ単位対称量子化、要素ごとの量子化は
+        `GpuDevice::launch_kernel`経由の実カーネルディスパッチ、ニブルパッキングは
+        ホスト側。単体テストで往復誤差の上限を検証済み）
+  - [x] `opencuda-blas`: 真のFlash Attention（`flash_attention`、タイル化・
+        オンラインsoftmaxによるメモリ効率化、`scaled_dot_product_attention`との
+        数値一致をテストで検証済み。純粋なホスト側Rust実装で`GpuDevice`の
+        カーネルディスパッチは使わない）
   - [ ] `opencuda-multidev`: パイプライン並列・統合VRAM
   - [ ] LLM 推論を 2 枚の GPU にまたがって実行
 - **Phase 4（拡張）** — Intel oneAPI、nvcc 互換ドライバ、PyTorch backend
