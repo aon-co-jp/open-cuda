@@ -225,6 +225,30 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-07-27 DirectX12スタックの実機健全性を再確認(ユーザー指示:
+  Windows/Linux/nVIDIA実機を中心に開発・検証を進める、SET連携強化の
+  一環)**: `cargo test -p opencuda-directx --release --features
+  real-dx12 -- --nocapture`を実際に実行し、モック3件+実機5件
+  (DXGIアダプタ名/ベンダー判定・H2D/D2Hラウンドトリップ・vector_add・
+  matmul・ChaCha20)**全8件green**であることを実測で確認した(実出力:
+  `DXGI adapter: name="NVIDIA GeForce GT 730" vendor=Nvidia {
+  compute_capability: (0, 0) } total_memory=2104819712`)。新規のコード
+  変更は無い、既存機能の実機再検証のみ。**正直な開示**: 前回HANDOFFの
+  「次にすべきこと」(1) Poly1305認証タグのGPU実装(完全なAEAD化)は、
+  130ビット剰余算(mod 2^130-5)をHLSLの32ビット整数演算のみで正しく
+  実装する必要があり(標準的な5×26ビットlimb表現+桁上げ処理)、
+  誤りが数値検証なしには発見しづらい実装難度と判断し、今回は着手を
+  見送った(実装するなら段階的に、CPU側リファレンス実装〈RustCrypto
+  `poly1305`クレート〉との1ブロックずつの数値照合を都度行いながら
+  進めるべき領域として明記しておく)。「(3) コマンドリストのバッチ化」
+  も、`GpuDevice::launch_kernel`が1回のディスパッチごとに同期的な
+  フェンス待機を行う設計(`execute_and_wait`)を変更するには、CPU/
+  Vulkan/DirectXの全バックエンドが共有する`GpuDevice`トレイト自体に
+  新しいバッチAPI(`begin_batch`/`end_batch_and_wait`等)を追加する必要が
+  あり、影響範囲が広いため今回は見送った。
+  - 次にすべきこと: 前回HANDOFFの(1)(2)(3)から変更なし(Poly1305/
+    ベンチマーク/コマンドリストバッチ化、いずれも未着手のまま)。
+
 - **2026-07-25 `opencuda-llm`にsafetensorsローダー追加(実GPT-2重みで検証)
   + `needless_range_loop`警告2件解消**: 前回HANDOFFの「次にすべきこと」
   (1)(2)に着手。
