@@ -23,21 +23,32 @@
 //!   カーネル（B転置版）を、softmax は行ごとにホスト側CPUで（rayonで
 //!   行並列に）、P·V 部分は `sgemm` をそのまま再利用して計算する。
 //! - `GemmPath::CuBlas` / `RocBlas` / `OneMkl`（GPUベンダー専用ライブラリ
-//!   経路）は引き続きスタブのまま。`GemmPath::VulkanGeneric`は
-//!   `sgemm_vulkan_generic`として実装済み。さらに`select_gemm_path`は、
-//!   ベンダー別専用経路がスタブのままの間、`device.supports_spirv()`が
-//!   `true`のデバイス（実Vulkanデバイス）に対しては自動的に
-//!   `VulkanGeneric`へフォールバックする（`sgemm`にオプションの`spirv`
-//!   引数を追加し、この経路で実際に計算できるようにした）。
-//!   `quantize_int4`（INT4/INT8量子化）は**このパスでは対象外**。
-//! - **`flash_attention`という名前の関数は実装していない**。文献上の
-//!   Flash Attention はオンラインsoftmax + タイル化により
-//!   seq_len×seq_len のスコア行列全体をメモリに展開しない、という
-//!   メモリ効率化が本質。今回実装したのはそれとは異なる、素朴な
-//!   （全展開する）attentionなので、誇大表現を避けるため
-//!   `scaled_dot_product_attention`という正直な名前にした。真のFlash
-//!   Attention（タイル化・オンラインsoftmax）は引き続き別増分として
-//!   `flash_attention`にスタブを残す。
+//!   経路）は引き続きスタブのまま（このマシンにはCUDA/ROCm/oneAPIの
+//!   ツールチェインが無く〈`nvcc --version`が見つからない〉、未検証の
+//!   コードを実装済みと偽ることになるため着手していない）。
+//!   `GemmPath::VulkanGeneric`は`sgemm_vulkan_generic`として実装済み
+//!   （実機NVIDIA GT 730で`sgemm`のCPU版との数値一致を検証）。さらに
+//!   `select_gemm_path`は、ベンダー別専用経路がスタブのままの間、
+//!   `device.supports_spirv()`が`true`のデバイス（実Vulkanデバイス）に
+//!   対しては自動的に`VulkanGeneric`へフォールバックする（`sgemm`に
+//!   オプションの`spirv`引数を追加し、この経路で実際に計算できるように
+//!   した）。
+//! - **`flash_attention`は実装済み**。Q/K/Vをブロックへタイル化し、
+//!   実行中の最大値・指数和・出力累積を保持する「オンラインsoftmax」
+//!   （Dao et al. 2022, FlashAttentionのアルゴリズム1相当）で、
+//!   `seq_len x seq_len`のスコア行列全体をメモリに展開せず計算する。
+//!   `scaled_dot_product_attention`（素朴な全展開版、GEMMカーネル
+//!   ディスパッチ経由）とは別に、`flash_attention`は純粋なホスト側
+//!   Rust実装（`GpuDevice`のカーネルディスパッチは使わない）として
+//!   併存させている。両者が数学的に同じ結果を返すことをテストで検証
+//!   済み（固定入力・乱数入力・block_sizeがseq_len非約数のケース・
+//!   seq_len=1の境界ケース・次元不一致のエラーケースを含む）。
+//! - `quantize_int4`/`quantize_int8`/`quantize_int4_awq`（AWQ風の
+//!   activation-aware INT4量子化）は**実装済み**。グループ単位の対称
+//!   量子化を`GpuDevice::launch_kernel`経由の実カーネルディスパッチで
+//!   行い（CPUバックエンドではrayon並列）、ニブルパッキング等の
+//!   バイト共有処理はホスト側で行う。それぞれ`dequantize_*`の逆変換と、
+//!   往復誤差がscale/2以内に収まることを検証するテストを含む。
 
 use opencuda_core::{CompiledKernel, GpuDevice, GpuVendor, KernelArg, LaunchConfig, ResolvedArg, Result, ThreadCtx};
 use rayon::prelude::*;
@@ -354,8 +365,8 @@ pub fn sgemm_vulkan_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize
 /// `seq_len x seq_len` 行列をまるごとメモリに展開しており、オンライン
 /// softmaxもタイル化も行わない。それらのメモリ効率化こそが Flash
 /// Attentionの本質であるため、誇張を避けてこの正直な名前にしている
-/// （`flash_attention` という別関数を、真のタイル化実装向けのスタブとして
-/// 残してある）。
+/// （タイル化・オンラインsoftmaxを実際に行う真のFlash Attentionは
+/// 別関数 [`flash_attention`] として実装済み）。
 ///
 /// QKᵀ の計算は本クレートの GEMM系カーネル（`transpose_b=true`）を、
 /// `probs·V` の計算は [`sgemm`] をそのまま再利用する。softmax は行同士に

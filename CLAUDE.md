@@ -526,3 +526,52 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     (実Android端末等)が用意でき次第、`vendor_from_id`の3分岐の実機
     検証、(2) AMD ROCm/Intel oneAPIのインストール手段が得られ次第、
     `select_gemm_path`のスタブ実装への着手。
+
+- **2026-07-26 `opencuda-blas`のドキュメント修正(実装済みコードに
+  ドキュメントを追いつかせる、新規実装ではない)**: `crates/
+  opencuda-blas/src/lib.rs`冒頭のモジュールdocコメントが
+  「`flash_attention`という名前の関数は実装していない」
+  「`quantize_int4`はこのパスでは対象外」という、2026-07-21・
+  2026-07-22のHANDOFFで既に実装済みとなった内容と矛盾する古い記述
+  のままだった(実装時に更新し忘れたもの)ことに気付き、修正した。
+  1. **事実確認**: `lib.rs`を全文読み、`flash_attention`(440行目
+     付近)がタイル化+オンラインsoftmax(Dao et al. アルゴリズム1相当)
+     の本物の実装であること、`quantize_int4`/`quantize_int8`/
+     `quantize_int4_awq`(AWQ風activation-aware INT4量子化)が
+     `dequantize_*`の逆変換・往復誤差検証テストとともに実装済み
+     であることを、コード本体を読んで確認した(grepだけで済ませず)。
+  2. **修正箇所**: (a) モジュールdocコメント(1〜40行目付近)を、
+     cuBLAS/rocBLAS/oneMKLのみが未検証スタブのまま(このマシンには
+     CUDA/ROCm/oneAPIのツールチェインが無いため)であることを明記
+     しつつ、flash_attention/量子化3関数は実装済みである旨へ書き換え。
+     (b) `scaled_dot_product_attention`のdocコメント(356行目付近)
+     内の「`flash_attention`という別関数を、真のタイル化実装向けの
+     スタブとして残してある」という記述も同様に古かったため、
+     「タイル化・オンラインsoftmaxを実際に行う真のFlash Attentionは
+     別関数`flash_attention`として実装済み」へ修正。(c)
+     `README-Japan.md`のロードマップ表(Phase 3節)も同じ理由で
+     チェックボックスと説明文が古かったため、`flash_attention`・
+     `GemmPath::VulkanGeneric`・INT4/INT8/AWQ量子化を`[x]`実装済みへ
+     更新(cuBLAS/rocBLAS/oneMKLのみ`[ ]`スタブのまま明記)。
+     `PORTING.md`にはこの種の古い記述は見つからなかった。
+  3. **`nvcc --version`を実際に再実行して確認**: `nvcc: command not
+     found`(見つからない)ことを確認済み——cuBLAS検証手段は依然
+     このマシンには無く、cuBLAS/rocBLAS/oneMKL経路は今回も一切
+     実装・変更していない(ドキュメント修正のみのスコープ)。
+  4. **検証結果**(実際に実行、型チェックのみで済ませていない):
+     `cargo build --workspace --release`警告0件・成功。
+     `cargo test --workspace --release`**全クレートregression無し**
+     (`opencuda-blas`22件・`opencuda-bert`2件・`opencuda-directx`3件
+     〈モックのみ、`real-dx12`feature未指定〉・`opencuda-ir`1件+
+     結線テスト1件・`opencuda-llm`6件・`opencuda-vulkan`結線テスト
+     3件、他クレートは0件、全て`test result: ok`、失敗0件)。
+     `cargo clippy --workspace --all-targets --release`**警告0件**。
+  5. **正直な開示**: このセッションでの新規実装は無い
+     (flash_attention/量子化3関数はいずれも2026-07-21・07-22の
+     過去コミットで既に実装・検証済みだったコードそのもの)。今回の
+     作業は「ドキュメントが実装より古い状態のまま取り残されていた」
+     という不整合の是正のみ。cuBLAS/rocBLAS/oneMKLは引き続き未実装
+     スタブのまま(理由は変わらず、このマシンにCUDA/ROCm/oneAPI
+     ツールチェインが無いこと)。
+  - 次にすべきこと: 前回HANDOFF(1)(2)に変更なし(実Qualcomm/ARM/
+    Imagination GPU環境・AMD ROCm/Intel oneAPI導入待ち)。
