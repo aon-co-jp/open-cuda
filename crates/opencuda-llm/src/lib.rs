@@ -455,18 +455,35 @@ impl GptModel {
         let tensors = safetensors::SafeTensors::deserialize(&weights_bytes).context("opencuda-llm: failed to parse model.safetensors")?;
 
         let hidden = config.hidden_size;
-        let word_embeddings = tensor_f32(&tensors, "wte.weight")?;
+
+        // 2026-07-27追記(実E2E検証で発見した実バグの修正): Hugging Face上の
+        // GPT-2互換モデルは、変換元スクリプトによってテンソル名に
+        // `transformer.`プレフィックスが付く場合(例: distilgpt2の
+        // `distilbert/distilgpt2`)と付かない場合(例: openai-communityの
+        // `gpt2`本体)が実際に混在する——同じGPT-2アーキテクチャでも
+        // 保存規約が統一されていない。プレフィックスの有無を`wte.weight`
+        // の存在で自動判定し、以降の全テンソル名にこの`key_prefix`を
+        // 前置することで両方を吸収する(モデルごとの個別分岐は増やさない)。
+        let key_prefix = if tensors.tensor("wte.weight").is_ok() {
+            ""
+        } else if tensors.tensor("transformer.wte.weight").is_ok() {
+            "transformer."
+        } else {
+            ""
+        };
+
+        let word_embeddings = tensor_f32(&tensors, &format!("{key_prefix}wte.weight"))?;
         anyhow::ensure!(
             word_embeddings.len() == config.vocab_size * hidden,
-            "opencuda-llm: 'wte.weight' has {} elements, expected {}x{}",
+            "opencuda-llm: '{key_prefix}wte.weight' has {} elements, expected {}x{}",
             word_embeddings.len(),
             config.vocab_size,
             hidden
         );
-        let position_embeddings = tensor_f32(&tensors, "wpe.weight")?;
+        let position_embeddings = tensor_f32(&tensors, &format!("{key_prefix}wpe.weight"))?;
         anyhow::ensure!(
             position_embeddings.len() == config.max_seq_len * hidden,
-            "opencuda-llm: 'wpe.weight' has {} elements, expected {}x{}",
+            "opencuda-llm: '{key_prefix}wpe.weight' has {} elements, expected {}x{}",
             position_embeddings.len(),
             config.max_seq_len,
             hidden
@@ -474,7 +491,7 @@ impl GptModel {
 
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let p = format!("h.{i}");
+            let p = format!("{key_prefix}h.{i}");
             let (query, key, value) = load_fused_qkv(&tensors, &format!("{p}.attn.c_attn"), hidden)?;
             layers.push(DecoderLayer {
                 ln_1: load_layer_norm(&tensors, &format!("{p}.ln_1"), config.layer_norm_eps)?,
@@ -488,7 +505,7 @@ impl GptModel {
             });
         }
 
-        let final_ln = load_layer_norm(&tensors, "ln_f", config.layer_norm_eps)?;
+        let final_ln = load_layer_norm(&tensors, &format!("{key_prefix}ln_f"), config.layer_norm_eps)?;
         let lm_head = Linear {
             weight_t: transpose(&word_embeddings, config.vocab_size, hidden),
             bias: vec![0.0; config.vocab_size], // GPT-2のlm_headはbias無し(weight tying)
@@ -713,8 +730,15 @@ mod tests {
     /// 実GPT-2重み(500MB超)が無い環境でもローダーのロジック自体を
     /// 検証できるようにするための単体テスト(モジュールdocコメント/
     /// タスク指示の「ネットワーク不到達時は単体テストに留めてよい」に対応)。
-    #[test]
-    fn load_parses_gpt2_shaped_safetensors_and_config_without_panicking() {
+    /// 合成safetensorsフィクスチャを作って`GptModel::load`する共通ヘルパー。
+    /// `key_prefix`に`""`を渡せば`openai-community/gpt2`本体と同じ無印の
+    /// テンソル名規約、`"transformer."`を渡せば`distilbert/distilgpt2`等
+    /// 一部モデルで使われる`transformer.`プレフィックス付き規約を再現する
+    /// (2026-07-27、実E2Eダウンロード検証でdistilgpt2のロードが
+    /// `missing tensor 'wte.weight'`で失敗する実バグを発見したことへの
+    /// 回帰テスト——`GptModel::load`が両方の規約を吸収できることを
+    /// 検証する)。
+    fn build_and_load_synthetic_model(dir_suffix: &str, key_prefix: &str) -> GptModel {
         use safetensors::tensor::{Dtype, TensorView};
         use std::collections::HashMap;
 
@@ -729,30 +753,31 @@ mod tests {
         // 形状・テンソル名がGPT-2の契約と一致するかだけを検証する)。
         let mut rng = SplitMix64::new(1234);
         let mut buffers: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
-        let mut push = |name: &str, shape: Vec<usize>, rng: &mut SplitMix64| {
+        let mut push = |name: String, shape: Vec<usize>, rng: &mut SplitMix64| {
             let len: usize = shape.iter().product();
             let data = random_vec(rng, len, 0.1);
             let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            buffers.push((name.to_string(), shape, bytes));
+            buffers.push((name, shape, bytes));
         };
-        push("wte.weight", vec![vocab, hidden], &mut rng);
-        push("wpe.weight", vec![n_positions, hidden], &mut rng);
+        push(format!("{key_prefix}wte.weight"), vec![vocab, hidden], &mut rng);
+        push(format!("{key_prefix}wpe.weight"), vec![n_positions, hidden], &mut rng);
         for i in 0..n_layer {
-            push(&format!("h.{i}.ln_1.weight"), vec![hidden], &mut rng);
-            push(&format!("h.{i}.ln_1.bias"), vec![hidden], &mut rng);
-            push(&format!("h.{i}.attn.c_attn.weight"), vec![hidden, 3 * hidden], &mut rng);
-            push(&format!("h.{i}.attn.c_attn.bias"), vec![3 * hidden], &mut rng);
-            push(&format!("h.{i}.attn.c_proj.weight"), vec![hidden, hidden], &mut rng);
-            push(&format!("h.{i}.attn.c_proj.bias"), vec![hidden], &mut rng);
-            push(&format!("h.{i}.ln_2.weight"), vec![hidden], &mut rng);
-            push(&format!("h.{i}.ln_2.bias"), vec![hidden], &mut rng);
-            push(&format!("h.{i}.mlp.c_fc.weight"), vec![hidden, inner], &mut rng);
-            push(&format!("h.{i}.mlp.c_fc.bias"), vec![inner], &mut rng);
-            push(&format!("h.{i}.mlp.c_proj.weight"), vec![inner, hidden], &mut rng);
-            push(&format!("h.{i}.mlp.c_proj.bias"), vec![hidden], &mut rng);
+            let p = format!("{key_prefix}h.{i}");
+            push(format!("{p}.ln_1.weight"), vec![hidden], &mut rng);
+            push(format!("{p}.ln_1.bias"), vec![hidden], &mut rng);
+            push(format!("{p}.attn.c_attn.weight"), vec![hidden, 3 * hidden], &mut rng);
+            push(format!("{p}.attn.c_attn.bias"), vec![3 * hidden], &mut rng);
+            push(format!("{p}.attn.c_proj.weight"), vec![hidden, hidden], &mut rng);
+            push(format!("{p}.attn.c_proj.bias"), vec![hidden], &mut rng);
+            push(format!("{p}.ln_2.weight"), vec![hidden], &mut rng);
+            push(format!("{p}.ln_2.bias"), vec![hidden], &mut rng);
+            push(format!("{p}.mlp.c_fc.weight"), vec![hidden, inner], &mut rng);
+            push(format!("{p}.mlp.c_fc.bias"), vec![inner], &mut rng);
+            push(format!("{p}.mlp.c_proj.weight"), vec![inner, hidden], &mut rng);
+            push(format!("{p}.mlp.c_proj.bias"), vec![hidden], &mut rng);
         }
-        push("ln_f.weight", vec![hidden], &mut rng);
-        push("ln_f.bias", vec![hidden], &mut rng);
+        push(format!("{key_prefix}ln_f.weight"), vec![hidden], &mut rng);
+        push(format!("{key_prefix}ln_f.bias"), vec![hidden], &mut rng);
 
         let mut views: HashMap<String, TensorView> = HashMap::new();
         for (name, shape, bytes) in &buffers {
@@ -760,7 +785,7 @@ mod tests {
         }
         let serialized = safetensors::serialize(&views, &None).unwrap();
 
-        let dir = std::env::temp_dir().join(format!("opencuda-llm-synthetic-gpt2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("opencuda-llm-synthetic-gpt2-{dir_suffix}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("model.safetensors"), serialized).unwrap();
         std::fs::write(
@@ -784,6 +809,22 @@ mod tests {
         assert_eq!(generated.len(), 4);
 
         let _ = std::fs::remove_dir_all(&dir);
+        model
+    }
+
+    #[test]
+    fn load_parses_gpt2_shaped_safetensors_and_config_without_panicking() {
+        build_and_load_synthetic_model("no-prefix", "");
+    }
+
+    /// 2026-07-27追記の回帰テスト: `transformer.`プレフィックス付きの
+    /// テンソル名規約(distilgpt2等が実際に使う規約)でも`GptModel::load`
+    /// が正しくロードできることを確認する(実際にHugging Faceから
+    /// distilgpt2をダウンロードして`GET /v1/models/select`したところ
+    /// `missing tensor 'wte.weight'`で失敗した実バグの回帰テスト)。
+    #[test]
+    fn load_parses_transformer_prefixed_safetensors_like_distilgpt2() {
+        build_and_load_synthetic_model("transformer-prefix", "transformer.");
     }
 
     /// 実GPT-2(124M、`openai-community/gpt2`のsafetensors)がこのマシンに
