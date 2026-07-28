@@ -599,3 +599,19 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      ツールチェインが無いこと)。
   - 次にすべきこと: 前回HANDOFF(1)(2)に変更なし(実Qualcomm/ARM/
     Imagination GPU環境・AMD ROCm/Intel oneAPI導入待ち)。
+
+- **2026-07-27(続き) README.mdに「まず自分のGPUで動くか試す」導線を追加(使いやすさ改善、ユーザー指示「open-directx と open-cuda と aruaru-llmのSETの完成度と実用性と使いやすさの向上をお願い」)**:
+  1. 既に`examples/`配下に`vulkan_info`(実Vulkan物理デバイス列挙)・
+     `matmul`・`matmul_vulkan_real`・`vector_add`系4本の実行可能な
+     ワークスペースメンバーが存在していたが、README.mdからその存在が
+     全く案内されていなかった(外部監査で指摘された使いやすさの
+     ギャップ)。新規に「自分のGPUで実際に動くか試す」節を追加し、
+     `cargo run -p vulkan_info`を「まず1つ動かして確認する」最初の
+     コマンドとして案内。他のexampleへの導線・`OmniGPU-Design.md`§8.5
+     (ベンダー対応表)への参照も追記。
+  2. **検証**: `cargo run -p vulkan_info`を実際に実行し、このマシン
+     (NVIDIA GeForce GT 730)で正しくベンダー名・VRAM容量・Vulkan
+     API/ドライババージョンが出力されることを確認済み。`cargo test
+     --workspace`は既存の全テスト回帰なし(ドキュメントのみの変更)。
+  - 次にすべきこと: 前回HANDOFFの内容に変更なし(cuBLAS/rocBLAS/
+    oneMKL・実Qualcomm/ARM/Imagination GPU環境待ち)。
