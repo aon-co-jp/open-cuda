@@ -84,6 +84,23 @@ cargo test --workspace
 cargo test -p opencuda-directx --features real-dx12
 ```
 
+### 自分のGPUで実際に動くか試す(2026-07-27追記)
+
+「まず何か1つ動かして確認したい」場合は、`examples/`配下の各サブクレート
+(ワークスペースメンバー)を`cargo run -p <名前>`で実行する。特に
+`vulkan_info`は、実機のVulkan物理デバイス(GPUベンダー名・VRAM容量)を
+列挙して表示するだけの最小構成なので、「自分の環境でGPUが検出できるか」
+を確認する最初の1コマンドとして最適:
+
+```bash
+cargo run -p vulkan_info
+```
+
+他の例(`matmul`・`matmul_vulkan_real`・`vector_add`・
+`vector_add_vulkan`・`vector_add_vulkan_real`・`vector_add_omniir`)も
+同様に`cargo run -p <名前>`で実行できる。各ベンダー(Intel/AMD/nVIDIA等)
+の対応状況一覧は`OmniGPU-Design.md`§8.5を参照。
+
 ## ライセンス
 
 Apache-2.0
