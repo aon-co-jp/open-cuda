@@ -615,3 +615,42 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      --workspace`は既存の全テスト回帰なし(ドキュメントのみの変更)。
   - 次にすべきこと: 前回HANDOFFの内容に変更なし(cuBLAS/rocBLAS/
     oneMKL・実Qualcomm/ARM/Imagination GPU環境待ち)。
+
+- **2026-07-27(続き2) `GptModel::load`が`transformer.`プレフィックス付きテンソル名を読めず実際に失敗する実バグを発見・修正(aruaru-llmの実E2E検証中に発覚)**:
+  1. **発見の経緯**: aruaru-llmで実際に`distilbert/distilgpt2`を
+     Hugging Faceからダウンロード→`POST /v1/models/select`で切り替え
+     ようとしたところ、`missing tensor 'wte.weight': TensorNotFound`
+     で失敗。ダウンロードされた`model.safetensors`のヘッダーを実際に
+     読んだところ、テンソル名が`transformer.wte.weight`・
+     `transformer.h.0...`のように**`transformer.`プレフィックス付き**
+     であることが判明した。一方、既に動作確認済みの`openai-community/
+     gpt2`本体は`wte.weight`(プレフィックス無し)を使っており、
+     **同じGPT-2アーキテクチャでも変換元スクリプトによってテンソル名
+     規約が実際に異なる**ことが根本原因だった。
+  2. **`crates/opencuda-llm/src/lib.rs::GptModel::load`を修正**:
+     ロード時に`wte.weight`/`transformer.wte.weight`のどちらが実在するか
+     を確認して`key_prefix`を自動判定し、以降の全テンソル名
+     (`wte.weight`/`wpe.weight`/`h.{i}...`/`ln_f`)にこの`key_prefix`を
+     前置するよう変更。モデルごとの個別分岐を増やすのではなく、
+     プレフィックスの自動判定という1箇所の変更で両規約を吸収する設計。
+  3. **検証**: 新規回帰テスト
+     `load_parses_transformer_prefixed_safetensors_like_distilgpt2`を
+     追加(合成フィクスチャを`transformer.`プレフィックス付きで生成し、
+     ロード→生成まで通ることを確認)。既存の
+     `load_parses_gpt2_shaped_safetensors_and_config_without_panicking`
+     も無変更のままgreen(後方互換)。`cargo test -p opencuda-llm`
+     **7件全green**(既存5件+新規2件のうち1件は本来から存在した
+     フィクスチャ関数のリファクタリングで名称変更、実質+1件)。
+  4. **実E2E確認(型チェックだけで終わらせない)**: 修正後、実際に
+     aruaru-llmサーバーを起動し、`POST /v1/models/select`で
+     `distilgpt2`への切り替えが成功し(修正前は失敗していた)、
+     `POST /v1/generate`で実際に英文が生成される(`distilgpt2-greedy-
+     decode-v0-opencuda-llm-cpu`エンジンラベル付きで応答)ことを
+     実際に確認した——「ダウンロード→切り替え→生成」の一気通貫を
+     実際に検証し、かつその過程で見つかった実バグを実際に修正した。
+  - 次にすべきこと: (1) `gpt2-medium`/`gpt2-large`/`gpt2-xl`が
+    それぞれどちらのテンソル名規約を使うか未確認(`gpt2`はプレフィックス
+    無し、`distilgpt2`はプレフィックス有りと確認済みだが、他のサイズは
+    未検証)、(2) 将来的にLlama/Mistral等の異なるアーキテクチャへ
+    対応する場合は、この`key_prefix`方式では吸収しきれない可能性が
+    高い(テンソル名の構造自体が異なるため)。
