@@ -474,7 +474,7 @@ mod real_hardware_tests {
 
         // データ長を4バイト境界へパディング(GPUカーネルはu32ワード単位)。
         let mut gpu_buf = plaintext.to_vec();
-        while gpu_buf.len() % 4 != 0 {
+        while !gpu_buf.len().is_multiple_of(4) {
             gpu_buf.push(0);
         }
 
@@ -498,6 +498,118 @@ mod real_hardware_tests {
         data.copy_to_host(&mut gpu_result).unwrap();
 
         assert_eq!(&gpu_result[..plaintext.len()], &cpu_buf[..], "GPU ChaCha20 output does not match RustCrypto CPU reference");
+    }
+
+    /// 実機でのPoly1305バッチディスパッチ(2026-07-30追記、前回HANDOFFの
+    /// 「実装難度が高く見送り」を実際に解消した実装)。RustCrypto製
+    /// `poly1305`クレート(CPU参照実装)と同一の鍵・メッセージで計算した
+    /// タグがバイト単位で完全一致することを検証する(ChaCha20テストと
+    /// 同じ「信頼できる既存実装との突き合わせ」方針)。複数の独立した
+    /// メッセージを1回のディスパッチでバッチ処理できることも合わせて
+    /// 検証する(RS-LinkFusionの多数の独立パケットという実利用形態を
+    /// 想定した設計、`poly1305.hlsl`冒頭のdocコメント参照)。
+    #[test]
+    fn real_d3d12_dispatches_poly1305_batch_and_matches_rustcrypto_reference() {
+        use poly1305::universal_hash::KeyInit;
+        use poly1305::{Key, Poly1305};
+
+        let dxil_path = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/poly1305.dxil");
+        let dxil = match std::fs::read(dxil_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("skipping real D3D12 poly1305 test: cannot read {dxil_path}: {e} (run tools/compile-dx12-shaders.sh first)");
+                return;
+            }
+        };
+
+        let device = match DirectXDevice::new(0) {
+            Ok(dev) => dev,
+            Err(e) => {
+                eprintln!("skipping real D3D12 poly1305 test: {e}");
+                return;
+            }
+        };
+        let dev: std::sync::Arc<dyn opencuda_core::GpuDevice> = device;
+
+        // 3個の独立したメッセージをバッチ処理する(鍵・長さともに異なる、
+        // 16バイト境界の整数倍長。GPU実装の「メッセージ長は16バイトの
+        // 整数倍のみ対応」という正直な制約に合わせたテストデータ)。
+        const NUM_MESSAGES: usize = 3;
+        const MAX_BLOCKS: usize = 4; // 最大64バイト/メッセージ
+        let keys: Vec<[u8; 32]> = (0..NUM_MESSAGES)
+            .map(|m| std::array::from_fn(|i| ((m * 7 + i * 3 + 11) % 256) as u8))
+            .collect();
+        let messages: Vec<Vec<u8>> = vec![
+            b"Cryptographic Forum Research Group".to_vec(),
+            b"RS-LinkFusion GPU Poly1305 batch test payload!!".to_vec(),
+            b"short block xx16".to_vec(),
+        ];
+        // 16バイト境界に切り詰める(GPU実装は端数ブロック未対応のため)。
+        let messages: Vec<Vec<u8>> = messages.into_iter().map(|m| { let n = (m.len() / 16) * 16; m[..n].to_vec() }).collect();
+
+        // CPU参照実装(RustCrypto)
+        let expected_tags: Vec<[u8; 16]> = keys
+            .iter()
+            .zip(messages.iter())
+            .map(|(key, msg)| {
+                let poly = Poly1305::new(Key::from_slice(key));
+                let tag = poly.compute_unpadded(msg);
+                let mut out = [0u8; 16];
+                out.copy_from_slice(tag.as_slice());
+                out
+            })
+            .collect();
+
+        // GPU側バッファ構築
+        let mut data_words = vec![0u32; NUM_MESSAGES * MAX_BLOCKS * 4];
+        let mut key_words = vec![0u32; NUM_MESSAGES * 8];
+        let mut block_counts = vec![0u32; NUM_MESSAGES];
+        for (m, (key, msg)) in keys.iter().zip(messages.iter()).enumerate() {
+            for (i, chunk) in key.chunks_exact(4).enumerate() {
+                key_words[m * 8 + i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            let blocks = msg.len() / 16;
+            assert!(blocks <= MAX_BLOCKS, "test message longer than MAX_BLOCKS");
+            block_counts[m] = blocks as u32;
+            for (j, chunk) in msg.chunks_exact(4).enumerate() {
+                data_words[m * MAX_BLOCKS * 4 + j] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+
+        let data_buf = alloc_buffer(&dev, data_words.len() * 4).unwrap();
+        let keys_buf = alloc_buffer(&dev, key_words.len() * 4).unwrap();
+        let counts_buf = alloc_buffer(&dev, block_counts.len() * 4).unwrap();
+        let tags_buf = alloc_buffer(&dev, NUM_MESSAGES * 16).unwrap();
+        data_buf.copy_from_host(u32_slice_as_bytes(&data_words)).unwrap();
+        keys_buf.copy_from_host(u32_slice_as_bytes(&key_words)).unwrap();
+        counts_buf.copy_from_host(u32_slice_as_bytes(&block_counts)).unwrap();
+
+        let kernel = opencuda_core::CompiledKernel::dxil("poly1305", "main", dxil);
+        let cfg = opencuda_core::LaunchConfig::linear(1, 1); // dispatch_poly1305は独自にgroup countを計算するため未使用
+        dev.launch_kernel(
+            &kernel,
+            &cfg,
+            &[
+                opencuda_core::KernelArg::Ptr(data_buf.as_ptr()),
+                opencuda_core::KernelArg::Ptr(keys_buf.as_ptr()),
+                opencuda_core::KernelArg::Ptr(counts_buf.as_ptr()),
+                opencuda_core::KernelArg::Ptr(tags_buf.as_ptr()),
+                opencuda_core::KernelArg::U32(MAX_BLOCKS as u32),
+            ],
+        )
+        .unwrap();
+
+        let mut tags_out = vec![0u8; NUM_MESSAGES * 16];
+        tags_buf.copy_to_host(&mut tags_out).unwrap();
+
+        for (m, expected) in expected_tags.iter().enumerate() {
+            let got = &tags_out[m * 16..m * 16 + 16];
+            assert_eq!(got, expected, "GPU Poly1305 tag for message {m} does not match RustCrypto CPU reference");
+        }
+    }
+
+    fn u32_slice_as_bytes(values: &[u32]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) }
     }
 }
 

@@ -27,3 +27,6 @@ echo "OK: compiled $SHADER_DIR/matmul.hlsl -> $SHADER_DIR/matmul.dxil"
 
 "$DXC_BIN" -T cs_6_0 -E main "$SHADER_DIR/chacha20.hlsl" -Fo "$SHADER_DIR/chacha20.dxil"
 echo "OK: compiled $SHADER_DIR/chacha20.hlsl -> $SHADER_DIR/chacha20.dxil"
+
+"$DXC_BIN" -T cs_6_0 -E main "$SHADER_DIR/poly1305.hlsl" -Fo "$SHADER_DIR/poly1305.dxil"
+echo "OK: compiled $SHADER_DIR/poly1305.hlsl -> $SHADER_DIR/poly1305.dxil"

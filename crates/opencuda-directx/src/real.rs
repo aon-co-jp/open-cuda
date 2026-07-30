@@ -433,6 +433,52 @@ impl DirectXDevice {
         self.dispatch_with_pipeline(&kernel.name, &[data_res], &root_constants, (group_count, 1, 1))?;
         Ok(())
     }
+
+    /// Poly1305認証タグ計算(`poly1305.hlsl`参照、RAID6と同様に日英
+    /// Web検索で裏取りしたpoly1305-donna-32アルゴリズムのGPU移植)の
+    /// ディスパッチ。1スレッドが1メッセージ全体を逐次処理するバッチ
+    /// 並列化(RS-LinkFusionの多数の独立パケットという実利用形態に
+    /// 合わせた設計、`poly1305.hlsl`冒頭のdocコメント参照)。
+    ///
+    /// 引数は`[data, keys, block_counts, tags, max_blocks]`の5個。
+    /// `data`は`num_messages*max_blocks*4`ワード、`keys`は
+    /// `num_messages*8`ワード(rの生16バイト+pad16バイト)、
+    /// `block_counts`は`num_messages`個(各メッセージの16バイトブロック数、
+    /// メッセージ長は16バイトの整数倍のみ対応)、`tags`は出力
+    /// (`num_messages*4`ワード)。`num_messages`はバッファ長から導出する。
+    fn dispatch_poly1305(&self, kernel: &CompiledKernel, dxil: &[u8], args: &[KernelArg]) -> Result<()> {
+        if args.len() != 5 {
+            return Err(GpuError::LaunchFailed("poly1305 expects 5 args: data, keys, block_counts, tags, max_blocks".to_string()).into());
+        }
+        let data_ptr = args[0].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg0 (data) must be a device pointer".to_string()))?;
+        let keys_ptr = args[1].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg1 (keys) must be a device pointer".to_string()))?;
+        let counts_ptr = args[2].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg2 (block_counts) must be a device pointer".to_string()))?;
+        let tags_ptr = args[3].as_ptr().ok_or_else(|| GpuError::LaunchFailed("arg3 (tags) must be a device pointer".to_string()))?;
+        let max_blocks = args[4].as_u32().ok_or_else(|| GpuError::LaunchFailed("arg4 (max_blocks) must be u32".to_string()))?;
+
+        self.pipeline_for(&kernel.name, dxil)?;
+        let (data_res, keys_res, counts_res, tags_res, num_messages) = {
+            let map = self.allocations.lock().unwrap();
+            let counts_alloc = map.get(&counts_ptr.addr).ok_or(GpuError::InvalidPtr(counts_ptr))?;
+            if counts_alloc.len % 4 != 0 {
+                return Err(GpuError::LaunchFailed("poly1305 block_counts buffer length must be a multiple of 4 bytes".to_string()).into());
+            }
+            let num_messages = (counts_alloc.len / 4) as u32;
+            (
+                map.get(&data_ptr.addr).ok_or(GpuError::InvalidPtr(data_ptr))?.resource.clone(),
+                map.get(&keys_ptr.addr).ok_or(GpuError::InvalidPtr(keys_ptr))?.resource.clone(),
+                counts_alloc.resource.clone(),
+                map.get(&tags_ptr.addr).ok_or(GpuError::InvalidPtr(tags_ptr))?.resource.clone(),
+                num_messages,
+            )
+        };
+
+        let root_constants = [num_messages, max_blocks];
+        let group_count = num_messages.div_ceil(64); // シェーダー側のnumthreads(64,1,1)と一致させる
+
+        self.dispatch_with_pipeline(&kernel.name, &[data_res, keys_res, counts_res, tags_res], &root_constants, (group_count, 1, 1))?;
+        Ok(())
+    }
 }
 
 fn buffer_desc(bytes: usize, flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
@@ -555,8 +601,10 @@ impl GpuDevice for DirectXDevice {
             "vector_add" | "vector_add_f32" => self.dispatch_vector_add(kernel, dxil, cfg, args),
             "matmul" | "matmul_f32" => self.dispatch_matmul(kernel, dxil, cfg, args),
             "chacha20" | "chacha20_encrypt" => self.dispatch_chacha20(kernel, dxil, args),
+            "poly1305" | "poly1305_mac" => self.dispatch_poly1305(kernel, dxil, args),
             _ => Err(GpuError::UnsupportedKernel(
-                "DirectXDevice only dispatches vector_add/vector_add_f32, matmul/matmul_f32, chacha20/chacha20_encrypt",
+                "DirectXDevice only dispatches vector_add/vector_add_f32, matmul/matmul_f32, \
+                 chacha20/chacha20_encrypt, poly1305/poly1305_mac",
             )
             .into()),
         }
