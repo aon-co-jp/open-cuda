@@ -29,3 +29,6 @@ Write-Host "OK: compiled matmul.hlsl -> matmul.dxil"
 
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "chacha20.hlsl") -Fo (Join-Path $shaderDir "chacha20.dxil")
 Write-Host "OK: compiled chacha20.hlsl -> chacha20.dxil"
+
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "poly1305.hlsl") -Fo (Join-Path $shaderDir "poly1305.dxil")
+Write-Host "OK: compiled poly1305.hlsl -> poly1305.dxil"

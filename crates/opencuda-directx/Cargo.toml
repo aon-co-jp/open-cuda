@@ -16,6 +16,9 @@ tracing.workspace = true
 # ChaCha20 GPUカーネルの正しさを検証するためのCPU参照実装
 # (RustCrypto製、監査実績のあるクレート。テストコードのみで使用)。
 chacha20 = "0.9"
+# Poly1305 GPUカーネル(poly1305.hlsl)の正しさを検証するためのCPU参照実装
+# (RustCrypto製、同上の理由でテストコードのみで使用)。
+poly1305 = "0.8"
 
 [features]
 default = []

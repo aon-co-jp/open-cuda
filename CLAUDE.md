@@ -225,6 +225,69 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-07-30(続き2) Poly1305認証タグのGPU実装(opencuda-directx)を
+  実機検証まで完了(ユーザー指示「Poly1305はGoogle検索して実装法も調査
+  して開発して」への対応、前回HANDOFF〈2026-07-27〉の「130ビット剰余算を
+  HLSLの32ビット整数演算のみで正しく実装する必要があり、誤りが数値検証
+  なしには発見しづらい実装難度と判断し、今回は着手を見送った」を実際に
+  解消)**:
+  1. **日英Web検索で設計を裏取り**: Poly1305は`h_new=(h_old+m_i)*r mod
+     (2^130-5)`という逐次依存のチェーン(1メッセージ内のブロック間では
+     並列化できない)であること、公開ドメイン実装"poly1305-donna-32"
+     (Andrew Moon作)が採用する5×26bit limb表現でのmod
+     `2^130-5`演算という標準設計を確認した。
+  2. **並列化の設計判断**: 1メッセージ内のブロック並列化(r^kの冪乗事前
+     計算+並列リダクションが必要)はスコープ外とし、代わりに「多数の
+     独立したメッセージを1スレッド1メッセージで一括処理する」バッチ
+     並列化を採用——RS-LinkFusionが実際に扱う多数の独立した小さい
+     ネットワークパケット(MTU程度)という利用形態に、内部並列化より
+     素直に合致する設計判断。
+  3. **64bit整数型を使わない実装**: DXIL SM6.0でも64bit整数演算
+     (`uint64_t`)はオプション機能(Int64ShaderOps)でGT730のような
+     旧世代GPUでの対応可否が不明なため、ChaCha20実装時と同じ「実機で
+     本当に動くか不明な機能に頼らない」方針を貫き、32bit×32bit→64bit
+     (hi,lo)ペア乗算(`umul32`)・64bit加算(`uadd64`)・64bit右シフト
+     (`ushr64_lo`)を32bit整数演算のみで自前実装し、poly1305-donna-32の
+     `unsigned long long`演算をすべてこれらのヘルパーへ機械的に置き換える
+     形で移植した。
+  4. **実装**: `crates/opencuda-directx/shaders/poly1305.hlsl`
+     (r値のクランプ・h+=m・h*=r(mod p)・桁上げ伝播・最終処理まで
+     poly1305-donna-32を忠実に移植)。`opencuda-directx::real::
+     DirectXDevice`に`dispatch_poly1305`を追加(既存の`dispatch_chacha20`
+     と同じ`UAV+RootConstants`パターン、UAV4本〈data/keys/block_counts/
+     tags〉)。`launch_kernel`のカーネル名分岐に`"poly1305"`/
+     `"poly1305_mac"`を追加。`tools/compile-dx12-shaders.{sh,ps1}`に
+     コンパイルエントリを追加。
+  5. **実機検証(型チェックのみで完了と報告しない方針を徹底)**:
+     RustCrypto製`poly1305`クレート(dev-dependency、`compute_unpadded`
+     ——端数ブロック処理を含まない点が本GPU実装の制約と正確に一致する
+     ため選定)をCPU参照実装とし、3個の独立したメッセージ(鍵・長さが
+     それぞれ異なる)を1回のディスパッチでバッチ処理した結果が、
+     実機(NVIDIA GeForce GT 730)でCPU参照実装とバイト単位で完全一致
+     することを確認した(`real_d3d12_dispatches_poly1305_batch_and_matches_rustcrypto_reference`)。
+  6. **検証**: `cargo test -p opencuda-directx --release --features
+     real-dx12`**9件全green**(既存6件+新規1件〈実質3件分のメッセージを
+     1テストでバッチ検証〉、regression無し)。`cargo clippy -p
+     opencuda-directx --all-targets --features real-dx12 -- -D
+     warnings`警告0件(検証の過程で見つかった既存コードの
+     `manual_is_multiple_of`警告1件も合わせて解消)。`cargo build
+     --workspace`/`cargo test --workspace --release`両方でregression無し。
+  7. **正直な開示・スコープ**: (a) メッセージ長は16バイトの整数倍のみ
+     対応(Poly1305本来の「最後の不完全ブロックへのパディング」処理は
+     未実装、呼び出し側が16バイト境界にパディング済みのデータを渡す
+     前提)。(b) 1メッセージ内のブロック並列化は行っていない(上記の
+     設計判断通り、バッチ〈メッセージ間〉並列のみ)。(c) `accel.rs`
+     (RS-LinkFusion/open-web-server-wireが使うChaCha20-Poly1305 AEAD
+     全体)への実際の配線はまだ行っていない——これでChaCha20暗号化+
+     Poly1305認証タグの両方がGPU実装・実機検証済みとなったが、両者を
+     組み合わせた完全なAEAD実装としての統合、および小サイズペイロード
+     (MTU程度)でのH2D/D2Hオーバーヘッドが実利益を生むかのベンチマークは
+     依然未着手。
+  - 次にすべきこと: (1) ChaCha20+Poly1305を組み合わせた完全なAEAD
+    実装としての`accel.rs`への統合、(2) 小サイズペイロードでのCPU版
+    (`chacha20poly1305`クレート)とのベンチマーク比較、(3) メッセージ長
+    が16バイトの整数倍でない場合(端数ブロック)への対応。
+
 - **2026-07-30(続き) RAID6 Q-parity(Reed-Solomon、GF(2^8))のGPU実装第二段を
   実装・実機検証(ユーザー指示「Q-parityは必要で重要なので必ずGoogleで
   日本語と英語で設計方法と実装方法を検索して調査して開発実装して」への
