@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// RAID6 Q-parity (Reed-Solomon, GF(2^8)): Q = XOR_d ( coeff[d] * data[d] )、
+// 各バイトをGF(2^8)上でcoeff[d]倍してXOR累積する。P-parity(XOR)と同じ
+// データレイアウト(disk d の word i は data[d*block_words+i])を踏襲する。
+layout(set = 0, binding = 0) readonly buffer Data {
+    uint data[];
+};
+
+// coeffs[d] の下位1バイトのみ使用(RAID6の係数はGF(2^8)の値、0-255)。
+layout(set = 0, binding = 1) readonly buffer Coeffs {
+    uint coeffs[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer Parity {
+    uint parity[];
+};
+
+layout(push_constant) uniform Params {
+    uint num_disks;
+    uint block_words;
+} params;
+
+// GF(2^8)乗算(RAID6標準の既約多項式 x^8+x^4+x^3+x^2+1、reduction byte 0x1D)。
+// キャリーレス乗算+条件付き還元を8回繰り返す、いわゆる"Russian peasant"乗算。
+uint gf_mul(uint a, uint b) {
+    uint p = 0u;
+    uint aa = a & 0xFFu;
+    uint bb = b & 0xFFu;
+    for (uint i = 0u; i < 8u; i++) {
+        if ((bb & 1u) != 0u) {
+            p ^= aa;
+        }
+        uint hi = aa & 0x80u;
+        aa = (aa << 1u) & 0xFFu;
+        if (hi != 0u) {
+            aa ^= 0x1Du;
+        }
+        bb >>= 1u;
+    }
+    return p & 0xFFu;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.block_words) {
+        return;
+    }
+    uint acc0 = 0u;
+    uint acc1 = 0u;
+    uint acc2 = 0u;
+    uint acc3 = 0u;
+    for (uint d = 0u; d < params.num_disks; d++) {
+        uint word = data[d * params.block_words + i];
+        uint coeff = coeffs[d] & 0xFFu;
+        acc0 ^= gf_mul((word) & 0xFFu, coeff);
+        acc1 ^= gf_mul((word >> 8u) & 0xFFu, coeff);
+        acc2 ^= gf_mul((word >> 16u) & 0xFFu, coeff);
+        acc3 ^= gf_mul((word >> 24u) & 0xFFu, coeff);
+    }
+    parity[i] = acc0 | (acc1 << 8u) | (acc2 << 16u) | (acc3 << 24u);
+}

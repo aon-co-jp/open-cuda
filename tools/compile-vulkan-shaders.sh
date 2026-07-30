@@ -19,3 +19,4 @@ compile() {
 compile vector_add_vulkan_real vector_add
 compile matmul_vulkan_real matmul
 compile raid6_xor_parity_vulkan_real raid6_xor_parity
+compile raid6_q_parity_vulkan_real raid6_q_parity
