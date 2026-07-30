@@ -225,6 +225,66 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-07-30 RAID6 P-parity(XOR)のGPU実装第一段を実装・実機検証
+  (open-raid-zのNVMe RAID6ランダムアクセス低速化問題への対応、ユーザー
+  指示「open-directxとopen-cudaなどでハードウェアアクセラレーター対応を
+  実装して解決して欲しい」への回答)**:
+  1. **背景**: 4〜8枚のNVMe SSDでRAID6を組むと、Read-Modify-Write
+     (parity write penalty)によりランダムアクセスが低速化する問題を、
+     GPU/ASICアクセラレーターでパリティ計算をオフロードして解決したい、
+     というユーザーの構想(既に`open-raid-z`のREADME/CLAUDE/PORTING.md
+     にロードマップとして記録済み)の実装第一段。
+  2. **設計**: 既存の`opencuda-vulkan::real::VulkanDevice`の
+     `dispatch_spirv`共通経路(`vector_add`/`matmul`と同じパターン)を
+     再利用し、新規`raid6_xor_parity`カーネルを追加。可変本数のデータ
+     ディスクをシェーダの固定バインディング数で扱えるようにするため、
+     「N本のディスクバッファを個別バインドする」のではなく「N本の
+     ブロックを1本のバッファへ連結し(`data[disk*block_words+i]`
+     レイアウト)、単一バッファとしてバインドする」設計にした——
+     `vector_add`(3バッファ固定)と同様にシンプルなバインディング数
+     (data 1本+parity 1本)を保てる。
+  3. **実装**:
+     - `examples/raid6_xor_parity_vulkan_real/shaders/raid6_xor_parity.comp`
+       (GLSL、`local_size_x=256`、各wordについて全ディスクをXOR)。
+     - `opencuda-vulkan::real::VulkanDevice`に
+       `ensure_raid6_xor_parity_args`/`run_raid6_xor_parity_spirv`を
+       追加(`vector_add`/`matmul`と全く同じ形の引数検証+ディスパッチ
+       パターン)。`launch_kernel`のカーネル名分岐に`"raid6_xor_parity"`
+       を追加。
+     - `tools/compile-vulkan-shaders.{sh,ps1,cmd}`に新シェーダの
+       コンパイルエントリを追加。
+     - 新規example crate`raid6_xor_parity_vulkan_real`
+       (`matmul_vulkan_real`と同じ構成): CPU素朴XORループのリファレンス
+       実装・CPU版(`CpuDevice`のnativeカーネル)・実Vulkan版の3つを
+       同じ入力(4ディスク×4096バイト=1024word、ディスク・word両方に
+       依存する疑似ランダムパターンで、全ゼロ・全同一値では検出できない
+       取りこぼしバグを避ける設計)で実行し、bit-exact一致(浮動小数点
+       誤差許容なし、XORは厳密一致するべき演算のため)を検証。
+  4. **実機検証(型チェックのみで完了と報告しない方針を徹底)**:
+     `cargo run -p raid6_xor_parity_vulkan_real --release`を実際に
+     このマシン(NVIDIA GeForce GT 730)で実行し、
+     `device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)`という
+     実機ログとともに、CPU vs reference・Vulkan vs reference・
+     Vulkan vs CPUの3組すべてがbit-exact一致することを確認した。
+  5. **検証**: `cargo build --workspace`警告0件、
+     `cargo test --workspace --release`全クレートregression無し、
+     `cargo clippy -p opencuda-vulkan -p raid6_xor_parity_vulkan_real
+     --all-targets --features real-vulkan -- -D warnings`警告0件。
+  6. **正直な開示・スコープ**: これはP-parity(XOR)のみの実装であり、
+     RAID6のQ-parity(Reed-Solomon符号、GF(2^8)上の演算)は別途実装が
+     必要な、より複雑な増分として意図的に切り出した(直近のPoly1305
+     GPU実装〈130ビット剰余算〉が「誤りが数値検証なしには発見しづらい
+     実装難度」として見送られたのと同じ判断基準)。また、これは
+     「パリティ計算そのものをGPUで行える」ことの実証であり、
+     `open-raid-z`本体の実RAID6パリティ計算経路への実際の配線
+     (統合)はまだ行っていない。ベンチマーク(小サイズブロックでの
+     H2D/D2H転送オーバーヘッドがGPU計算優位性を相殺しないか)も未実施。
+  - 次にすべきこと: (1) Q-parity(Reed-Solomon、GF(2^8))のGPU実装、
+    (2) `open-raid-z`本体の実パリティ計算経路への統合、
+    (3) 実ブロックサイズ(4KB〜1MB程度)でのCPU版とのベンチマーク比較
+    (H2D/D2Hオーバーヘッドが実利益を生むか、前回のChaCha20と同様の
+    懸念事項)。
+
 - **2026-07-27 DirectX12スタックの実機健全性を再確認(ユーザー指示:
   Windows/Linux/nVIDIA実機を中心に開発・検証を進める、SET連携強化の
   一環)**: `cargo test -p opencuda-directx --release --features
