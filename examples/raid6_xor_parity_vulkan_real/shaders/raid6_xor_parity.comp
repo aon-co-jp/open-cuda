@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// data: num_disks 個のデータブロックを連結したバッファ。
+// disk d のブロック内 word i は data[d * block_words + i] に格納される
+// (RAID6のP-parity=全データディスクのXOR、というシンプルなブロックレイアウト)。
+layout(set = 0, binding = 0) readonly buffer Data {
+    uint data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer Parity {
+    uint parity[];
+};
+
+layout(push_constant) uniform Params {
+    uint num_disks;
+    uint block_words;
+} params;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.block_words) {
+        return;
+    }
+    uint acc = 0u;
+    for (uint d = 0u; d < params.num_disks; d++) {
+        acc ^= data[d * params.block_words + i];
+    }
+    parity[i] = acc;
+}

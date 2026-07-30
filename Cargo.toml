@@ -18,6 +18,7 @@ members = [
     "examples/vulkan_info",
     "examples/matmul",
     "examples/matmul_vulkan_real",
+    "examples/raid6_xor_parity_vulkan_real",
 ]
 
 [workspace.package]

@@ -335,6 +335,54 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[a_buffer, b_buffer, c_buffer], &push)
     }
 
+    /// `raid6_xor_parity` の引数契約を検証する(2026-07-30追記、open-raid-zの
+    /// NVMe RAID6 ランダムアクセス低速化問題〈parity write penalty〉解決策として
+    /// ユーザーから明示指示のあった「open-directx/open-cudaでのハードウェア
+    /// アクセラレーター対応」の第一段: RAID6のP-parity(XOR)計算をGPUへ
+    /// オフロードする最小実装)。
+    ///
+    /// レイアウト: `data`バッファは`num_disks`個のブロックを連結したもの
+    /// (disk d の word i は `data[d*block_words+i]`)、`parity`バッファは
+    /// `block_words`要素。`vector_add`/`matmul`と同じ`args: &[KernelArg]`
+    /// 契約に合わせ、ポインタ2つ+usize2つの4引数とする。
+    fn ensure_raid6_xor_parity_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, u32, u32)> {
+        if args.len() != 4 {
+            bail!("raid6_xor_parity expects 4 args: data, parity, num_disks, block_words");
+        }
+        let data = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 (data) must be pointer"))?;
+        let parity = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 (parity) must be pointer"))?;
+        let num_disks = args[2].as_usize().ok_or_else(|| anyhow!("arg2 (num_disks) must be usize/u32"))?;
+        let block_words = args[3].as_usize().ok_or_else(|| anyhow!("arg3 (block_words) must be usize/u32"))?;
+
+        let (data_buf, _, _, data_len, _, _) = self.get_allocation(data)?;
+        let (parity_buf, _, _, parity_len, _, _) = self.get_allocation(parity)?;
+
+        let word_size = std::mem::size_of::<u32>();
+        let data_bytes = num_disks
+            .checked_mul(block_words)
+            .and_then(|v| v.checked_mul(word_size))
+            .ok_or_else(|| anyhow!("raid6_xor_parity data byte size overflow"))?;
+        let parity_bytes = block_words.checked_mul(word_size).ok_or_else(|| anyhow!("raid6_xor_parity parity byte size overflow"))?;
+        if data_bytes > data_len {
+            bail!("raid6_xor_parity data buffer too small: need {data_bytes} bytes, have {data_len}");
+        }
+        if parity_bytes > parity_len {
+            bail!("raid6_xor_parity parity buffer too small: need {parity_bytes} bytes, have {parity_len}");
+        }
+
+        let num_disks_u32 = u32::try_from(num_disks).context("raid6_xor_parity num_disks does not fit in u32 push constant")?;
+        let block_words_u32 = u32::try_from(block_words).context("raid6_xor_parity block_words does not fit in u32 push constant")?;
+        Ok((data_buf, parity_buf, num_disks_u32, block_words_u32))
+    }
+
+    fn run_raid6_xor_parity_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (data_buffer, parity_buffer, num_disks, block_words) = self.ensure_raid6_xor_parity_args(args)?;
+        let mut push = Vec::with_capacity(8);
+        push.extend_from_slice(&num_disks.to_ne_bytes());
+        push.extend_from_slice(&block_words.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[data_buffer, parity_buffer], &push)
+    }
+
     /// SPIR-Vコンピュートシェーダを起動する共通経路。
     ///
     /// `buffers` の各要素は set=0 の連番 binding (STORAGE_BUFFER) に束ねられ、
@@ -563,8 +611,9 @@ impl GpuDevice for VulkanDevice {
         match kernel.name.as_str() {
             "vector_add" | "vector_add_f32" => self.run_vector_add_spirv(spirv, &kernel.entry, cfg, args),
             "matmul" | "matmul_f32" => self.run_matmul_spirv(spirv, &kernel.entry, cfg, args),
+            "raid6_xor_parity" => self.run_raid6_xor_parity_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
-                "VulkanDevice v0.4.0 only implements vector_add/vector_add_f32 and matmul/matmul_f32; got `{other}`"
+                "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, and raid6_xor_parity; got `{other}`"
             ),
         }
     }
