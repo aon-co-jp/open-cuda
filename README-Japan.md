@@ -353,3 +353,27 @@ OpenCUDA v0.3.5 は「本物Vulkan実装」の直前に必要な、GPUなしで�
 - `compile_omniir_to_spirv_fixture` は本物のSPIR-V生成器ではなく、パイプライン契約を固定するためのfixture生成器です。
 
 v0.3.5 では、`ash` による Vulkan Instance / Device / Queue / Buffer / ShaderModule / ComputePipeline / Dispatch の最小実装へ進めています。
+
+## 2026-07-30 で追加したもの: RAID6 GPUパリティ加速 + Poly1305 GPU実装
+
+`open-raid-z`のNVMe RAID6ランダムアクセス低速化(parity write penalty)問題を
+解決するためのGPUハードウェアアクセラレーター対応を実装・実機検証した。
+
+- **RAID6 P-parity(XOR)**: `opencuda-vulkan`に`raid6_xor_parity`カーネルを
+  新設(既存`vector_add`/`matmul`と同じ`dispatch_spirv`共通経路を再利用)。
+  N本のデータディスクを1本の連結バッファとしてバインドする設計。
+- **RAID6 Q-parity(Reed-Solomon、GF(2^8))**: 同じくGPU実装。Linuxカーネル/
+  H. Peter Anvin論文と同じ標準方式(生成元`0x02`、既約多項式`0x11D`)を
+  日英Web検索で裏取りした上で実装。
+- **Poly1305認証タグ**: `opencuda-directx`にGPU実装を追加(前回HANDOFFで
+  「実装難度が高く見送り」としていた項目)。64bit整数型に頼らず32bitの
+  hi/loペア演算のみでHLSL移植(GT730のようなInt64ShaderOps対応可否が
+  不明な旧世代GPUでも動く設計)。1メッセージ内のブロック並列化ではなく、
+  多数の独立したメッセージを1スレッド1メッセージで一括処理するバッチ
+  並列化を採用(RS-LinkFusionの実利用形態に合わせた設計判断)。
+- **実機検証**: いずれも実機(NVIDIA GeForce GT 730)で、RAID6両パリティは
+  CPU参照実装とbit-exact一致、Poly1305はRustCrypto製`poly1305`クレートと
+  バイト単位で完全一致することを確認済み。
+- **正直な残作業**: `open-raid-z`本体の実パリティ計算経路への統合・
+  実ベンチマークは未着手。ChaCha20+Poly1305を組み合わせた完全なAEAD
+  実装としての統合も未着手。

@@ -101,9 +101,32 @@ Host↔Device間の転送オーバーヘッドがGPU側の演算優位性を相�
 (`RS-LinkFusion`側`accel.rs`統合時に判明した懸念、詳細は同リポジトリの
 CLAUDE.md参照)。
 
-## 現状(2026-07-23)
+## 7. RAID6パリティ計算カーネルの移植パターン(2026-07-30追加)
+
+`opencuda-vulkan`の`raid6_xor_parity`/`raid6_q_parity`カーネルは、可変本数の
+データディスクを「1本の連結バッファ」としてバインドする設計(個別バッファ
+本数をシェーダの固定バインディング数に依存させない)。他プロジェクトで
+同様の「N個の入力を1カーネルで処理したい」場面があれば、この連結バッファ
+方式を踏襲すると良い。Q-parity(Reed-Solomon)のGF(2^8)乗算は
+`gf_mul`関数(Russian peasant乗算、既約多項式`0x11D`)としてシェーダ内に
+自己完結しており、他言語(HLSL等)への移植もアルゴリズムをそのまま
+書き写せる。
+
+## 8. 64bit整数型に依存しないGPU実装パターン(2026-07-30追加、Poly1305)
+
+DXIL SM6.0でも64bit整数演算(`uint64_t`)はオプション機能
+(Int64ShaderOps)で、旧世代GPUでの対応可否が不明な場合がある。
+`opencuda-directx`のPoly1305実装(`shaders/poly1305.hlsl`)は、32bit×32bit
+→64bit(hi,lo)ペア乗算(`umul32`)・64bit加算(`uadd64`)・64bit右シフト
+(`ushr64_lo`)を32bit整数演算のみで自前実装することでこの制約を回避した。
+64bit整数の対応可否が不明なターゲットへ暗号/大整数演算を移植する場合の
+パターンとして参考にできる。
+
+## 現状(2026-07-30)
 
 `opencuda-core`/`opencuda-cpu`/`opencuda-vulkan`/`opencuda-directx`/
 `opencuda-blas`/`opencuda-bert`/`opencuda-llm`から成るCargoワークスペース。
-`opencuda-directx`はPhase 2まで実装済み(vector_add/matmul/ChaCha20の
-実機ディスパッチ)。詳細な到達状況は`CLAUDE.md`のHANDOFF節を参照。
+`opencuda-directx`はPhase 2まで実装済み(vector_add/matmul/ChaCha20/
+Poly1305の実機ディスパッチ)。`opencuda-vulkan`にRAID6 P-parity(XOR)/
+Q-parity(Reed-Solomon)カーネルを追加、実機検証済み。詳細な到達状況は
+`CLAUDE.md`のHANDOFF節を参照。
