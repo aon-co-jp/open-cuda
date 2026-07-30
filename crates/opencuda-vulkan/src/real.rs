@@ -383,6 +383,58 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[data_buffer, parity_buffer], &push)
     }
 
+    /// `raid6_q_parity` の引数契約を検証する(2026-07-30続き追記: RAID6
+    /// GPUオフロード計画の第二段。P-parity(XOR)に続き、Reed-Solomon符号の
+    /// Q-parity(GF(2^8)上でのバイト単位の重み付きXOR)をGPUへオフロードする)。
+    ///
+    /// `raid6_xor_parity`と同じ`data`レイアウト(disk d の word i は
+    /// `data[d*block_words+i]`)に加え、ディスクごとのGF(2^8)係数
+    /// (RAID6標準では生成元2のべき乗 `2^d`)を渡す`coeffs`バッファ
+    /// (`num_disks`要素、各要素は下位1バイトのみ有効)を追加した5引数契約。
+    fn ensure_raid6_q_parity_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer, u32, u32)> {
+        if args.len() != 5 {
+            bail!("raid6_q_parity expects 5 args: data, coeffs, parity, num_disks, block_words");
+        }
+        let data = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 (data) must be pointer"))?;
+        let coeffs = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 (coeffs) must be pointer"))?;
+        let parity = args[2].as_ptr().ok_or_else(|| anyhow!("arg2 (parity) must be pointer"))?;
+        let num_disks = args[3].as_usize().ok_or_else(|| anyhow!("arg3 (num_disks) must be usize/u32"))?;
+        let block_words = args[4].as_usize().ok_or_else(|| anyhow!("arg4 (block_words) must be usize/u32"))?;
+
+        let (data_buf, _, _, data_len, _, _) = self.get_allocation(data)?;
+        let (coeffs_buf, _, _, coeffs_len, _, _) = self.get_allocation(coeffs)?;
+        let (parity_buf, _, _, parity_len, _, _) = self.get_allocation(parity)?;
+
+        let word_size = std::mem::size_of::<u32>();
+        let data_bytes = num_disks
+            .checked_mul(block_words)
+            .and_then(|v| v.checked_mul(word_size))
+            .ok_or_else(|| anyhow!("raid6_q_parity data byte size overflow"))?;
+        let coeffs_bytes = num_disks.checked_mul(word_size).ok_or_else(|| anyhow!("raid6_q_parity coeffs byte size overflow"))?;
+        let parity_bytes = block_words.checked_mul(word_size).ok_or_else(|| anyhow!("raid6_q_parity parity byte size overflow"))?;
+        if data_bytes > data_len {
+            bail!("raid6_q_parity data buffer too small: need {data_bytes} bytes, have {data_len}");
+        }
+        if coeffs_bytes > coeffs_len {
+            bail!("raid6_q_parity coeffs buffer too small: need {coeffs_bytes} bytes, have {coeffs_len}");
+        }
+        if parity_bytes > parity_len {
+            bail!("raid6_q_parity parity buffer too small: need {parity_bytes} bytes, have {parity_len}");
+        }
+
+        let num_disks_u32 = u32::try_from(num_disks).context("raid6_q_parity num_disks does not fit in u32 push constant")?;
+        let block_words_u32 = u32::try_from(block_words).context("raid6_q_parity block_words does not fit in u32 push constant")?;
+        Ok((data_buf, coeffs_buf, parity_buf, num_disks_u32, block_words_u32))
+    }
+
+    fn run_raid6_q_parity_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (data_buffer, coeffs_buffer, parity_buffer, num_disks, block_words) = self.ensure_raid6_q_parity_args(args)?;
+        let mut push = Vec::with_capacity(8);
+        push.extend_from_slice(&num_disks.to_ne_bytes());
+        push.extend_from_slice(&block_words.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[data_buffer, coeffs_buffer, parity_buffer], &push)
+    }
+
     /// SPIR-Vコンピュートシェーダを起動する共通経路。
     ///
     /// `buffers` の各要素は set=0 の連番 binding (STORAGE_BUFFER) に束ねられ、
@@ -612,8 +664,10 @@ impl GpuDevice for VulkanDevice {
             "vector_add" | "vector_add_f32" => self.run_vector_add_spirv(spirv, &kernel.entry, cfg, args),
             "matmul" | "matmul_f32" => self.run_matmul_spirv(spirv, &kernel.entry, cfg, args),
             "raid6_xor_parity" => self.run_raid6_xor_parity_spirv(spirv, &kernel.entry, cfg, args),
+            "raid6_q_parity" => self.run_raid6_q_parity_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
-                "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, and raid6_xor_parity; got `{other}`"
+                "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
+                 raid6_xor_parity, and raid6_q_parity; got `{other}`"
             ),
         }
     }

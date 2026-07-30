@@ -31,3 +31,10 @@ set OUT=%SHADER_DIR%\raid6_xor_parity.spv
 glslc "%SRC%" -o "%OUT%"
 if errorlevel 1 exit /b %errorlevel%
 echo OK: compiled %SRC% -^> %OUT%
+
+set SHADER_DIR=%ROOT%\examples\raid6_q_parity_vulkan_real\shaders
+set SRC=%SHADER_DIR%\raid6_q_parity.comp
+set OUT=%SHADER_DIR%\raid6_q_parity.spv
+glslc "%SRC%" -o "%OUT%"
+if errorlevel 1 exit /b %errorlevel%
+echo OK: compiled %SRC% -^> %OUT%

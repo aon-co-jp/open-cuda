@@ -11,7 +11,8 @@ glslc --version
 $shaders = @(
     @{ Dir = "examples\vector_add_vulkan_real\shaders"; Name = "vector_add" },
     @{ Dir = "examples\matmul_vulkan_real\shaders"; Name = "matmul" },
-    @{ Dir = "examples\raid6_xor_parity_vulkan_real\shaders"; Name = "raid6_xor_parity" }
+    @{ Dir = "examples\raid6_xor_parity_vulkan_real\shaders"; Name = "raid6_xor_parity" },
+    @{ Dir = "examples\raid6_q_parity_vulkan_real\shaders"; Name = "raid6_q_parity" }
 )
 
 foreach ($shader in $shaders) {

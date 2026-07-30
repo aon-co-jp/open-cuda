@@ -225,6 +225,58 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-07-30(続き) RAID6 Q-parity(Reed-Solomon、GF(2^8))のGPU実装第二段を
+  実装・実機検証(ユーザー指示「Q-parityは必要で重要なので必ずGoogleで
+  日本語と英語で設計方法と実装方法を検索して調査して開発実装して」への
+  対応、前回HANDOFFで「実装難度が高く見送り」としていた項目に正面から
+  着手)**:
+  1. **日英Web検索で設計を裏取り**(着手前に必ず調査、という指示通り):
+     Linuxカーネル`lib/raid6`/mdadmおよびH. Peter Anvin
+     "The mathematics of RAID-6"論文が採用する標準方式——
+     `Q = XOR_d(g^d・D_d)`(生成元`g=0x02`)、GF(2^8)の既約多項式
+     `x^8+x^4+x^3+x^2+1`(バイト表現`0x11D`、乗算時に最上位ビットが
+     立っていた場合の還元バイトは`0x1D`)——を日本語・英語両方の検索で
+     確認し、実装した`gf_mul`(キャリーレス乗算+条件付き還元を8回、
+     いわゆる"Russian peasant"乗算)がこの標準と一致することを裏付けた。
+  2. **設計**: `raid6_xor_parity`(P-parity)と同じ`data`バッファレイアウト
+     (disk d の word i は`data[d*block_words+i]`)を再利用しつつ、
+     ディスクごとの係数`g^d`を渡す`coeffs`バッファ(`num_disks`要素)を
+     追加した5引数契約(`data, coeffs, parity, num_disks, block_words`)。
+     GLSL側は32bit word内の4バイトそれぞれについて`gf_mul(byte, coeff)`
+     をXOR累積し、再パックして出力する。
+  3. **実装**: `examples/raid6_q_parity_vulkan_real/shaders/raid6_q_parity.comp`
+     (GLSL、`gf_mul`関数を含む)、`opencuda-vulkan::real::VulkanDevice`に
+     `ensure_raid6_q_parity_args`/`run_raid6_q_parity_spirv`を追加し
+     `launch_kernel`のカーネル名分岐に`"raid6_q_parity"`を追加。
+     `tools/compile-vulkan-shaders.{sh,ps1,cmd}`に新シェーダのコンパイル
+     エントリを追加。新規example crate`raid6_q_parity_vulkan_real`:
+     CPU側に`gf_mul`(シェーダの`gf_mul`と全く同じアルゴリズムだが独立
+     実装、Rustのバイト演算で記述)によるリファレンス実装・CPU版・
+     実Vulkan版の3経路を同一入力(4ディスク×4096バイト、係数
+     `g^0,g^1,g^2,g^3`)で実行し、bit-exact一致を検証。
+  4. **実機検証(型チェックのみで完了と報告しない方針を徹底)**:
+     `cargo run -p raid6_q_parity_vulkan_real --release`を実際にこの
+     マシン(NVIDIA GeForce GT 730)で実行し、CPU vs reference・
+     Vulkan vs reference・Vulkan vs CPUの3組すべてがbit-exact一致
+     することを確認した。
+  5. **検証**: `cargo build --workspace`警告0件、`cargo test --workspace
+     --release`全クレートregression無し、`cargo clippy -p opencuda-vulkan
+     -p raid6_xor_parity_vulkan_real -p raid6_q_parity_vulkan_real
+     --all-targets --features real-vulkan -- -D warnings`警告0件。
+  6. **正直な開示・スコープ**: これでRAID6のP-parity・Q-parity両方が
+     GPU実装・実機検証済みとなったが、依然として(a)`open-raid-z`本体の
+     実パリティ計算経路への統合、(b)実ブロックサイズでのCPU版との
+     ベンチマーク比較、は未着手のまま(前回HANDOFFと同じ残作業)。
+     また今回の`gf_mul`はスカラー(1バイトずつ)実装であり、Anvinの
+     論文が言及する「複数バイトを並列処理する高速化」等のSIMD的な
+     最適化は行っていない(RAID6の正しさの実証を優先、性能最適化は
+     次の増分)。
+  - 次にすべきこと: (1) `open-raid-z`本体の実パリティ計算経路への統合、
+    (2) 実ブロックサイズ(4KB〜1MB程度)でのCPU版とのベンチマーク比較、
+    (3) Poly1305認証タグのGPU実装(`opencuda-directx`側の既存の見送り
+    項目、ユーザーから同時に「必ずGoogleで調査して実装して」との指示
+    あり、次のセッション増分として着手予定)。
+
 - **2026-07-30 RAID6 P-parity(XOR)のGPU実装第一段を実装・実機検証
   (open-raid-zのNVMe RAID6ランダムアクセス低速化問題への対応、ユーザー
   指示「open-directxとopen-cudaなどでハードウェアアクセラレーター対応を
