@@ -12,14 +12,14 @@ GitHubリポジトリ: [aon-co-jp/open-cuda](https://github.com/aon-co-jp/open-c
 
 GPU抽象化・計算基盤(`OmniGPU`設計、詳細は`OmniGPU-Design.md`参照)。
 `opencuda-core`/`opencuda-cpu`/`opencuda-vulkan`/`opencuda-blas`
-(GEMM/Attention/量子化)・`opencuda-bert`(BERT系エンコーダのforward pass、
+(GEMM/Attention/量子化)・`open-cuda-bert`(BERT系エンコーダのforward pass、
 multilingual-e5-small対応)から成るCargoワークスペース。`aruaru-llm`との
 SET構成(GPU/CPU実行パイプラインの実装先)。
 
 前回のマーケティング調査(Python製AIライブラリのRust移植ランキング)で
 言う「1〜6位の良いとこ取りハイブリッド/トライブリッド」の実体
-——`opencuda-blas`がNumPy相当、`opencuda-bert`がTransformers推論パス
-相当。今後`opencuda-llm`(vLLM相当、自己回帰デコーダ追加時)を追加予定。
+——`opencuda-blas`がNumPy相当、`open-cuda-bert`がTransformers推論パス
+相当。今後`open-cuda-llm`(vLLM相当、自己回帰デコーダ追加時)を追加予定。
 
 ## 詳細な設計・現状
 
@@ -47,7 +47,7 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 - 検討時の技術的懸念(RS-LinkFusion側調査で判明、DirectX移行時にも
   該当しうる): 汎用`GpuDevice`(alloc/memcpy/launch_kernel)の抽象化
   自体はバイト列を扱えるが、圧縮・暗号化カーネル(ChaCha20-Poly1305等)
-  は既存の`opencuda-blas`/`opencuda-bert`(ML専用、GEMM/Attention/
+  は既存の`opencuda-blas`/`open-cuda-bert`(ML専用、GEMM/Attention/
   量子化)には一切存在せず、新規に書く必要がある。また小サイズ
   ペイロード(例: ネットワークMTU程度の数百〜数千バイト)では
   Host↔Device間のメモリ転送オーバーヘッドがGPU側の演算優位性を
@@ -217,7 +217,7 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 「関連プロジェクト」節を参照。主な関連リポジトリ:
 
 - [aruaru-llm](https://github.com/aon-co-jp/aruaru-llm) — `open-cuda`の
-  実装例(bag-of-words→`opencuda-bert`埋め込みベースの意図分類へ移行済み)
+  実装例(bag-of-words→`open-cuda-bert`埋め込みベースの意図分類へ移行済み)
 - [RS-Git](https://github.com/aon-co-jp/RS-Git)・[RJSON](https://github.com/aon-co-jp/RJSON) —
   Git forge・JSON処理(OTPログイン・アクセス制御パターンの先行実装)
 - [RS-Chiketto](https://github.com/aon-co-jp/RS-Chiketto)・[RS-Blog](https://github.com/aon-co-jp/RS-Blog)・[RS-EC](https://github.com/aon-co-jp/RS-EC) —
@@ -225,11 +225,11 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
-- **2026-07-31 `opencuda-whisper`新設(6位Whisper相当のMVP着手、ユーザー指示)**:
+- **2026-07-31 `open-cuda-whisper`新設(6位Whisper相当のMVP着手、ユーザー指示)**:
   `open-raid-z`の「Python製AIライブラリのRust移植」ロードマップ
   (マーケティング調査1〜6位)のうち、前回(2026-07-25)HANDOFFで次の
-  推奨とされていた6位Whisper相当に着手した。`opencuda-bert`
-  (エンコーダ専用パターン)・`opencuda-llm`(KVキャッシュ付きGPT系
+  推奨とされていた6位Whisper相当に着手した。`open-cuda-bert`
+  (エンコーダ専用パターン)・`open-cuda-llm`(KVキャッシュ付きGPT系
   デコーダパターン)の両方を組み合わせ、実際のWhisperアーキテクチャ
   (音声エンコーダ+テキストデコーダ+Cross-Attention)向けに新規実装した。
   1. **対数メルスペクトログラム抽出**(`log_mel_spectrogram`): 16kHz
@@ -239,9 +239,9 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      サンプルを受け取る前提)。
   2. **`WhisperEncoder`**: メル特徴量を`Linear`で射影(本家の畳み込み
      stemの簡略版、正直な開示として明記)+正弦波位置埋め込み+
-     pre-LNトランスフォーマー(双方向自己注意、`opencuda-bert`と同じ
+     pre-LNトランスフォーマー(双方向自己注意、`open-cuda-bert`と同じ
      Multi-Head Attention構成)。
-  3. **`WhisperDecoder`**: `opencuda-llm::GptModel`と同じKVキャッシュ付き
+  3. **`WhisperDecoder`**: `open-cuda-llm::GptModel`と同じKVキャッシュ付き
      自己回帰デコーダに、エンコーダ出力への**Cross-Attention**サブ層を
      追加。Cross-Attentionはクエリ長(デコーダ側)とキー/バリュー長
      (エンコーダ側)が異なるため`opencuda_blas::scaled_dot_product_
@@ -255,40 +255,40 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      返しうる**(どちらもDXGI/vkGetPhysicalDeviceProperties経由で
      同じベンダーIDを読むため)ため、現状の`select_gemm_path`ロジックは
      DirectXデバイスに対しても誤って`GemmPath::VulkanGeneric`
-     (SPIR-Vシェーダ前提)を選んでしまう——これは`opencuda-whisper`
-     固有の問題ではなく`opencuda-blas`(=`opencuda-bert`/`opencuda-llm`
+     (SPIR-Vシェーダ前提)を選んでしまう——これは`open-cuda-whisper`
+     固有の問題ではなく`opencuda-blas`(=`open-cuda-bert`/`open-cuda-llm`
      含む全モデルクレート共通の基盤)側の既知のギャップと判断し、
-     **`opencuda-whisper`側にDirectX固有分岐を持ち込むことはしなかった**
+     **`open-cuda-whisper`側にDirectX固有分岐を持ち込むことはしなかった**
      (モジュールdocに詳細を明記)。`opencuda-directx`は既にmatmul
      カーネルを実機検証済み(2026-07-27 HANDOFF参照)のため、
      `opencuda-blas`側に`GemmPath::DirectXGeneric`を追加すれば
-     `opencuda-whisper`を含む全モデルクレートが自動的にDirectX対応
+     `open-cuda-whisper`を含む全モデルクレートが自動的にDirectX対応
      される見込み。
-  5. **正直な開示・スコープの限界**(`opencuda-bert`/`opencuda-llm`初回
+  5. **正直な開示・スコープの限界**(`open-cuda-bert`/`open-cuda-llm`初回
      MVPと同じ開発方針): (a) 学習済み重みは未対応(`load_random`のみ、
      `openai/whisper-tiny`等の実safetensorsローダーは次回の増分)。
      (b) 畳み込みstemを`Linear`射影に簡略化(真の畳み込みは未実装)。
      (c) トークナイザは`ByteTokenizer`(UTF-8バイト単位)のみ、本家の
      マルチリンガルBPE語彙は未対応。
-  6. **検証**: `cargo build -p opencuda-whisper`警告0件、
-     `cargo test -p opencuda-whisper`**9件全green**——メルスペクトログラム
+  6. **検証**: `cargo build -p open-cuda-whisper`警告0件、
+     `cargo test -p open-cuda-whisper`**9件全green**——メルスペクトログラム
      の形状・NaN/Inf非混入・短すぎる音声の安全な拒否、エンコーダの
      出力形状、デコーダの指定トークン数生成、同一シード決定性、
      異なるシードでの出力差、**そして最重要の
      `incremental_kv_cache_decoding_matches_full_recompute_at_each_
      position`**(KVキャッシュ経由の逐次デコードとキャッシュ無し
      フルスクラッチ再計算が、Cross-Attention込みで数値一致
-     〈誤差1e-4以内〉することを確認——`opencuda-llm`の同名テストの
+     〈誤差1e-4以内〉することを確認——`open-cuda-llm`の同名テストの
      Cross-Attention版)、`transcribe`の一気通貫動作確認。
-     `cargo clippy -p opencuda-whisper --all-targets -- -D warnings`
+     `cargo clippy -p open-cuda-whisper --all-targets -- -D warnings`
      警告0件。`cargo build --workspace`/`cargo test --workspace`とも
      既存クレートへのregression無し(全green)。
   - 次にすべきこと: (1) `opencuda-blas::select_gemm_path`への
     `GemmPath::DirectXGeneric`追加(DirectX/Vulkanの判別、上記4.参照、
-    `opencuda-whisper`単体のスコープを超える基盤課題)、(2) 実在の
+    `open-cuda-whisper`単体のスコープを超える基盤課題)、(2) 実在の
     学習済みWhisper重み(`openai/whisper-tiny`等)のsafetensorsローダー、
     (3) `aruaru-llm`を本家`poem`クレート直接依存からRPoem
-    (`open-runo-poem-compat`)へ移行し、`opencuda-whisper`を含む
+    (`open-runo-poem-compat`)へ移行し、`open-cuda-whisper`を含む
     AI機能群をPoem互換APIとして他言語からHTTP経由で利用可能にする
     (ユーザー指示、「Rust＋Poem版と並行でRPoem」の実現、今回は
     Whisper本体の実装を優先しスコープ外とした)。
@@ -492,10 +492,10 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   - 次にすべきこと: 前回HANDOFFの(1)(2)(3)から変更なし(Poly1305/
     ベンチマーク/コマンドリストバッチ化、いずれも未着手のまま)。
 
-- **2026-07-25 `opencuda-llm`にsafetensorsローダー追加(実GPT-2重みで検証)
+- **2026-07-25 `open-cuda-llm`にsafetensorsローダー追加(実GPT-2重みで検証)
   + `needless_range_loop`警告2件解消**: 前回HANDOFFの「次にすべきこと」
   (1)(2)に着手。
-  1. **safetensorsローダー**: `opencuda-bert::BertModel::load`と同じ設計
+  1. **safetensorsローダー**: `open-cuda-bert::BertModel::load`と同じ設計
      (config.json→safetensorsの順で読み、テンソル名を辿る)で
      `GptModel::load(dir: &Path) -> Result<Self>`を実装。GPT-2は
      BERTと重みレイアウトが異なる点への対応が必要だった:
@@ -521,7 +521,7 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      徹底)**: `huggingface.co`への到達性を`curl`で確認後、
      GPT-2 124M(`openai-community/gpt2`)の`model.safetensors`
      (548MB)・`config.json`・`tokenizer.json`を実際にダウンロード
-     (`crates/opencuda-llm/models/gpt2/`、`.gitignore`対象、リポジトリ
+     (`crates/open-cuda-llm/models/gpt2/`、`.gitignore`対象、リポジトリ
      には含めない)。`GptModel::load`で実際にロードでき
      (`vocab_size=50257`/`hidden_size=768`/`num_layers=12`/
      `num_heads=12`を実際に検証)、GPT-2自身のBPE語彙に対応した
@@ -548,7 +548,7 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      実行される)。
   5. **`GptTokenizer`新設**: 実重みでの意味のある検証には、
      `ByteTokenizer`(バイト値=トークンID)ではなくGPT-2自身のBPE語彙
-     ベースのトークナイザが必要だったため、`opencuda-bert::BertTokenizer`
+     ベースのトークナイザが必要だったため、`open-cuda-bert::BertTokenizer`
      と同じ設計で`tokenizers`クレートによる`GptTokenizer`(`tokenizer.json`
      読み込み)を追加した。**正直な開示**: `ByteTokenizer`は既定のまま
      残しており(既存4テストは変更無し、後方互換)、実重みと
@@ -558,8 +558,8 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      ヘッドループ(`enumerate().take(num_heads)`へ)、`load_fused_qkv`の
      QKV分割ループ(`chunks_exact`/`chunks_exact_mut`のzipへ)を
      イテレータベースへ書き換え。
-  7. **検証結果**: `cargo build -p opencuda-llm --release`警告0件、
-     `cargo test -p opencuda-llm --release`**6件全green**(既存4件+
+  7. **検証結果**: `cargo build -p open-cuda-llm --release`警告0件、
+     `cargo test -p open-cuda-llm --release`**6件全green**(既存4件+
      新規2件〈合成safetensors検証・実GPT-2重み検証〉、実機で実際に
      GPT-2重みをロード・生成し記録)。`cargo test --workspace --release`
      も全クレートでregression無し(全て`test result: ok`)。
@@ -570,12 +570,12 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     Whisper相当)のうち次に着手するものの選定(前回HANDOFFの推奨
     〈Whisper相当〉のまま)。
 
-- **2026-07-22 `opencuda-llm`新設(1位vLLM相当のMVP着手)**: `open-raid-z`
+- **2026-07-22 `open-cuda-llm`新設(1位vLLM相当のMVP着手)**: `open-raid-z`
   CLAUDE.mdの「Python製AIライブラリのRust移植ハイブリッド/トライブリッド版」
   構想(マーケティング調査1〜6位: vLLM/Transformers/NumPy/PyTorch互換/
   scikit-learn/Whisper相当)のうち、`opencuda-blas`(NumPy相当)・
-  `opencuda-bert`(Transformersエンコーダ相当)に続き未着手だった
-  **1位vLLM相当**に、新規クレート`crates/opencuda-llm`として着手した。
+  `open-cuda-bert`(Transformersエンコーダ相当)に続き未着手だった
+  **1位vLLM相当**に、新規クレート`crates/open-cuda-llm`として着手した。
   6目標を同時に手を広げず、既存の`opencuda-blas`のGEMM/Attention
   カーネルをそのまま再利用できて最も早く実用最小限(MVP)を動かせる
   対象として選定(判断基準: 既存クレートの再利用度合い、外部の巨大
@@ -591,13 +591,13 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   2. **正直な開示**: (a) 本家vLLMの核心的最適化(PagedAttention・
      連続バッチング・複数リクエスト同時処理)は一切未実装、単一
      シーケンスの逐次デコードのみ。(b) **学習済み重みは無い**
-     (`opencuda-bert`と異なり`safetensors`ローダー未実装)、生成される
+     (`open-cuda-bert`と異なり`safetensors`ローダー未実装)、生成される
      テキストは意味を持たない——検証対象は「自己回帰生成パイプライン
      の配線が正しいか」であって「自然な文章を生成できるか」ではない。
      (c) バイト単位トークナイザなので本格的なBPE/SentencePieceより
      語彙効率は悪い。
-  3. **検証**: `cargo build -p opencuda-llm --release`警告0件、
-     `cargo test -p opencuda-llm --release`4件全green——
+  3. **検証**: `cargo build -p open-cuda-llm --release`警告0件、
+     `cargo test -p open-cuda-llm --release`4件全green——
      `generates_requested_number_of_tokens_without_panicking`
      (プロンプトから8トークン生成しpanicしないこと)、
      `same_seed_and_prompt_produce_identical_output_deterministically`、
@@ -607,26 +607,26 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      無しでシーケンス全体をフルスクラッチ再計算した場合と数値一致
      〈誤差1e-4以内〉することを検証——`opencuda-blas`の既存Flash
      Attention数値一致テストと同じ考え方で、causalマスクの代替実装が
-     正しいことを裏付ける)。`cargo clippy -p opencuda-llm --all-targets
+     正しいことを裏付ける)。`cargo clippy -p open-cuda-llm --all-targets
      --release`は`needless_range_loop`警告2件のみ(機能に影響しない、
      次回クリーンアップ対象)。`cargo test --workspace --release`で
-     既存クレート全て regression 無し(`opencuda-bert`等の既存テストに
+     既存クレート全て regression 無し(`open-cuda-bert`等の既存テストに
      影響なし)。
   - 次にすべきこと: (1) 実在の学習済みGPT系モデル(GPT-2小型版等)の
-    `safetensors`を読み込むローダーの追加(`opencuda-bert`の
+    `safetensors`を読み込むローダーの追加(`open-cuda-bert`の
     `BertModel::load`と同様の設計で移植可能)、(2) `clippy`の
     `needless_range_loop`警告2件の解消、(3) 残り4目標
     (PyTorch互換/scikit-learn/Whisper相当)のうち次に着手するものの
-    選定(現時点の推奨: Whisper相当——既存の`opencuda-bert`の
+    選定(現時点の推奨: Whisper相当——既存の`open-cuda-bert`の
     エンコーダ実装パターンを転用しやすく、音声特徴量抽出さえ用意すれば
     比較的早くMVPに到達できると見込む)。
 
 - **2026-07-21 CLAUDE.md新規作成**: これまでREADME/DEVELOPMENT-NEXT.md
   のみでプロジェクト共通の開発方針ドキュメントが無かったため新設。
-  併せて`opencuda-bert`(以前ローカルのみで未コミットだった)を
+  併せて`open-cuda-bert`(以前ローカルのみで未コミットだった)を
   ワークスペースへ正式追加・コミット・push済み(コミット`47f7837`)。
   - 次にすべきこと: (1) `opencuda-blas`のGPU専用パス(cuBLAS/rocBLAS/
-    oneMKL/Vulkan汎用)の実装、(2) 真のFlash Attention、(3) `opencuda-llm`
+    oneMKL/Vulkan汎用)の実装、(2) 真のFlash Attention、(3) `open-cuda-llm`
     (自己回帰デコーダ、vLLM相当)の設計・着手。
 
 - **2026-07-21 真のFlash Attention + VulkanGEMM(matmul)経路を実装**:
@@ -701,7 +701,7 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     `CpuNaive`経路と同じセマンティクスを保つ。`None`ならエラーで
     明示的に失敗させる(黙って別経路にフォールバックしたり誤った
     結果を返したりしない)。ワークスペース内の既存呼び出し元
-    (`opencuda-bert`、本クレート内のattention実装・既存テスト)は
+    (`open-cuda-bert`、本クレート内のattention実装・既存テスト)は
     末尾に`None`を追加して更新。`sgemm_vulkan_generic`自体は変更なし
     (引き続き直接呼び出し可能)。
   - 新規テスト1件(`sgemm_auto_dispatch_uses_vulkan_path_on_real_nvidia_hardware_instead_of_cublas_stub`):
@@ -828,9 +828,9 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   4. **検証結果**(実際に実行、型チェックのみで済ませていない):
      `cargo build --workspace --release`警告0件・成功。
      `cargo test --workspace --release`**全クレートregression無し**
-     (`opencuda-blas`22件・`opencuda-bert`2件・`opencuda-directx`3件
+     (`opencuda-blas`22件・`open-cuda-bert`2件・`opencuda-directx`3件
      〈モックのみ、`real-dx12`feature未指定〉・`opencuda-ir`1件+
-     結線テスト1件・`opencuda-llm`6件・`opencuda-vulkan`結線テスト
+     結線テスト1件・`open-cuda-llm`6件・`opencuda-vulkan`結線テスト
      3件、他クレートは0件、全て`test result: ok`、失敗0件)。
      `cargo clippy --workspace --all-targets --release`**警告0件**。
   5. **正直な開示**: このセッションでの新規実装は無い
@@ -870,7 +870,7 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      gpt2`本体は`wte.weight`(プレフィックス無し)を使っており、
      **同じGPT-2アーキテクチャでも変換元スクリプトによってテンソル名
      規約が実際に異なる**ことが根本原因だった。
-  2. **`crates/opencuda-llm/src/lib.rs::GptModel::load`を修正**:
+  2. **`crates/open-cuda-llm/src/lib.rs::GptModel::load`を修正**:
      ロード時に`wte.weight`/`transformer.wte.weight`のどちらが実在するか
      を確認して`key_prefix`を自動判定し、以降の全テンソル名
      (`wte.weight`/`wpe.weight`/`h.{i}...`/`ln_f`)にこの`key_prefix`を
@@ -881,14 +881,14 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      追加(合成フィクスチャを`transformer.`プレフィックス付きで生成し、
      ロード→生成まで通ることを確認)。既存の
      `load_parses_gpt2_shaped_safetensors_and_config_without_panicking`
-     も無変更のままgreen(後方互換)。`cargo test -p opencuda-llm`
+     も無変更のままgreen(後方互換)。`cargo test -p open-cuda-llm`
      **7件全green**(既存5件+新規2件のうち1件は本来から存在した
      フィクスチャ関数のリファクタリングで名称変更、実質+1件)。
   4. **実E2E確認(型チェックだけで終わらせない)**: 修正後、実際に
      aruaru-llmサーバーを起動し、`POST /v1/models/select`で
      `distilgpt2`への切り替えが成功し(修正前は失敗していた)、
      `POST /v1/generate`で実際に英文が生成される(`distilgpt2-greedy-
-     decode-v0-opencuda-llm-cpu`エンジンラベル付きで応答)ことを
+     decode-v0-open-cuda-llm-cpu`エンジンラベル付きで応答)ことを
      実際に確認した——「ダウンロード→切り替え→生成」の一気通貫を
      実際に検証し、かつその過程で見つかった実バグを実際に修正した。
   - 次にすべきこと: (1) `gpt2-medium`/`gpt2-large`/`gpt2-xl`が

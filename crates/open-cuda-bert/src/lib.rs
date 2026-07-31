@@ -1,4 +1,4 @@
-//! # opencuda-bert
+//! # open-cuda-bert
 //!
 //! BERT系エンコーダ(multilingual-e5-small等)のforward pass実装。
 //! `opencuda-blas`の実カーネル(`sgemm`によるLinear層、
@@ -175,14 +175,14 @@ pub struct BertModel {
 }
 
 fn tensor_f32(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>> {
-    let view = tensors.tensor(name).with_context(|| format!("opencuda-bert: missing tensor '{name}'"))?;
+    let view = tensors.tensor(name).with_context(|| format!("open-cuda-bert: missing tensor '{name}'"))?;
     anyhow::ensure!(
         view.dtype() == safetensors::Dtype::F32,
-        "opencuda-bert: tensor '{name}' has unexpected dtype {:?} (expected F32)",
+        "open-cuda-bert: tensor '{name}' has unexpected dtype {:?} (expected F32)",
         view.dtype()
     );
     let bytes = view.data();
-    anyhow::ensure!(bytes.len() % 4 == 0, "opencuda-bert: tensor '{name}' byte length not a multiple of 4");
+    anyhow::ensure!(bytes.len() % 4 == 0, "open-cuda-bert: tensor '{name}' byte length not a multiple of 4");
     let mut out = vec![0.0f32; bytes.len() / 4];
     for (i, chunk) in bytes.chunks_exact(4).enumerate() {
         out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -207,7 +207,7 @@ fn load_linear(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
     let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
     anyhow::ensure!(
         weight.len() == out_dim * in_dim,
-        "opencuda-bert: '{prefix}.weight' has {} elements, expected {}x{}",
+        "open-cuda-bert: '{prefix}.weight' has {} elements, expected {}x{}",
         weight.len(),
         out_dim,
         in_dim
@@ -232,12 +232,12 @@ impl BertModel {
     /// `dir`配下の`config.json`・`model.safetensors`を読み込む。
     pub fn load(dir: &Path) -> Result<Self> {
         let config_json = std::fs::read_to_string(dir.join("config.json"))
-            .with_context(|| format!("opencuda-bert: failed to read config.json in {dir:?}"))?;
-        let config: BertConfig = serde_json::from_str(&config_json).context("opencuda-bert: failed to parse config.json")?;
+            .with_context(|| format!("open-cuda-bert: failed to read config.json in {dir:?}"))?;
+        let config: BertConfig = serde_json::from_str(&config_json).context("open-cuda-bert: failed to parse config.json")?;
 
         let weights_bytes = std::fs::read(dir.join("model.safetensors"))
-            .with_context(|| format!("opencuda-bert: failed to read model.safetensors in {dir:?}"))?;
-        let tensors = safetensors::SafeTensors::deserialize(&weights_bytes).context("opencuda-bert: failed to parse model.safetensors")?;
+            .with_context(|| format!("open-cuda-bert: failed to read model.safetensors in {dir:?}"))?;
+        let tensors = safetensors::SafeTensors::deserialize(&weights_bytes).context("open-cuda-bert: failed to parse model.safetensors")?;
 
         let hidden = config.hidden_size;
         let word_embeddings = tensor_f32(&tensors, "embeddings.word_embeddings.weight")?;
@@ -268,10 +268,10 @@ impl BertModel {
     /// L2正規化を行う。`token_type_ids`は単一セグメント想定で常に0。
     pub fn embed_tokens(&self, device: &Arc<dyn GpuDevice>, token_ids: &[u32]) -> Result<Vec<f32>> {
         let seq_len = token_ids.len();
-        anyhow::ensure!(seq_len > 0, "opencuda-bert: token_ids must not be empty");
+        anyhow::ensure!(seq_len > 0, "open-cuda-bert: token_ids must not be empty");
         anyhow::ensure!(
             seq_len <= self.config.max_position_embeddings,
-            "opencuda-bert: seq_len {seq_len} exceeds max_position_embeddings {}",
+            "open-cuda-bert: seq_len {seq_len} exceeds max_position_embeddings {}",
             self.config.max_position_embeddings
         );
 
@@ -279,7 +279,7 @@ impl BertModel {
         let mut hidden = vec![0.0f32; seq_len * hidden_size];
         for (row, &tok) in token_ids.iter().enumerate() {
             let tok = tok as usize;
-            anyhow::ensure!(tok < self.config.vocab_size, "opencuda-bert: token id {tok} out of vocab range");
+            anyhow::ensure!(tok < self.config.vocab_size, "open-cuda-bert: token id {tok} out of vocab range");
             for c in 0..hidden_size {
                 hidden[row * hidden_size + c] = self.word_embeddings[tok * hidden_size + c]
                     + self.position_embeddings[row * hidden_size + c]
@@ -328,7 +328,7 @@ pub struct BertTokenizer {
 impl BertTokenizer {
     pub fn load(dir: &Path) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("opencuda-bert: failed to load tokenizer.json: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("open-cuda-bert: failed to load tokenizer.json: {e}"))?;
         Ok(Self { inner })
     }
 
@@ -337,7 +337,7 @@ impl BertTokenizer {
         let encoding = self
             .inner
             .encode(text, true)
-            .map_err(|e| anyhow::anyhow!("opencuda-bert: tokenizer encode failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("open-cuda-bert: tokenizer encode failed: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
 }

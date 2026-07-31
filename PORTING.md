@@ -125,7 +125,7 @@ DXIL SM6.0でも64bit整数演算(`uint64_t`)はオプション機能
 ## 現状(2026-07-30)
 
 `opencuda-core`/`opencuda-cpu`/`opencuda-vulkan`/`opencuda-directx`/
-`opencuda-blas`/`opencuda-bert`/`opencuda-llm`から成るCargoワークスペース。
+`opencuda-blas`/`open-cuda-bert`/`open-cuda-llm`から成るCargoワークスペース。
 `opencuda-directx`はPhase 2まで実装済み(vector_add/matmul/ChaCha20/
 Poly1305の実機ディスパッチ)。`opencuda-vulkan`にRAID6 P-parity(XOR)/
 Q-parity(Reed-Solomon)カーネルを追加、実機検証済み。詳細な到達状況は

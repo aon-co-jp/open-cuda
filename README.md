@@ -30,19 +30,19 @@
   等)との出力完全一致をテストで確認。DXGIアダプタ列挙による実際の
   ベンダー名・VRAM容量取得も実装済み。
 - **`opencuda-blas`**: NumPy相当(GEMM/Attention/量子化)。
-- **`opencuda-bert`**: BERT系エンコーダのforward pass
+- **`open-cuda-bert`**: BERT系エンコーダのforward pass
   (multilingual-e5-small対応)。
-- **`opencuda-llm`**: vLLM相当(KVキャッシュ付き貪欲デコード)。GPT-2
+- **`open-cuda-llm`**: vLLM相当(KVキャッシュ付き貪欲デコード)。GPT-2
   (Hugging Face `openai-community/gpt2`)の`safetensors`を読み込む
-  `GptModel::load`実装済み(2026-07-25、`opencuda-bert::BertModel::load`
+  `GptModel::load`実装済み(2026-07-25、`open-cuda-bert::BertModel::load`
   と同じ設計)。実機でGPT-2 124Mの実重みをダウンロード・ロードし、
   ランダム初期化(意味を持たない出力)と比べて明確に流暢な英語の
   貪欲デコード継続("The quick brown fox" → "es are a great way to
   get a little bit of a")を確認済み——詳細は`CLAUDE.md`HANDOFF参照。
-- **`opencuda-whisper`**(2026-07-31新設): Whisper相当(音声認識、
+- **`open-cuda-whisper`**(2026-07-31新設): Whisper相当(音声認識、
   マーケティング調査ロードマップ6位)。対数メルスペクトログラム抽出+
-  エンコーダ(`opencuda-bert`と同じMulti-Head Attention構成)+
-  KVキャッシュ付きデコーダ(`opencuda-llm`と同じ設計)+
+  エンコーダ(`open-cuda-bert`と同じMulti-Head Attention構成)+
+  KVキャッシュ付きデコーダ(`open-cuda-llm`と同じ設計)+
   Cross-Attentionを実装。**現状ランダム初期化のMVPのみ**(学習済み
   Whisper重みのローダーは未実装、詳細は`CLAUDE.md`HANDOFF参照)。
 
