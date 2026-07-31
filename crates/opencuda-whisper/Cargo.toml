@@ -1,0 +1,17 @@
+[package]
+name = "opencuda-whisper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Whisper(音声認識)相当のエンコーダ・デコーダforward pass実装(open-raid-zマーケティング調査ロードマップ6位)。opencuda-bert/opencuda-llmと同じopencuda-blas上のCPU/Vulkan両対応MVP。"
+
+[dependencies]
+anyhow = { workspace = true }
+opencuda-core = { path = "../opencuda-core" }
+opencuda-blas = { path = "../opencuda-blas" }
+
+[dev-dependencies]
+opencuda-cpu = { path = "../opencuda-cpu" }

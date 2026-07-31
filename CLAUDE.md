@@ -225,6 +225,74 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-07-31 `opencuda-whisper`新設(6位Whisper相当のMVP着手、ユーザー指示)**:
+  `open-raid-z`の「Python製AIライブラリのRust移植」ロードマップ
+  (マーケティング調査1〜6位)のうち、前回(2026-07-25)HANDOFFで次の
+  推奨とされていた6位Whisper相当に着手した。`opencuda-bert`
+  (エンコーダ専用パターン)・`opencuda-llm`(KVキャッシュ付きGPT系
+  デコーダパターン)の両方を組み合わせ、実際のWhisperアーキテクチャ
+  (音声エンコーダ+テキストデコーダ+Cross-Attention)向けに新規実装した。
+  1. **対数メルスペクトログラム抽出**(`log_mel_spectrogram`): 16kHz
+     モノラルPCM→25msウィンドウ・10msホップのSTFT(素朴なO(N²)DFT、
+     性能最適化は次回課題として正直に開示)→80メル帯域の対数パワー。
+     外部音声デコードライブラリ非依存(既にデコード済みのf32 PCM
+     サンプルを受け取る前提)。
+  2. **`WhisperEncoder`**: メル特徴量を`Linear`で射影(本家の畳み込み
+     stemの簡略版、正直な開示として明記)+正弦波位置埋め込み+
+     pre-LNトランスフォーマー(双方向自己注意、`opencuda-bert`と同じ
+     Multi-Head Attention構成)。
+  3. **`WhisperDecoder`**: `opencuda-llm::GptModel`と同じKVキャッシュ付き
+     自己回帰デコーダに、エンコーダ出力への**Cross-Attention**サブ層を
+     追加。Cross-Attentionはクエリ長(デコーダ側)とキー/バリュー長
+     (エンコーダ側)が異なるため`opencuda_blas::scaled_dot_product_
+     attention`(Q/K/V等長前提)をそのまま使えず、`opencuda_blas::sgemm`
+     のみを組み合わせた`cross_attention`ヘルパーを新設した。
+  4. **重要な設計判断(ユーザー指摘を受けて)**: 当初`opencuda-directx`
+     抜きで設計されていた`opencuda-blas`の自動バックエンド選択
+     (`select_gemm_path`)が、`GpuVendor`(NVIDIA/AMD/Intel等の
+     シリコンベンダー)だけを見て経路を選ぶ設計であることを確認した。
+     **DirectXデバイスもVulkanデバイスも同じ`GpuVendor::Nvidia`等を
+     返しうる**(どちらもDXGI/vkGetPhysicalDeviceProperties経由で
+     同じベンダーIDを読むため)ため、現状の`select_gemm_path`ロジックは
+     DirectXデバイスに対しても誤って`GemmPath::VulkanGeneric`
+     (SPIR-Vシェーダ前提)を選んでしまう——これは`opencuda-whisper`
+     固有の問題ではなく`opencuda-blas`(=`opencuda-bert`/`opencuda-llm`
+     含む全モデルクレート共通の基盤)側の既知のギャップと判断し、
+     **`opencuda-whisper`側にDirectX固有分岐を持ち込むことはしなかった**
+     (モジュールdocに詳細を明記)。`opencuda-directx`は既にmatmul
+     カーネルを実機検証済み(2026-07-27 HANDOFF参照)のため、
+     `opencuda-blas`側に`GemmPath::DirectXGeneric`を追加すれば
+     `opencuda-whisper`を含む全モデルクレートが自動的にDirectX対応
+     される見込み。
+  5. **正直な開示・スコープの限界**(`opencuda-bert`/`opencuda-llm`初回
+     MVPと同じ開発方針): (a) 学習済み重みは未対応(`load_random`のみ、
+     `openai/whisper-tiny`等の実safetensorsローダーは次回の増分)。
+     (b) 畳み込みstemを`Linear`射影に簡略化(真の畳み込みは未実装)。
+     (c) トークナイザは`ByteTokenizer`(UTF-8バイト単位)のみ、本家の
+     マルチリンガルBPE語彙は未対応。
+  6. **検証**: `cargo build -p opencuda-whisper`警告0件、
+     `cargo test -p opencuda-whisper`**9件全green**——メルスペクトログラム
+     の形状・NaN/Inf非混入・短すぎる音声の安全な拒否、エンコーダの
+     出力形状、デコーダの指定トークン数生成、同一シード決定性、
+     異なるシードでの出力差、**そして最重要の
+     `incremental_kv_cache_decoding_matches_full_recompute_at_each_
+     position`**(KVキャッシュ経由の逐次デコードとキャッシュ無し
+     フルスクラッチ再計算が、Cross-Attention込みで数値一致
+     〈誤差1e-4以内〉することを確認——`opencuda-llm`の同名テストの
+     Cross-Attention版)、`transcribe`の一気通貫動作確認。
+     `cargo clippy -p opencuda-whisper --all-targets -- -D warnings`
+     警告0件。`cargo build --workspace`/`cargo test --workspace`とも
+     既存クレートへのregression無し(全green)。
+  - 次にすべきこと: (1) `opencuda-blas::select_gemm_path`への
+    `GemmPath::DirectXGeneric`追加(DirectX/Vulkanの判別、上記4.参照、
+    `opencuda-whisper`単体のスコープを超える基盤課題)、(2) 実在の
+    学習済みWhisper重み(`openai/whisper-tiny`等)のsafetensorsローダー、
+    (3) `aruaru-llm`を本家`poem`クレート直接依存からRPoem
+    (`open-runo-poem-compat`)へ移行し、`opencuda-whisper`を含む
+    AI機能群をPoem互換APIとして他言語からHTTP経由で利用可能にする
+    (ユーザー指示、「Rust＋Poem版と並行でRPoem」の実現、今回は
+    Whisper本体の実装を優先しスコープ外とした)。
+
 - **2026-07-30(続き2) Poly1305認証タグのGPU実装(opencuda-directx)を
   実機検証まで完了(ユーザー指示「Poly1305はGoogle検索して実装法も調査
   して開発して」への対応、前回HANDOFF〈2026-07-27〉の「130ビット剰余算を
