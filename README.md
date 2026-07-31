@@ -39,6 +39,12 @@
   ランダム初期化(意味を持たない出力)と比べて明確に流暢な英語の
   貪欲デコード継続("The quick brown fox" → "es are a great way to
   get a little bit of a")を確認済み——詳細は`CLAUDE.md`HANDOFF参照。
+- **`opencuda-whisper`**(2026-07-31新設): Whisper相当(音声認識、
+  マーケティング調査ロードマップ6位)。対数メルスペクトログラム抽出+
+  エンコーダ(`opencuda-bert`と同じMulti-Head Attention構成)+
+  KVキャッシュ付きデコーダ(`opencuda-llm`と同じ設計)+
+  Cross-Attentionを実装。**現状ランダム初期化のMVPのみ**(学習済み
+  Whisper重みのローダーは未実装、詳細は`CLAUDE.md`HANDOFF参照)。
 
 ## なぜDirectXとVulkanを両方持つか(2026-07-23の技術判断)
 
