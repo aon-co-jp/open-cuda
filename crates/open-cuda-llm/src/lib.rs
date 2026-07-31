@@ -1,9 +1,9 @@
-//! # opencuda-llm
+//! # open-cuda-llm
 //!
 //! 自己回帰デコーダ(GPT系アーキテクチャ)のforward pass実装。
 //! `open-raid-z`の2026-07-21マーケティング調査ロードマップで言う
 //! 「Python製AIライブラリのRust移植 1〜6位」のうち、**1位のvLLM相当**の
-//! MVP(最小実用実装)にあたる。`opencuda-bert`(2位Transformers相当、
+//! MVP(最小実用実装)にあたる。`open-cuda-bert`(2位Transformers相当、
 //! エンコーダ専用)・`opencuda-blas`(3位NumPy相当、GEMM/Attention)が
 //! 既に存在していたので、本クレートはそれらの上に「トークンを1つずつ
 //! 生成していく」自己回帰パス(KVキャッシュ付き貪欲デコード)を追加する。
@@ -15,7 +15,7 @@
 //!   いない**。単一シーケンスを1件ずつ、KVキャッシュを使って逐次デコード
 //!   するだけの素朴な実装(いわば「vLLMが最適化する前のベースライン」)。
 //! - **2026-07-25追記: 実在の学習済み重み(GPT-2 124M、`openai-community/gpt2`)
-//!   を読み込む`GptModel::load`を追加した**(`opencuda-bert::BertModel::load`
+//!   を読み込む`GptModel::load`を追加した**(`open-cuda-bert::BertModel::load`
 //!   と同じ設計、safetensorsを直接パース)。デフォルトのコンストラクタは
 //!   引き続き決定的な疑似乱数(`SplitMix64`)による`load_random`(既存の
 //!   最小構成テスト・KVキャッシュ数値一致テストはこちらを使い続ける、
@@ -27,7 +27,7 @@
 //!   外部ファイル不要)。実重みでの検証用に`tokenizers`クレートによる
 //!   本格的なBPE/SentencePiece対応`GptTokenizer`(GPT-2の`tokenizer.json`を
 //!   読み込む)も追加した。
-//! - Attentionは`opencuda-bert`と同じく`opencuda-blas::scaled_dot_product_attention`
+//! - Attentionは`open-cuda-bert`と同じく`opencuda-blas::scaled_dot_product_attention`
 //!   (非タイル化の素朴な実装)をそのまま使う。KVキャッシュ付きの1トークン
 //!   ずつの生成では、クエリ行を`n`回複製して`n x n`のattentionを計算し
 //!   先頭行だけを使うという簡易的な方法で「新規トークンのクエリ×
@@ -95,8 +95,8 @@ impl GPT2Config {
         let max_seq_len = self
             .n_positions
             .or(self.n_ctx)
-            .context("opencuda-llm: config.json must have n_positions or n_ctx")?;
-        anyhow::ensure!(self.n_embd % self.n_head == 0, "opencuda-llm: n_embd {} not divisible by n_head {}", self.n_embd, self.n_head);
+            .context("open-cuda-llm: config.json must have n_positions or n_ctx")?;
+        anyhow::ensure!(self.n_embd % self.n_head == 0, "open-cuda-llm: n_embd {} not divisible by n_head {}", self.n_embd, self.n_head);
         Ok(GptConfig {
             vocab_size: self.vocab_size,
             hidden_size: self.n_embd,
@@ -110,14 +110,14 @@ impl GPT2Config {
 }
 
 fn tensor_f32(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>> {
-    let view = tensors.tensor(name).with_context(|| format!("opencuda-llm: missing tensor '{name}'"))?;
+    let view = tensors.tensor(name).with_context(|| format!("open-cuda-llm: missing tensor '{name}'"))?;
     anyhow::ensure!(
         view.dtype() == safetensors::Dtype::F32,
-        "opencuda-llm: tensor '{name}' has unexpected dtype {:?} (expected F32)",
+        "open-cuda-llm: tensor '{name}' has unexpected dtype {:?} (expected F32)",
         view.dtype()
     );
     let bytes = view.data();
-    anyhow::ensure!(bytes.len() % 4 == 0, "opencuda-llm: tensor '{name}' byte length not a multiple of 4");
+    anyhow::ensure!(bytes.len() % 4 == 0, "open-cuda-llm: tensor '{name}' byte length not a multiple of 4");
     let mut out = vec![0.0f32; bytes.len() / 4];
     for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
         *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -126,7 +126,7 @@ fn tensor_f32(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>
 }
 
 /// `[out_dim, in_dim]`(行優先)を`[in_dim, out_dim]`へ転置する
-/// (`opencuda-bert`の同名ヘルパーと同じ用途。GPT-2のトークン埋め込み
+/// (`open-cuda-bert`の同名ヘルパーと同じ用途。GPT-2のトークン埋め込み
 /// `wte.weight`は`[vocab_size, hidden]`で保存されており、重み共有
 /// 〈weight tying〉される`lm_head`としては`[hidden, vocab_size]`
 /// レイアウトが必要なため転置する)。
@@ -146,7 +146,7 @@ fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
     let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
     anyhow::ensure!(
         weight.len() == in_dim * out_dim,
-        "opencuda-llm: '{prefix}.weight' has {} elements, expected {}x{}",
+        "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}",
         weight.len(),
         in_dim,
         out_dim
@@ -162,13 +162,13 @@ fn load_fused_qkv(tensors: &safetensors::SafeTensors, prefix: &str, hidden: usiz
     let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
     anyhow::ensure!(
         weight.len() == hidden * 3 * hidden,
-        "opencuda-llm: '{prefix}.weight' has {} elements, expected {}x{}",
+        "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}",
         weight.len(),
         hidden,
         3 * hidden
     );
     let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
-    anyhow::ensure!(bias.len() == 3 * hidden, "opencuda-llm: '{prefix}.bias' has {} elements, expected {}", bias.len(), 3 * hidden);
+    anyhow::ensure!(bias.len() == 3 * hidden, "open-cuda-llm: '{prefix}.bias' has {} elements, expected {}", bias.len(), 3 * hidden);
 
     let split = |idx: usize| -> (Vec<f32>, Vec<f32>) {
         let col_start = idx * hidden;
@@ -432,7 +432,7 @@ impl GptModel {
     }
 
     /// `dir`配下の`config.json`・`model.safetensors`(Hugging Face GPT-2形式、
-    /// 例: `openai-community/gpt2`)を読み込む。`opencuda-bert::BertModel::load`
+    /// 例: `openai-community/gpt2`)を読み込む。`open-cuda-bert::BertModel::load`
     /// と同じ設計(config.json→safetensorsの順で読み、レイヤーごとに
     /// テンソル名`h.{i}.*`を辿る)。
     ///
@@ -446,13 +446,13 @@ impl GptModel {
     ///   ——`wte.weight`(`[vocab, hidden]`)を転置して使う。
     pub fn load(dir: &Path) -> Result<Self> {
         let config_json = std::fs::read_to_string(dir.join("config.json"))
-            .with_context(|| format!("opencuda-llm: failed to read config.json in {dir:?}"))?;
-        let raw_config: GPT2Config = serde_json::from_str(&config_json).context("opencuda-llm: failed to parse config.json")?;
+            .with_context(|| format!("open-cuda-llm: failed to read config.json in {dir:?}"))?;
+        let raw_config: GPT2Config = serde_json::from_str(&config_json).context("open-cuda-llm: failed to parse config.json")?;
         let config = raw_config.into_gpt_config()?;
 
         let weights_bytes = std::fs::read(dir.join("model.safetensors"))
-            .with_context(|| format!("opencuda-llm: failed to read model.safetensors in {dir:?}"))?;
-        let tensors = safetensors::SafeTensors::deserialize(&weights_bytes).context("opencuda-llm: failed to parse model.safetensors")?;
+            .with_context(|| format!("open-cuda-llm: failed to read model.safetensors in {dir:?}"))?;
+        let tensors = safetensors::SafeTensors::deserialize(&weights_bytes).context("open-cuda-llm: failed to parse model.safetensors")?;
 
         let hidden = config.hidden_size;
 
@@ -475,7 +475,7 @@ impl GptModel {
         let word_embeddings = tensor_f32(&tensors, &format!("{key_prefix}wte.weight"))?;
         anyhow::ensure!(
             word_embeddings.len() == config.vocab_size * hidden,
-            "opencuda-llm: '{key_prefix}wte.weight' has {} elements, expected {}x{}",
+            "open-cuda-llm: '{key_prefix}wte.weight' has {} elements, expected {}x{}",
             word_embeddings.len(),
             config.vocab_size,
             hidden
@@ -483,7 +483,7 @@ impl GptModel {
         let position_embeddings = tensor_f32(&tensors, &format!("{key_prefix}wpe.weight"))?;
         anyhow::ensure!(
             position_embeddings.len() == config.max_seq_len * hidden,
-            "opencuda-llm: '{key_prefix}wpe.weight' has {} elements, expected {}x{}",
+            "open-cuda-llm: '{key_prefix}wpe.weight' has {} elements, expected {}x{}",
             position_embeddings.len(),
             config.max_seq_len,
             hidden
@@ -523,10 +523,10 @@ impl GptModel {
 
     /// 1トークンぶん進め、そのトークンの次を予測するロジット(語彙数長)を返す。
     fn forward_step(&self, device: &dyn GpuDevice, token_id: u32, pos: usize, caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
-        anyhow::ensure!(pos < self.config.max_seq_len, "opencuda-llm: position {pos} exceeds max_seq_len {}", self.config.max_seq_len);
+        anyhow::ensure!(pos < self.config.max_seq_len, "open-cuda-llm: position {pos} exceeds max_seq_len {}", self.config.max_seq_len);
         let hidden_size = self.config.hidden_size;
         let tok = token_id as usize;
-        anyhow::ensure!(tok < self.config.vocab_size, "opencuda-llm: token id {tok} out of vocab range");
+        anyhow::ensure!(tok < self.config.vocab_size, "open-cuda-llm: token id {tok} out of vocab range");
 
         let word_row = &self.word_embeddings[tok * hidden_size..(tok + 1) * hidden_size];
         let pos_row = &self.position_embeddings[pos * hidden_size..(pos + 1) * hidden_size];
@@ -544,7 +544,7 @@ impl GptModel {
     /// トークンを生成する。`prompt_ids`自体は出力に含めない
     /// (呼び出し側で連結すること)。
     pub fn generate(&self, device: &std::sync::Arc<dyn GpuDevice>, prompt_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
-        anyhow::ensure!(!prompt_ids.is_empty(), "opencuda-llm: prompt_ids must not be empty");
+        anyhow::ensure!(!prompt_ids.is_empty(), "open-cuda-llm: prompt_ids must not be empty");
         let device_ref = device.as_ref();
         let mut caches = self.new_caches();
 
@@ -606,7 +606,7 @@ impl ByteTokenizer {
 }
 
 /// GPT-2の`tokenizer.json`(Hugging Face fast tokenizer形式、バイトレベルBPE)を
-/// ロードする薄いラッパー(`opencuda-bert::BertTokenizer`と同じ設計)。
+/// ロードする薄いラッパー(`open-cuda-bert::BertTokenizer`と同じ設計)。
 /// `GptModel::load`で読み込んだ実重みは、GPT-2自身のBPE語彙で学習された
 /// ものなので、意味のある出力を得るには`ByteTokenizer`(語彙0..256=生バイト)
 /// ではなく本トークナイザを使う必要がある——**正直な開示**: `ByteTokenizer`の
@@ -620,17 +620,17 @@ pub struct GptTokenizer {
 impl GptTokenizer {
     pub fn load(dir: &Path) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("opencuda-llm: failed to load tokenizer.json: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("open-cuda-llm: failed to load tokenizer.json: {e}"))?;
         Ok(Self { inner })
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self.inner.encode(text, false).map_err(|e| anyhow::anyhow!("opencuda-llm: tokenizer encode failed: {e}"))?;
+        let encoding = self.inner.encode(text, false).map_err(|e| anyhow::anyhow!("open-cuda-llm: tokenizer encode failed: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.inner.decode(ids, true).map_err(|e| anyhow::anyhow!("opencuda-llm: tokenizer decode failed: {e}"))
+        self.inner.decode(ids, true).map_err(|e| anyhow::anyhow!("open-cuda-llm: tokenizer decode failed: {e}"))
     }
 }
 
@@ -785,7 +785,7 @@ mod tests {
         }
         let serialized = safetensors::serialize(&views, &None).unwrap();
 
-        let dir = std::env::temp_dir().join(format!("opencuda-llm-synthetic-gpt2-{dir_suffix}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("open-cuda-llm-synthetic-gpt2-{dir_suffix}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("model.safetensors"), serialized).unwrap();
         std::fs::write(

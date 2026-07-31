@@ -1,10 +1,10 @@
-//! # opencuda-whisper
+//! # open-cuda-whisper
 //!
 //! Whisper(音声認識)相当のエンコーダ・デコーダforward pass実装。
 //! `open-raid-z`の2026-07-21マーケティング調査ロードマップで言う
 //! 「Python製AIライブラリのRust移植 1〜6位」のうち、**6位のWhisper相当**
-//! にあたる。`opencuda-bert`(エンコーダ専用、事前学習済み重みロード対応)・
-//! `opencuda-llm`(GPT系デコーダ、KVキャッシュ+安全弁argmax貪欲デコード)の
+//! にあたる。`open-cuda-bert`(エンコーダ専用、事前学習済み重みロード対応)・
+//! `open-cuda-llm`(GPT系デコーダ、KVキャッシュ+安全弁argmax貪欲デコード)の
 //! 両方の設計パターンを、実際のWhisperアーキテクチャ(音声エンコーダ+
 //! テキストデコーダ+Cross-Attention)に合わせて組み合わせたもの。
 //!
@@ -15,20 +15,20 @@
 //!    対数パワーを計算する(外部音声デコードライブラリ非依存、既に
 //!    デコード済みのf32 PCMサンプルを受け取る前提)。
 //! 2. **`WhisperEncoder`**: メル特徴量をpre-LNトランスフォーマーへ通す
-//!    (`opencuda-bert`と同じ`Linear`/`LayerNorm`/Multi-Head Attention構成、
+//!    (`open-cuda-bert`と同じ`Linear`/`LayerNorm`/Multi-Head Attention構成、
 //!    ただし正弦波位置埋め込み+pre-LNという本家Whisperエンコーダの構成に
 //!    合わせた)。
-//! 3. **`WhisperDecoder`**: `opencuda-llm::GptModel`と同じKVキャッシュ付き
+//! 3. **`WhisperDecoder`**: `open-cuda-llm::GptModel`と同じKVキャッシュ付き
 //!    自己回帰デコーダに、エンコーダ出力への**Cross-Attention**サブ層を
 //!    追加したもの。
 //!
-//! ## 正直な開示(スコープの限界、`opencuda-bert`/`opencuda-llm`の初回MVPと
+//! ## 正直な開示(スコープの限界、`open-cuda-bert`/`open-cuda-llm`の初回MVPと
 //! 同じ「まず配線が正しいことを実証し、実重みローダーは次段階」という
 //! 開発方針を踏襲)
 //!
 //! - **学習済み重みは未対応**(`load_random`のみ、`openai/whisper-tiny`等の
-//!   実safetensorsを読み込むローダーは次回の増分——`opencuda-bert::
-//!   BertModel::load`/`opencuda-llm::GptModel::load`と同じ設計で移植可能な
+//!   実safetensorsを読み込むローダーは次回の増分——`open-cuda-bert::
+//!   BertModel::load`/`open-cuda-llm::GptModel::load`と同じ設計で移植可能な
 //!   見込み)。生成される文字起こしは意味を持たない——検証対象は
 //!   「音声→エンコーダ→デコーダ→トークン生成という自己回帰パイプライン
 //!   全体の配線が正しいか」であって「実際に音声を書き起こせるか」ではない。
@@ -36,16 +36,16 @@
 //!   対しstride 2のconv1d×2で時間方向を半分に間引くが、本実装ではこれを
 //!   単純な全結合層(`Linear`)による射影に置き換えている(真の畳み込み
 //!   〈im2col〉実装は今回のスコープ外、次回の忠実度向上候補として明記)。
-//! - **トークナイザ**: `opencuda-llm::ByteTokenizer`と同じUTF-8バイト単位の
+//! - **トークナイザ**: `open-cuda-llm::ByteTokenizer`と同じUTF-8バイト単位の
 //!   自前実装のみ(本家WhisperのマルチリンガルBPE語彙は未対応)。
-//! - Attentionは`opencuda-bert`/`opencuda-llm`と同じく
+//! - Attentionは`open-cuda-bert`/`open-cuda-llm`と同じく
 //!   `opencuda_blas::scaled_dot_product_attention`(Q/K/V長が等しい自己
 //!   注意用)をそのまま使う。Cross-Attention(デコーダ側クエリ長とエンコーダ
 //!   側キー/バリュー長が異なりうる)は、これを直接使えないため、本クレート内に
 //!   `cross_attention`ヘルパー(`opencuda_blas::sgemm`のみを組み合わせた
 //!   素朴な非タイル化実装)を新設した。
 //! - **推論経路はCPU/Vulkan両対応(`opencuda_blas::sgemm`/
-//!   `scaled_dot_product_attention`経由、`opencuda-bert`/`opencuda-llm`と
+//!   `scaled_dot_product_attention`経由、`open-cuda-bert`/`open-cuda-llm`と
 //!   全く同じ土台)**。ただし、`opencuda-blas::select_gemm_path`は現状
 //!   `GpuVendor`(NVIDIA/AMD/Intel等のシリコンベンダー)だけを見て経路を
 //!   選んでおり、**同じNVIDIA GPUでもVulkan経由なのかDirectX 12経由
@@ -53,7 +53,7 @@
 //!   `GpuVendor::Nvidia`を返すため、現状の`select_gemm_path`ロジックでは
 //!   誤って`GemmPath::VulkanGeneric`(SPIR-Vシェーダ前提)を選んでしまい、
 //!   DirectXデバイス上では正しく動作しない。これは本クレート固有の問題
-//!   ではなく`opencuda-blas`(=`opencuda-bert`/`opencuda-llm`含む全モデル
+//!   ではなく`opencuda-blas`(=`open-cuda-bert`/`open-cuda-llm`含む全モデル
 //!   クレート共通の基盤)側の既知のギャップであり、本クレートに
 //!   DirectX固有分岐を持ち込むのではなく、`opencuda-blas`側で
 //!   `GemmPath::DirectXGeneric`(DXILベースの`matmul`/`attention`
@@ -159,7 +159,7 @@ pub fn log_mel_spectrogram(samples: &[f32]) -> (Vec<f32>, usize) {
 }
 
 // ---------------------------------------------------------------------
-// 共有プリミティブ(`opencuda-bert`/`opencuda-llm`と同じ設計、
+// 共有プリミティブ(`open-cuda-bert`/`open-cuda-llm`と同じ設計、
 // クレート境界をまたいだ共有はせず各クレートで完結させる既存の慣行を踏襲)
 // ---------------------------------------------------------------------
 
@@ -282,7 +282,7 @@ fn softmax_rows_inplace(x: &mut [f32], row_len: usize) {
 /// Cross-Attention(クエリ長`q_len`とキー/バリュー長`kv_len`が異なって
 /// よい単一ヘッド分の注意計算)。`opencuda_blas::scaled_dot_product_attention`は
 /// Q/K/V長が等しい(自己注意)前提のため使えず、`sgemm`のみを組み合わせて
-/// 素朴に実装する(非タイル化、`opencuda-bert`/`opencuda-llm`の既存の
+/// 素朴に実装する(非タイル化、`open-cuda-bert`/`open-cuda-llm`の既存の
 /// Attention実装と同じ実装難度)。
 fn cross_attention(device: &dyn GpuDevice, q: &[f32], k: &[f32], v: &[f32], q_len: usize, kv_len: usize, head_dim: usize) -> Result<Vec<f32>> {
     debug_assert_eq!(q.len(), q_len * head_dim);
@@ -348,7 +348,7 @@ impl EncoderLayer {
         }
     }
 
-    /// pre-LN(本家Whisperエンコーダと同じ構成、`opencuda-llm::DecoderLayer`
+    /// pre-LN(本家Whisperエンコーダと同じ構成、`open-cuda-llm::DecoderLayer`
     /// と同じ規約)。双方向自己注意(causalマスク無し、エンコーダなので
     /// 全フレームを相互参照可能)。
     fn forward(&self, device: &dyn GpuDevice, hidden: &[f32], seq_len: usize, hidden_size: usize, num_heads: usize) -> Result<Vec<f32>> {
@@ -446,13 +446,13 @@ impl WhisperEncoder {
     /// `mel`(`[n_frames * n_mels]`行優先)を`[n_frames * hidden_size]`の
     /// 隠れ状態列へ変換する。
     pub fn encode(&self, device: &Arc<dyn GpuDevice>, mel: &[f32], n_frames: usize) -> Result<Vec<f32>> {
-        anyhow::ensure!(n_frames > 0, "opencuda-whisper: n_frames must not be 0");
+        anyhow::ensure!(n_frames > 0, "open-cuda-whisper: n_frames must not be 0");
         anyhow::ensure!(
             n_frames <= self.config.max_frames,
-            "opencuda-whisper: n_frames {n_frames} exceeds max_frames {}",
+            "open-cuda-whisper: n_frames {n_frames} exceeds max_frames {}",
             self.config.max_frames
         );
-        anyhow::ensure!(mel.len() == n_frames * self.config.n_mels, "opencuda-whisper: mel.len() does not match n_frames * n_mels");
+        anyhow::ensure!(mel.len() == n_frames * self.config.n_mels, "open-cuda-whisper: mel.len() does not match n_frames * n_mels");
 
         let device_ref = device.as_ref();
         let hidden_size = self.config.hidden_size;
@@ -546,7 +546,7 @@ impl DecoderLayer {
     }
 
     /// 1トークン分を処理する。`self_cache`は自己注意用KVキャッシュ
-    /// (このレイヤー・このヘッドで蓄積、`opencuda-llm::DecoderLayer`と
+    /// (このレイヤー・このヘッドで蓄積、`open-cuda-llm::DecoderLayer`と
     /// 同じ設計)。`encoder_hidden`はCross-Attention用の固定エンコーダ出力
     /// (毎トークン同じ、シーケンス全体で1回だけ計算されたものを使い回す)。
     #[allow(clippy::too_many_arguments)]
@@ -681,10 +681,10 @@ impl WhisperDecoder {
         encoder_hidden: &[f32],
         encoder_len: usize,
     ) -> Result<Vec<f32>> {
-        anyhow::ensure!(pos < self.config.max_seq_len, "opencuda-whisper: position {pos} exceeds max_seq_len {}", self.config.max_seq_len);
+        anyhow::ensure!(pos < self.config.max_seq_len, "open-cuda-whisper: position {pos} exceeds max_seq_len {}", self.config.max_seq_len);
         let hidden_size = self.config.hidden_size;
         let tok = token_id as usize;
-        anyhow::ensure!(tok < self.config.vocab_size, "opencuda-whisper: token id {tok} out of vocab range");
+        anyhow::ensure!(tok < self.config.vocab_size, "open-cuda-whisper: token id {tok} out of vocab range");
 
         let word_row = &self.word_embeddings[tok * hidden_size..(tok + 1) * hidden_size];
         let pos_row = &self.position_embeddings[pos * hidden_size..(pos + 1) * hidden_size];
@@ -740,7 +740,7 @@ fn argmax(logits: &[f32]) -> u32 {
 // トークナイザ・統合ヘルパー
 // ---------------------------------------------------------------------
 
-/// UTF-8バイト単位の素朴なトークナイザ(`opencuda-llm::ByteTokenizer`と
+/// UTF-8バイト単位の素朴なトークナイザ(`open-cuda-llm::ByteTokenizer`と
 /// 同じ設計、モジュールdoc参照)。
 pub struct ByteTokenizer;
 
@@ -772,7 +772,7 @@ impl WhisperModel {
     /// (モジュールdoc参照)、配線の健全性検証用。
     pub fn transcribe(&self, device: &Arc<dyn GpuDevice>, samples: &[f32], max_new_tokens: usize) -> Result<String> {
         let (mel, n_frames) = log_mel_spectrogram(samples);
-        anyhow::ensure!(n_frames > 0, "opencuda-whisper: audio too short to extract at least one frame (need >= {N_FFT} samples)");
+        anyhow::ensure!(n_frames > 0, "open-cuda-whisper: audio too short to extract at least one frame (need >= {N_FFT} samples)");
         let encoder_hidden = self.encoder.encode(device, &mel, n_frames)?;
         let ids = self.decoder.generate(device, &encoder_hidden, n_frames, ByteTokenizer::BOS, max_new_tokens)?;
         Ok(ByteTokenizer::decode(&ids))
@@ -865,9 +865,9 @@ mod tests {
 
     /// KVキャッシュを使った逐次デコードの各位置の出力が、キャッシュ無しで
     /// 都度フルスクラッチ再計算した場合と数値一致することを検証する
-    /// (`opencuda-llm`の同名テストと同じ考え方——causalマスクの代替実装
+    /// (`open-cuda-llm`の同名テストと同じ考え方——causalマスクの代替実装
     /// [キャッシュに存在しない未来のトークンは追加されていない]が正しい
-    /// ことの裏付け。Cross-Attention込みで検証する点が`opencuda-llm`との
+    /// ことの裏付け。Cross-Attention込みで検証する点が`open-cuda-llm`との
     /// 違い)。
     #[test]
     fn incremental_kv_cache_decoding_matches_full_recompute_at_each_position() {

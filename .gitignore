@@ -6,4 +6,4 @@
 # opencuda-llmの実重み検証用にダウンロードするGPT-2 safetensors(500MB超、
 # ライセンス上の理由でリポジトリには含めない。crates/opencuda-llm/src/lib.rs
 # のテスト・CLAUDE.md HANDOFF参照、各自Hugging Faceから取得すること)。
-crates/opencuda-llm/models/
+crates/open-cuda-llm/models/

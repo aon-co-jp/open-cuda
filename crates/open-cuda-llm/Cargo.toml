@@ -1,5 +1,5 @@
 [package]
-name = "opencuda-llm"
+name = "open-cuda-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
