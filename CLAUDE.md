@@ -225,6 +225,34 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-04(続き) `aruaru-llm`側の実機検証で判明: `Linear::forward`が
+  `matmul.spv`を`sgemm`へ渡していないため`GemmPath::VulkanGeneric`が
+  機能しない(次回セッションの最優先課題として記録)**: 直下エントリ
+  (QKV融合+プリフィル/デコード分離)の実装後、`aruaru-llm`側で
+  `real-vulkan` featureを新設し実機(NVIDIA GT 730)で`opencuda_vulkan::
+  real::VulkanDevice`経由の`/v1/generate`を検証したところ、デバイス
+  構築自体は成功する(ログに`OpenCUDA Vulkan Device (NVIDIA GeForce
+  GT 730)`と出る)ものの、実リクエストが**約0.2秒で即座にエラー失敗**
+  することが判明した。原因はこのリポジトリの`crates/open-cuda-llm/
+  src/lib.rs`の`Linear::forward`が`opencuda_blas::sgemm`を呼ぶ際、
+  `spirv`引数に常に`None`を渡しており、`GemmPath::VulkanGeneric`が
+  必須とするコンパイル済みシェーダバイト列(`matmul.spv`)が渡っていない
+  ため。これは「配線しても遅い」という直下エントリの設計上の懸念より
+  手前の、単純に**動作しない**という結果——`opencuda_blas::sgemm`の
+  `GemmPath::VulkanGeneric`自体は既に実装済み(`device.supports_spirv()`
+  かつ`spirv`引数ありで動作する設計)なので、呼び出し側(`Linear::
+  forward`)が`matmul.spv`のロード・引き渡しを行っていないだけの
+  ギャップと考えられる(今回、指示により`open-cuda`側のコード変更は
+  行わず、この調査結果のみ`aruaru-llm/CLAUDE.md`側に記録した)。
+  - 次にすべきこと(最優先): `Linear::forward`(またはその呼び出し元の
+    `DecoderLayer`)が使用中の`GpuDevice`実装に応じて`matmul.spv`を
+    ロード・保持し`sgemm`へ渡すよう配線する。実装後、`aruaru-llm`側
+    (`--features real-vulkan`)で実機再検証し、(1) CPU版とVulkan版の
+    生成トークン列が完全一致すること、(2) 実際の速度差(直下エントリの
+    QKV融合+プリフィル分離の効果でVulkan版が有利になるか)を計測する
+    こと。詳細は`aruaru-llm/CLAUDE.md`のHANDOFF 2026-08-04エントリ・
+    `aruaru-llm/README.md`「実推論ディスパッチ先としてのVulkan」節参照。
+
 - **2026-08-04 `open-cuda-llm`にプリフィル/デコード分離+QKV融合GEMMを実装
   (aruaru-llm側CLAUDE.md 2026-07-26 HANDOFFで指摘された「安易なGPU配線は
   逆に遅くなりうる」問題への設計変更(a)(b)に対応、ユーザー指示
