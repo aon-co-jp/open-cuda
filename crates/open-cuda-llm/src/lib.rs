@@ -155,40 +155,17 @@ fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
     Ok(Linear { weight_t: weight, bias, in_dim, out_dim })
 }
 
-/// GPT-2はQ/K/Vを1本の`c_attn`(`[hidden, 3*hidden]`)へ融合して保存する。
-/// `Linear::forward`はヘッドごとに独立した`Linear`を要求するため、
-/// 出力次元(列)方向に3分割してQ/K/Vそれぞれの`Linear`を作る。
-fn load_fused_qkv(tensors: &safetensors::SafeTensors, prefix: &str, hidden: usize) -> Result<(Linear, Linear, Linear)> {
-    let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
-    anyhow::ensure!(
-        weight.len() == hidden * 3 * hidden,
-        "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}",
-        weight.len(),
-        hidden,
-        3 * hidden
-    );
-    let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
-    anyhow::ensure!(bias.len() == 3 * hidden, "open-cuda-llm: '{prefix}.bias' has {} elements, expected {}", bias.len(), 3 * hidden);
-
-    let split = |idx: usize| -> (Vec<f32>, Vec<f32>) {
-        let col_start = idx * hidden;
-        let mut w = vec![0.0f32; hidden * hidden];
-        for (dst_row, src_row) in w.chunks_exact_mut(hidden).zip(weight.chunks_exact(3 * hidden)) {
-            dst_row.copy_from_slice(&src_row[col_start..col_start + hidden]);
-        }
-        let b = bias[col_start..col_start + hidden].to_vec();
-        (w, b)
-    };
-
-    let (qw, qb) = split(0);
-    let (kw, kb) = split(1);
-    let (vw, vb) = split(2);
-    Ok((
-        Linear { weight_t: qw, bias: qb, in_dim: hidden, out_dim: hidden },
-        Linear { weight_t: kw, bias: kb, in_dim: hidden, out_dim: hidden },
-        Linear { weight_t: vw, bias: vb, in_dim: hidden, out_dim: hidden },
-    ))
-}
+// **2026-08-04変更**: GPT-2はQ/K/Vを1本の`c_attn`(`[hidden, 3*hidden]`)へ
+// 融合して保存している。以前はこれを列方向に3分割し、Q/K/Vそれぞれ独立
+// した`Linear`(3回のGEMM呼び出し)として扱っていたが、safetensors側の
+// レイアウトが既に`Linear::forward`が要求する`[in_dim, out_dim]`
+// (`in_dim=hidden, out_dim=3*hidden`)そのものであるため、分割は不要
+// ——単に`load_conv1d`で1本の融合`Linear`として読み込めばよい。これに
+// より推論側のディスパッチ回数がQ/K/Vぶん1/3になる(`load_conv1d`を
+// そのまま再利用、専用関数〈旧`load_fused_qkv`〉は廃止)。分割後に3つの
+// 独立したGEMMで計算していた場合と、1回のGEMMで計算してから列方向に
+// 出力を切り出す場合とで数値結果は完全に一致する(同じ内積・同じ累積
+// 順序、下記HANDOFF 2026-08-04参照)。
 
 fn load_layer_norm(tensors: &safetensors::SafeTensors, prefix: &str, eps: f32) -> Result<LayerNorm> {
     let weight = tensor_f32(tensors, &format!("{prefix}.weight"))?;
@@ -301,9 +278,10 @@ fn gelu_inplace(x: &mut [f32]) {
 /// 悪影響は無い。
 struct DecoderLayer {
     ln_1: LayerNorm,
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    /// Q/K/Vを1本に融合した`Linear`(`out_dim = 3*hidden`、列0..hidden=Q・
+    /// hidden..2*hidden=K・2*hidden..3*hidden=V)。2026-08-04に3本の独立
+    /// した`Linear`から統合(上記`load_conv1d`呼び出し箇所のコメント参照)。
+    qkv: Linear,
     attn_out: Linear,
     ln_2: LayerNorm,
     intermediate: Linear,
@@ -314,9 +292,7 @@ impl DecoderLayer {
     fn random(rng: &mut SplitMix64, hidden: usize, intermediate: usize, eps: f32) -> Self {
         Self {
             ln_1: LayerNorm::identity(hidden, eps),
-            query: Linear::random(rng, hidden, hidden),
-            key: Linear::random(rng, hidden, hidden),
-            value: Linear::random(rng, hidden, hidden),
+            qkv: Linear::random(rng, hidden, 3 * hidden),
             attn_out: Linear::random(rng, hidden, hidden),
             ln_2: LayerNorm::identity(hidden, eps),
             intermediate: Linear::random(rng, hidden, intermediate),
@@ -335,9 +311,13 @@ impl DecoderLayer {
         let mut normed = hidden.to_vec();
         self.ln_1.forward(&mut normed, 1, hidden_size);
 
-        let q = self.query.forward(device, &normed, 1)?;
-        let k = self.key.forward(device, &normed, 1)?;
-        let v = self.value.forward(device, &normed, 1)?;
+        // 2026-08-04: Q/K/Vを3回の別々のGEMMではなく、融合`c_attn`への
+        // 1回のGEMMで計算し、出力を列方向に3分割する(下記`forward_prefill`
+        // と全く同じ分割規約)。
+        let qkv = self.qkv.forward(device, &normed, 1)?;
+        let q = &qkv[0..hidden_size];
+        let k = &qkv[hidden_size..2 * hidden_size];
+        let v = &qkv[2 * hidden_size..3 * hidden_size];
 
         let mut context = vec![0.0f32; hidden_size];
         for (h, cache_head) in cache.iter_mut().enumerate().take(num_heads) {
@@ -375,6 +355,88 @@ impl DecoderLayer {
         let mut hidden3 = hidden2.clone();
         for (a, b) in hidden3.iter_mut().zip(ffn_out.iter()) {
             *a += b; // residual
+        }
+
+        Ok(hidden3)
+    }
+
+    /// **2026-08-04新設(プリフィル/デコード分離、`aruaru-llm`側
+    /// 2026-07-26 HANDOFFで指摘された次の設計変更(a))**: プロンプト全体
+    /// (`seq_len`トークン)を1回のバッチ処理として通す。`forward_step`が
+    /// 1トークンずつ`seq_len=1`でLinear/GEMMを呼ぶのに対し、本メソッドは
+    /// Q/K/V融合GEMM・`attn_out`・`intermediate`・`output`の4つのLinearを
+    /// いずれも`seq_len=プロンプト長`の**本当のGEMM(m>1)**として1回ずつ
+    /// 呼ぶ(レイヤーあたりのディスパッチ回数が`4*seq_len`から`4`へ削減)。
+    /// Attention自体は引き続き位置ごとの因果性(causality)を守るため、
+    /// 各行(トークン位置)を昇順に処理し、その位置までのキャッシュのみを
+    /// 参照する(`forward_step`をprompt長ぶん呼んだ場合と全く同じ順序で
+    /// KVキャッシュを構築・参照する)。
+    ///
+    /// **数値的な同値性の根拠**: LayerNorm・Linear(GEMM)・GELU・残差加算は
+    /// いずれも「各行(トークン位置)ごとに独立」した計算であり、バッチ
+    /// (`seq_len`行まとめて1回のGEMM)で計算しても、行ごとに`seq_len`回
+    /// `forward_step`を呼んだ場合と同じ内積・同じ累積順序になる
+    /// (`sgemm`のCPU素朴実装は出力の各要素を独立に`sum_k`で計算するため、
+    /// `m`が1でもNでも各行の計算結果は変わらない)。Attentionもキャッシュへの
+    /// push順序を`forward_step`の逐次呼び出しと同じ昇順に保つことで、
+    /// 同一の入力から同一の出力が得られる。よって本メソッドは
+    /// 「挙動を変えない最適化」であり、`forward_step`をprompt長ぶん
+    /// ループした場合とビット完全に一致する(open-cuda-llm側テスト
+    /// `prefill_batch_matches_sequential_forward_step`で検証)。
+    fn forward_prefill(&self, device: &dyn GpuDevice, hidden_batch: &[f32], seq_len: usize, caches: &mut [KvCacheHead], hidden_size: usize, num_heads: usize) -> Result<Vec<f32>> {
+        let head_dim = hidden_size / num_heads;
+        debug_assert_eq!(hidden_batch.len(), seq_len * hidden_size);
+
+        let mut normed = hidden_batch.to_vec();
+        self.ln_1.forward(&mut normed, seq_len, hidden_size);
+
+        // 1回のバッチGEMM(m=seq_len)でQ/K/Vをまとめて計算する。
+        let qkv = self.qkv.forward(device, &normed, seq_len)?;
+
+        let mut context = vec![0.0f32; seq_len * hidden_size];
+        for row in 0..seq_len {
+            let qkv_row = &qkv[row * 3 * hidden_size..(row + 1) * 3 * hidden_size];
+            let q_row = &qkv_row[0..hidden_size];
+            let k_row = &qkv_row[hidden_size..2 * hidden_size];
+            let v_row = &qkv_row[2 * hidden_size..3 * hidden_size];
+
+            for (h, cache_head) in caches.iter_mut().enumerate().take(num_heads) {
+                let col_start = h * head_dim;
+                let q_h = &q_row[col_start..col_start + head_dim];
+                let k_h = &k_row[col_start..col_start + head_dim];
+                let v_h = &v_row[col_start..col_start + head_dim];
+
+                cache_head.push(k_h, v_h);
+                let n = cache_head.n;
+
+                let mut q_full = vec![0.0f32; n * head_dim];
+                for q_full_row in q_full.chunks_exact_mut(head_dim) {
+                    q_full_row.copy_from_slice(q_h);
+                }
+                let out = opencuda_blas::scaled_dot_product_attention(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim)?;
+                context[row * hidden_size + col_start..row * hidden_size + col_start + head_dim].copy_from_slice(&out[0..head_dim]);
+            }
+        }
+
+        // 1回のバッチGEMM(m=seq_len)。
+        let attn_dense = self.attn_out.forward(device, &context, seq_len)?;
+        let mut hidden2 = hidden_batch.to_vec();
+        for (a, b) in hidden2.iter_mut().zip(attn_dense.iter()) {
+            *a += b;
+        }
+
+        let mut normed2 = hidden2.clone();
+        self.ln_2.forward(&mut normed2, seq_len, hidden_size);
+
+        // 1回のバッチGEMM(m=seq_len)。
+        let mut intermediate = self.intermediate.forward(device, &normed2, seq_len)?;
+        gelu_inplace(&mut intermediate);
+
+        // 1回のバッチGEMM(m=seq_len)。
+        let ffn_out = self.output.forward(device, &intermediate, seq_len)?;
+        let mut hidden3 = hidden2.clone();
+        for (a, b) in hidden3.iter_mut().zip(ffn_out.iter()) {
+            *a += b;
         }
 
         Ok(hidden3)
@@ -492,12 +554,10 @@ impl GptModel {
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
             let p = format!("{key_prefix}h.{i}");
-            let (query, key, value) = load_fused_qkv(&tensors, &format!("{p}.attn.c_attn"), hidden)?;
+            let qkv = load_conv1d(&tensors, &format!("{p}.attn.c_attn"), hidden, 3 * hidden)?;
             layers.push(DecoderLayer {
                 ln_1: load_layer_norm(&tensors, &format!("{p}.ln_1"), config.layer_norm_eps)?,
-                query,
-                key,
-                value,
+                qkv,
                 attn_out: load_conv1d(&tensors, &format!("{p}.attn.c_proj"), hidden, hidden)?,
                 ln_2: load_layer_norm(&tensors, &format!("{p}.ln_2"), config.layer_norm_eps)?,
                 intermediate: load_conv1d(&tensors, &format!("{p}.mlp.c_fc"), hidden, config.intermediate_size)?,
@@ -540,30 +600,64 @@ impl GptModel {
         self.lm_head.forward(device, &hidden, 1)
     }
 
+    /// **2026-08-04新設**: プロンプト全体(`prompt_ids`)を`DecoderLayer::
+    /// forward_prefill`でバッチ処理し、最終位置のロジットを返す
+    /// (プリフィル/デコード分離、上記`forward_prefill`のdocコメント参照)。
+    fn forward_prefill_all_layers(&self, device: &dyn GpuDevice, prompt_ids: &[u32], caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let seq_len = prompt_ids.len();
+
+        let mut hidden_batch = vec![0.0f32; seq_len * hidden_size];
+        for (row, &tok) in prompt_ids.iter().enumerate() {
+            anyhow::ensure!(row < self.config.max_seq_len, "open-cuda-llm: position {row} exceeds max_seq_len {}", self.config.max_seq_len);
+            let tok = tok as usize;
+            anyhow::ensure!(tok < self.config.vocab_size, "open-cuda-llm: token id {tok} out of vocab range");
+            let word_row = &self.word_embeddings[tok * hidden_size..(tok + 1) * hidden_size];
+            let pos_row = &self.position_embeddings[row * hidden_size..(row + 1) * hidden_size];
+            let dst = &mut hidden_batch[row * hidden_size..(row + 1) * hidden_size];
+            for (d, (w, p)) in dst.iter_mut().zip(word_row.iter().zip(pos_row.iter())) {
+                *d = w + p;
+            }
+        }
+
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            hidden_batch = layer.forward_prefill(device, &hidden_batch, seq_len, cache, hidden_size, self.config.num_heads)?;
+        }
+
+        // 最終位置のみLayerNorm+lm_headを適用すれば十分(`generate`が
+        // 必要とするのは次トークン予測用のロジットのみのため、他の行を
+        // 正規化する計算は省く)。
+        let last_row_start = (seq_len - 1) * hidden_size;
+        let mut last_hidden = hidden_batch[last_row_start..last_row_start + hidden_size].to_vec();
+        self.final_ln.forward(&mut last_hidden, 1, hidden_size);
+        self.lm_head.forward(device, &last_hidden, 1)
+    }
+
     /// 貪欲デコード(argmax、サンプリング温度無し)で`max_new_tokens`個
     /// トークンを生成する。`prompt_ids`自体は出力に含めない
     /// (呼び出し側で連結すること)。
+    ///
+    /// **2026-08-04変更(プリフィル/デコード分離)**: プロンプトの初回
+    /// forwardは`forward_prefill_all_layers`(バッチGEMM)で処理し、
+    /// 生成された各トークンの逐次デコードは従来通り`forward_step`
+    /// (`seq_len=1`)のままとする(`aruaru-llm`側CLAUDE.md 2026-07-26
+    /// HANDOFFで指摘された設計変更(a))。
     pub fn generate(&self, device: &std::sync::Arc<dyn GpuDevice>, prompt_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
         anyhow::ensure!(!prompt_ids.is_empty(), "open-cuda-llm: prompt_ids must not be empty");
         let device_ref = device.as_ref();
         let mut caches = self.new_caches();
 
-        let mut pos = 0usize;
-        let mut logits = Vec::new();
-        for &tok in prompt_ids {
-            logits = self.forward_step(device_ref, tok, pos, &mut caches)?;
-            pos += 1;
-        }
+        let mut logits = self.forward_prefill_all_layers(device_ref, prompt_ids, &mut caches)?;
+        let pos = prompt_ids.len();
 
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut next = argmax(&logits);
-        for _ in 0..max_new_tokens {
+        for pos_now in (pos..).take(max_new_tokens) {
             generated.push(next);
-            if pos >= self.config.max_seq_len {
+            if pos_now >= self.config.max_seq_len {
                 break;
             }
-            logits = self.forward_step(device_ref, next, pos, &mut caches)?;
-            pos += 1;
+            logits = self.forward_step(device_ref, next, pos_now, &mut caches)?;
             next = argmax(&logits);
         }
         Ok(generated)
@@ -876,5 +970,111 @@ mod tests {
         eprintln!("random-init weights greedy continuation: {random_text:?} (token ids: {random_out:?})");
 
         assert_ne!(real_out, random_out, "real GPT-2 weights should produce different greedy output than random init for the same prompt");
+    }
+
+    /// **2026-08-04新設**: プリフィル/デコード分離(`forward_prefill_all_layers`)
+    /// +QKV融合GEMM(`DecoderLayer::qkv`)というディスパッチ削減最適化が、
+    /// 「挙動を変えない最適化」であることの回帰テスト。プロンプトを
+    /// バッチ処理する`GptModel::generate`(内部で`forward_prefill_all_layers`
+    /// を使う)の出力が、1トークンずつ`forward_step`をループする素朴な
+    /// リファレンス実装と完全に一致する(ビット完全)ことを確認する。
+    #[test]
+    fn prefill_batch_generate_matches_token_by_token_forward_step_reference() {
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let model = GptModel::load_random(config, 2026);
+        let device = device();
+        let prompt = ByteTokenizer::encode("prefill batching regression check");
+
+        // 最適化されたパス(forward_prefill_all_layers経由)。
+        let optimized = model.generate(&device, &prompt, 10).unwrap();
+
+        // リファレンス実装: forward_stepを1トークンずつ呼ぶだけの素朴な
+        // ループ(最適化前の`generate`のロジックをそのままここへ複製)。
+        let mut caches = model.new_caches();
+        let mut pos = 0usize;
+        let mut logits = Vec::new();
+        for &tok in &prompt {
+            logits = model.forward_step(device.as_ref(), tok, pos, &mut caches).unwrap();
+            pos += 1;
+        }
+        let mut reference = Vec::with_capacity(10);
+        let mut next = argmax(&logits);
+        for _ in 0..10 {
+            reference.push(next);
+            if pos >= model.config().max_seq_len {
+                break;
+            }
+            logits = model.forward_step(device.as_ref(), next, pos, &mut caches).unwrap();
+            pos += 1;
+            next = argmax(&logits);
+        }
+
+        assert_eq!(optimized, reference, "prefill-batched generate() must match token-by-token forward_step reference exactly (behavior-preserving optimization)");
+    }
+
+    /// 上記と同じ趣旨だが、単一トークンのプロンプト(`seq_len=1`)という
+    /// 境界ケースでも一致することを確認する(バッチ処理コードパスが
+    /// `seq_len=1`のときも正しく`forward_step`ループの特殊ケースとして
+    /// 振る舞うことの検証)。
+    #[test]
+    fn prefill_batch_generate_matches_reference_for_single_token_prompt() {
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let model = GptModel::load_random(config, 4242);
+        let device = device();
+        let prompt = ByteTokenizer::encode("x");
+        assert_eq!(prompt.len(), 1);
+
+        let optimized = model.generate(&device, &prompt, 6).unwrap();
+
+        let mut caches = model.new_caches();
+        let mut pos = 0usize;
+        let mut logits = Vec::new();
+        for &tok in &prompt {
+            logits = model.forward_step(device.as_ref(), tok, pos, &mut caches).unwrap();
+            pos += 1;
+        }
+        let mut reference = Vec::with_capacity(6);
+        let mut next = argmax(&logits);
+        for _ in 0..6 {
+            reference.push(next);
+            if pos >= model.config().max_seq_len {
+                break;
+            }
+            logits = model.forward_step(device.as_ref(), next, pos, &mut caches).unwrap();
+            pos += 1;
+            next = argmax(&logits);
+        }
+
+        assert_eq!(optimized, reference);
+    }
+}
+
+#[cfg(test)]
+mod bench_manual {
+    use super::*;
+    use opencuda_cpu::CpuDevice;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// 手動実行専用(既定のcargo testでは実行しない、`--ignored`指定時のみ)。
+    /// 実GPT-2 124M重みでプロンプト長ごとのgenerate()所要時間を計測し、
+    /// プリフィルバッチ化の効果を実測するためのベンチマーク。
+    #[test]
+    #[ignore]
+    fn manual_bench_real_gpt2_generate_timing() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/gpt2");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: no real GPT-2 weights");
+            return;
+        }
+        let model = GptModel::load(&dir).unwrap();
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let device: Arc<dyn GpuDevice> = CpuDevice::new(0);
+        let prompt = tokenizer.encode("The quick brown fox jumps over the lazy dog and continues running through the forest").unwrap();
+        eprintln!("prompt_len={}", prompt.len());
+        let start = Instant::now();
+        let out = model.generate(&device, &prompt, 20).unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("generate(20 new tokens) elapsed={elapsed:?}, out_len={}", out.len());
     }
 }

@@ -225,6 +225,95 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-04 `open-cuda-llm`にプリフィル/デコード分離+QKV融合GEMMを実装
+  (aruaru-llm側CLAUDE.md 2026-07-26 HANDOFFで指摘された「安易なGPU配線は
+  逆に遅くなりうる」問題への設計変更(a)(b)に対応、ユーザー指示
+  「open-directx open-cuda aruaru-llmなどの使いやすさ向上と連携と実用性と
+  完成度を向上させて」)**:
+  1. **背景**: `aruaru-llm`側の2026-07-26 HANDOFFで、`GptModel`の推論
+     ループが常に`seq_len=1`(1トークンずつ)で`opencuda_blas::sgemm`を
+     呼ぶ設計のため、Vulkan経由への単純な置き換えはディスパッチ
+     オーバーヘッドがCPU実行より遅くなる懸念があり、次の設計変更(a)
+     プリフィルのバッチ化・(b)QKV融合GEMMが推奨されていた。今回はこの
+     (a)(b)を実装した(GPUディスパッチへの実配線(c)は今回は着手せず、
+     次回HANDOFFとして正直に申し送る、下記参照)。
+  2. **(b) QKV融合GEMM**: `DecoderLayer`の`query`/`key`/`value`という
+     3本の独立した`Linear`フィールドを、単一の`qkv: Linear`
+     (`out_dim=3*hidden`)へ統合した。GPT-2のsafetensorsは元々Q/K/Vを
+     `c_attn`という1本の融合`Conv1D`(`[hidden, 3*hidden]`)として保存
+     しており、`load_fused_qkv`(列方向に3分割してから3本の`Linear`を
+     組み立てていた専用関数)を削除し、既存の`load_conv1d`をそのまま
+     `out_dim=3*hidden`で呼ぶだけで済むことが分かった(分割自体が
+     不要だった)。`forward_step`(1トークンデコード)・新設の
+     `forward_prefill`(下記)双方でこの融合`Linear`を使うため、
+     デコード・プリフィルの両方でQ/K/Vのディスパッチ回数が3回→1回に
+     減っている。
+  3. **(a) プリフィル/デコード分離**: `DecoderLayer::forward_prefill`
+     (新設)は、プロンプト全体(`seq_len`トークン)をQKV融合`Linear`・
+     `attn_out`・`intermediate`・`output`の4つとも`seq_len`を`m`パラメータ
+     とする**本当のGEMM(m>1)**として1回ずつ呼ぶ(レイヤーあたりの
+     ディスパッチ回数が`4*seq_len`から`4`へ削減)。Attention自体は
+     位置ごとの因果性(causality)を守るため、行(トークン位置)を昇順に
+     処理しその位置までのキャッシュのみを参照する形は維持した(素朴な
+     O(n)重複クエリ方式、既存のまま変更なし)。`GptModel::generate`は
+     プロンプトの初回forwardをこの`forward_prefill`(内部で
+     `forward_prefill_all_layers`)経由に変更し、生成された各トークンの
+     逐次デコードは従来通り`forward_step`(`seq_len=1`)のまま
+     (prefill/decode分離)。
+  4. **挙動を変えない最適化であることの検証(型チェックのみで完了と
+     報告しない方針を徹底)**:
+     - 新規回帰テスト2件(`open-cuda-llm/src/lib.rs`):
+       `prefill_batch_generate_matches_token_by_token_forward_step_reference`
+       (複数トークンのプロンプト)・
+       `prefill_batch_generate_matches_reference_for_single_token_prompt`
+       (`seq_len=1`の境界ケース)——いずれも、最適化後の`generate()`が、
+       1トークンずつ`forward_step`をループする素朴なリファレンス実装と
+       生成トークン列が完全一致(ビット完全)することを確認。
+     - **実GPT-2 124M重み(`openai-community/gpt2`、このマシンに
+       ダウンロード済み)で、変更前(`git stash`でコード変更を退避)と
+       変更後の生成結果を実際に比較**: プロンプト`"The quick brown
+       fox"`・`max_new_tokens=12`で、変更前後とも
+       `token ids: [274, 389, 257, 1049, 835, 284, 651, 257, 1310,
+       1643, 286, 257]`(`"es are a great way to get a little bit of
+       a"`)と**完全一致**(1トークンも違わない)することを確認した。
+     - `cargo test -p open-cuda-llm --release`**9件全green**(既存7件+
+       新規2件、regression無し)。`cargo build --workspace --release`/
+       `cargo test --workspace --release`全クレートregression無し。
+       `cargo clippy -p open-cuda-llm --all-targets --release -- -D
+       warnings`(および`cargo clippy --workspace`)**警告0件**
+       (リファクタ過程で新たに検出された`empty_line_after_doc_comments`・
+       `explicit_counter_loop`の2件も解消済み)。
+  5. **手動ベンチマーク(参考値、正直な開示)**: `#[ignore]`付きの
+     `manual_bench_real_gpt2_generate_timing`テストを追加し、実GPT-2
+     124M・プロンプト長15トークン・`max_new_tokens=20`でCPU実行時間を
+     計測したところ約6.8秒だった。**これは変更前との比較ベンチマークでは
+     ない**(旧コードでの同条件計測は今回実施していない)——今回の変更は
+     「GEMM呼び出し回数を減らす」ものであり、CPU素朴実装の総浮動小数点
+     演算量自体は不変のため、CPU実行時間の大幅な改善は本質的に期待して
+     いない(このテストはあくまでVulkan配線時に比較対象となるCPU側の
+     基準値を残す目的)。
+  6. **正直な開示・スコープ外**: (c)「`aruaru-llm`側にオプトインの
+     `real-vulkan` feature配線を追加し、実機(GT 730)でCPU版とVulkan版の
+     生成結果が数値的に一致すること・実際の速度差をベンチマークで確認」
+     は**今回未着手**。理由: (a)(b)の実装・検証(挙動を変えないことの
+     証明)に時間を要したため、優先度指示通り「(a)(b)の完了・検証までを
+     確実にやり切る」を優先した。(c)に着手する場合、`aruaru-llm/src/
+     main.rs`のデバイス選択(`CpuDevice::new(0)`)を`opencuda-vulkan::
+     real::VulkanDevice`へ切り替えるオプトインfeatureを追加し、
+     `opencuda_blas::select_gemm_path`が`GemmPath::VulkanGeneric`を
+     選ぶこと(既存の自動選択ロジック、2026-07-22実装済み)を利用する形に
+     なる見込み。ディスパッチ回数は今回の変更でレイヤーあたり
+     `4*seq_len+seq_len`(デコード)から`4`(プリフィル)+デコードは
+     従来通りに削減されたため、Vulkan配線時のオーバーヘッド懸念は
+     プリフィル側については大きく緩和されているはずだが、これは
+     理論上の期待であり実測はしていない。
+  - 次にすべきこと: (1) (c)`aruaru-llm`側`real-vulkan` feature配線+
+    実機(GT 730)でのCPU版/Vulkan版の生成結果一致・速度ベンチマーク、
+    (2) デコード側(`forward_step`、`seq_len=1`のまま)へのVulkan適用は
+    引き続き懸念が残るため、複数リクエストのバッチデコード
+    (continuous batching相当)等の追加設計が必要かの検討、(3) README/
+    OmniGPU-Design.mdへの本変更の反映(現状はCLAUDE.md HANDOFFのみ)。
+
 - **2026-07-31 `open-cuda-whisper`新設(6位Whisper相当のMVP着手、ユーザー指示)**:
   `open-raid-z`の「Python製AIライブラリのRust移植」ロードマップ
   (マーケティング調査1〜6位)のうち、前回(2026-07-25)HANDOFFで次の
