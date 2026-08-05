@@ -342,7 +342,8 @@ impl DecoderLayer {
             for row in q_full.chunks_exact_mut(head_dim) {
                 row.copy_from_slice(q_h);
             }
-            let out = opencuda_blas::scaled_dot_product_attention(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim)?;
+            let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
+            let out = opencuda_blas::scaled_dot_product_attention_with_spirv(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim, spirv)?;
             context[col_start..col_start + head_dim].copy_from_slice(&out[0..head_dim]);
         }
 
@@ -420,7 +421,8 @@ impl DecoderLayer {
                 for q_full_row in q_full.chunks_exact_mut(head_dim) {
                     q_full_row.copy_from_slice(q_h);
                 }
-                let out = opencuda_blas::scaled_dot_product_attention(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim)?;
+                let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
+                let out = opencuda_blas::scaled_dot_product_attention_with_spirv(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim, spirv)?;
                 context[row * hidden_size + col_start..row * hidden_size + col_start + head_dim].copy_from_slice(&out[0..head_dim]);
             }
         }
@@ -1148,6 +1150,60 @@ mod tests {
         for (i, (&cv, &vv)) in cpu_out.iter().zip(vulkan_out.iter()).enumerate() {
             assert!((cv - vv).abs() < 1e-3, "idx {i}: cpu={cv}, vulkan={vv}");
         }
+    }
+
+    /// 2026-08-05(続き)追加: 上のテストが書かれた時点では
+    /// `scaled_dot_product_attention`がVulkanデバイス上で
+    /// `KernelSource::Native`を要求し即座にpanicしたため、`generate()`
+    /// 全体をVulkanで動かす検証は意図的に外していた
+    /// (`opencuda-blas`側に`scaled_dot_product_attention_with_spirv`
+    /// を新設し、`DecoderLayer::forward_step`/`forward_prefill`の
+    /// 呼び出し箇所を切り替えたことで解消——このテストがその
+    /// エンドツーエンド検証)。`GptModel::set_matmul_spirv`を呼んだ
+    /// モデルに対して`generate()`を実Vulkanハードウェア(NVIDIA GT 730)
+    /// 上で実行し、CPU実行(spirv未設定のモデル)と生成トークン列が
+    /// 完全一致することを確認する。
+    #[test]
+    fn generate_end_to_end_matches_cpu_on_real_vulkan_hardware_after_set_matmul_spirv() {
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping generate_end_to_end test: matmul.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping generate_end_to_end test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        let vulkan_device: std::sync::Arc<dyn GpuDevice> = vulkan_device;
+        let cpu_device: std::sync::Arc<dyn GpuDevice> = opencuda_cpu::CpuDevice::new(0);
+
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let prompt = ByteTokenizer::encode("hi");
+
+        let cpu_model = GptModel::load_random(config.clone(), 42);
+        let cpu_out = cpu_model.generate(&cpu_device, &prompt, 6).unwrap();
+
+        let mut vulkan_model = GptModel::load_random(config, 42);
+        vulkan_model.set_matmul_spirv(spirv);
+        // 本題: これまで`VulkanDevice::launch_kernel`が
+        // `kernel source not supported by this backend: Native`で
+        // panicしていた経路。scaled_dot_product_attention_with_spirvへの
+        // 切り替えにより、ここでpanicせず最後まで完走することを確認する。
+        let vulkan_out = vulkan_model.generate(&vulkan_device, &prompt, 6).unwrap();
+
+        assert_eq!(cpu_out, vulkan_out, "CPU and Vulkan generation should produce byte-identical token sequences for the same seed/prompt");
     }
 }
 

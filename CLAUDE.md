@@ -225,6 +225,79 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-05(続き) SPIR-V版Attention(GPU GEMM + CPU softmaxハイブリッド)を
+  実装し、`GptModel::generate()`が実Vulkanハードウェア上で最後まで完走する
+  ことをエンドツーエンド検証(直下エントリ「次にすべきこと(1)」への対応)**:
+  1. **背景**: 直下エントリで`Linear::forward`(GEMM)側の`matmul.spv`未配線
+     バグは直したが、`scaled_dot_product_attention`が内部で`launch_naive_gemm`
+     (`KernelSource::Native`)を直接呼んでいたため、`VulkanDevice::launch_kernel`
+     (SpirVしか受理しない)に渡すと`kernel source not supported by this
+     backend: Native`で即座にpanicする、というより深いギャップが残っていた。
+  2. **調査・設計判断**: `crates/opencuda-blas/shaders/matmul.comp`
+     (既存の非転置GEMM専用SPIR-Vシェーダ)を読み、QKᵀ・P·Vの両ステップは
+     形状的にはGEMMそのものなので、新規SPIR-Vカーネルを書かずに既存の
+     `sgemm_vulkan_generic`を再利用できると判断した。ただしシェーダは
+     `b`の転置に対応していないため、QKᵀ計算ではKをホスト側で
+     `seq_len x head_dim`→`head_dim x seq_len`へ転置してから通常GEMMとして
+     渡す(転置コストはO(seq_len*head_dim)、GEMM本体のO(seq_len^2*head_dim)
+     より軽い)。一方、行ごとのsoftmax(exp/sum/normalize)には対応する
+     SPIR-Vカーネルが無く、新規に書くには規模が大きいため、**今回は
+     ホスト側CPU(rayon並列)のまま残した**——ユーザー指示「野心的すぎる
+     実装を無理に通さない」方針に従い、正直に「GPU GEMM + CPU softmax」の
+     ハイブリッドとして実装・命名した(完全にGPU常駐する融合Attention
+     カーネルではない、と`opencuda-blas`側のdocコメントに明記)。
+  3. **実装**: `crates/opencuda-blas/src/lib.rs`に
+     `scaled_dot_product_attention_with_spirv(device, q, k, v, seq_len,
+     head_dim, spirv: Option<&[u8]>)`を新設。既存の`scaled_dot_product_
+     attention`はこれを`spirv=None`で呼ぶ薄いラッパーへ変更(後方互換、
+     既存呼び出し元は無改修で従来通りCPU Native経路のまま動く)。P・Vの
+     計算は既存の`sgemm(...,spirv)`をそのまま再利用(`spirv`を素通し)。
+     `crates/open-cuda-llm/src/lib.rs`の`DecoderLayer::forward_step`/
+     `forward_prefill`の呼び出し箇所を新関数へ切り替え、
+     `self.qkv.spirv_matmul`(直下エントリで配線済みの`Arc<Vec<u8>>`)を
+     そのままattentionへも渡すようにした。
+  4. **実機検証(型チェックのみで完了と報告しない方針を徹底、NVIDIA
+     GeForce GT 730)**:
+     - 新規テスト`scaled_dot_product_attention_with_spirv_matches_cpu_
+       on_real_hardware`(`opencuda-blas`)が、`select_gemm_path`が
+       `GemmPath::VulkanGeneric`を選ぶ実Vulkanデバイス上で新関数を実行し、
+       CPU版(`GemmPath::CpuNaive`)と誤差1e-3以内で一致することを確認
+       (`cargo test -p opencuda-blas --release
+       scaled_dot_product_attention_with_spirv -- --nocapture`
+       →`test result: ok. 1 passed`)。
+     - **本命**: 新規テスト`generate_end_to_end_matches_cpu_on_real_
+       vulkan_hardware_after_set_matmul_spirv`(`open-cuda-llm`)が、
+       `GptModel::set_matmul_spirv`済みモデルに対し`generate()`を実
+       Vulkanデバイス上でそのまま呼び、CPU実行(spirv未設定モデル)と
+       生成トークン列が完全一致することを確認した——これで
+       「配線しても`Native`カーネルで即panicする」という直下エントリの
+       既知ブロッカーは解消された。実行結果:
+       `cargo test -p open-cuda-llm --release generate_end_to_end --
+       --nocapture` →
+       `test tests::generate_end_to_end_matches_cpu_on_real_vulkan_
+       hardware_after_set_matmul_spirv ... ok`
+       (`test result: ok. 1 passed; 0 failed`)。
+     - 既存テスト回帰無し: `cargo test -p opencuda-blas --release`
+       23件全green、`cargo test -p open-cuda-llm --release`11件全green
+       (`manual_bench_*`は既存通り`--ignored`)、`cargo clippy -p
+       opencuda-blas -p open-cuda-llm --all-targets --release --
+       -D warnings`警告0件、`cargo build --workspace --release`
+       リグレッション無し。
+  5. **正直な開示・スコープ**: これは「完全にGPU常駐するfused Attention
+     カーネル」ではなく「QKᵀ・P·Vの2つのGEMMは実Vulkanディスパッチ、
+     softmaxはCPU」のハイブリッドである。この点は`opencuda-blas::
+     scaled_dot_product_attention_with_spirv`のdocコメントに明記した。
+  - 次にすべきこと: (1) softmax専用のSPIR-Vカーネル(または真の融合
+    Attentionカーネル)を書き、GPU常駐率をさらに上げる増分、(2)
+    `flash_attention`(タイル化+オンラインsoftmax)側もSPIR-V対応させる
+    かどうかの検討(現状は`scaled_dot_product_attention`系のみ対応、
+    `flash_attention`は引き続き純粋ホスト側CPU実装のまま)、(3)
+    `aruaru-llm`側で実際に`GptModel::set_matmul_spirv`を呼ぶ配線
+    (これでようやく`generate()`全体が実際にVulkan経由で動作するように
+    なったため、着手する価値がある)、(4) ユーザー指示の優先順位
+    (1. open-directx 2. open-cuda 3. aruaru-llm)に沿って、次は
+    open-directx側の作業へ切り替える。
+
 - **2026-08-05 `Linear::forward`が`matmul.spv`を渡さずGemmPath::
   VulkanGenericが機能しなかった実バグを修正・実機検証(直下2026-08-04
   エントリ「最優先課題」への対応、ユーザー指示「open-directx open-cuda
