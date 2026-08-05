@@ -379,6 +379,51 @@ pub fn scaled_dot_product_attention(
     seq_len: usize,
     head_dim: usize,
 ) -> Result<Vec<f32>> {
+    scaled_dot_product_attention_with_spirv(device, q, k, v, seq_len, head_dim, None)
+}
+
+/// [`scaled_dot_product_attention`] の SPIR-V 対応版。
+///
+/// **2026-08-05実装、正直な開示: これは「GPU GEMM + CPU softmax」の
+/// ハイブリッドであり、完全にGPU常駐する（fusedな）Attentionカーネル
+/// ではない**。理由・設計:
+///
+/// - `select_gemm_path(device)` が `GemmPath::VulkanGeneric` を選び、
+///   かつ `spirv`（`matmul.spv` のバイト列、[`sgemm_vulkan_generic`] と
+///   同一契約）が渡された場合のみ、QKᵀ とP·Vの**両方のGEMMステップを
+///   実際にVulkanデバイス上でディスパッチする**。それ以外
+///   （`GemmPath::CpuNaive`、あるいはVulkanGenericだが`spirv`が
+///   `None`）の場合は、従来通りホスト側`Native`カーネル
+///   （[`launch_naive_gemm`]）にフォールバックする（＝[`sgemm`]と同じ
+///   フォールバック規約）。
+/// - QKᵀの計算には既存の[`sgemm_vulkan_generic`]（`matmul.comp`
+///   シェーダ、非転置の通常GEMM専用）をそのまま再利用する。シェーダは
+///   `b`の転置に対応していないため、Kをホスト側で転置してから
+///   （`seq_len x head_dim` → `head_dim x seq_len`）通常のGEMMとして
+///   渡す。これは新規SPIR-Vカーネルを書かずに済ませるための実装判断
+///   （転置自体はO(seq_len*head_dim)のメモリコピーで、行列積本体の
+///   O(seq_len^2*head_dim)に比べ軽い）。alpha相当のスケーリング
+///   （`1/sqrt(head_dim)`）はシェーダが対応していないため、GPU計算後に
+///   ホスト側で適用する（[`sgemm`]がalpha/betaをホスト側適用するのと
+///   同じパターン）。
+/// - **softmax（行ごとのexp/sum/normalize）は依然としてホスト側CPU
+///   （rayon並列）で計算する**。softmaxはGEMM形状ではなくSPIR-V版の
+///   実装が無いため——これは意図的な、検証可能な最初の増分であり、
+///   将来softmax専用のSPIR-Vカーネル（またはfused attentionカーネル）
+///   を書けばGPU常駐率をさらに上げられる（`CLAUDE.md`のHANDOFF参照）。
+/// - P·V の計算は[`sgemm`]をそのまま再利用する（`spirv`をそのまま
+///   渡すため、`GemmPath::VulkanGeneric`ならここもVulkanへディスパッチ
+///   される）。
+#[allow(clippy::too_many_arguments)]
+pub fn scaled_dot_product_attention_with_spirv(
+    device: &dyn GpuDevice,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    spirv: Option<&[u8]>,
+) -> Result<Vec<f32>> {
     if q.len() != seq_len * head_dim {
         anyhow::bail!("attention: q.len()={} != seq_len*head_dim={}", q.len(), seq_len * head_dim);
     }
@@ -390,10 +435,29 @@ pub fn scaled_dot_product_attention(
     }
 
     // 1. scores = Q・Kᵀ / sqrt(head_dim)
-    //    launch_naive_gemm の alpha でスケーリングを同時に適用する。
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let mut scores = vec![0.0f32; seq_len * seq_len];
-    launch_naive_gemm(device, seq_len, head_dim, seq_len, scale, q, k, true, 0.0, &mut scores)?;
+    let path = select_gemm_path(device);
+    match (path, spirv) {
+        (GemmPath::VulkanGeneric, Some(spirv_bytes)) => {
+            // シェーダは転置Bに対応していないため、Kをホスト側で
+            // head_dim x seq_len へ転置してから通常GEMMとして渡す。
+            let mut k_t = vec![0.0f32; head_dim * seq_len];
+            for row in 0..seq_len {
+                for col in 0..head_dim {
+                    k_t[col * seq_len + row] = k[row * head_dim + col];
+                }
+            }
+            let raw = sgemm_vulkan_generic(device, seq_len, head_dim, seq_len, q, &k_t, spirv_bytes)?;
+            for (s, r) in scores.iter_mut().zip(raw.iter()) {
+                *s = scale * r;
+            }
+        }
+        _ => {
+            // launch_naive_gemm の alpha でスケーリングを同時に適用する。
+            launch_naive_gemm(device, seq_len, head_dim, seq_len, scale, q, k, true, 0.0, &mut scores)?;
+        }
+    }
 
     // 2. 行ごとのsoftmax（数値安定のため各行の最大値を引く）。行同士は独立
     //    なので rayon で並列化する。
@@ -416,9 +480,11 @@ pub fn scaled_dot_product_attention(
             }
         });
 
-    // 3. output = probs・V （通常の GEMM、sgemm をそのまま再利用）
+    // 3. output = probs・V （通常の GEMM、sgemm をそのまま再利用。spirv を
+    //    そのまま渡すことで GemmPath::VulkanGeneric ならここもVulkanへ
+    //    ディスパッチされる）。
     let mut output = vec![0.0f32; seq_len * head_dim];
-    sgemm(device, seq_len, seq_len, head_dim, 1.0, &probs, v, 0.0, &mut output, None)?;
+    sgemm(device, seq_len, seq_len, head_dim, 1.0, &probs, v, 0.0, &mut output, spirv)?;
 
     Ok(output)
 }
@@ -1133,6 +1199,74 @@ mod tests {
         assert_eq!(c_auto.len(), c_cpu.len());
         for (i, (&ga, &gc)) in c_auto.iter().zip(c_cpu.iter()).enumerate() {
             assert!((ga - gc).abs() < 1e-3, "idx {i}: sgemm(auto)={ga}, cpu={gc}");
+        }
+    }
+
+    #[test]
+    fn scaled_dot_product_attention_with_spirv_matches_cpu_on_real_hardware() {
+        // 2026-08-05新設: scaled_dot_product_attention_with_spirv が
+        // 実Vulkanハードウェア上で「GPU GEMM(QKᵀ・P·V) + CPU softmax」の
+        // ハイブリッド経路を実際にディスパッチし、CPU版
+        // (scaled_dot_product_attention、GemmPath::CpuNaive)と数値一致
+        // することを検証する。matmul.spv/実Vulkanデバイスのどちらかが
+        // 欠けている環境(CI等)では誤魔化さずスキップする(既存の同種
+        // テストと同じ方針)。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping scaled_dot_product_attention_with_spirv test: matmul.spv not \
+                     compiled at {}: {e} (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping scaled_dot_product_attention_with_spirv test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+
+        assert_eq!(
+            select_gemm_path(vulkan_device.as_ref()),
+            GemmPath::VulkanGeneric,
+            "expected select_gemm_path to pick VulkanGeneric on this real Vulkan device"
+        );
+
+        let seq_len = 6;
+        let head_dim = 4;
+        let q: Vec<f32> = (0..seq_len * head_dim).map(|i| ((i as f32) * 0.11).sin()).collect();
+        let k: Vec<f32> = (0..seq_len * head_dim).map(|i| ((i as f32) * 0.23).cos()).collect();
+        let v: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32) * 0.07 - 0.5).collect();
+
+        let cpu_device = cpu_device();
+        let cpu_out = scaled_dot_product_attention(cpu_device.as_ref(), &q, &k, &v, seq_len, head_dim).unwrap();
+
+        // 本題: 実Vulkanデバイスへ spirv を渡して呼ぶ。select_gemm_path が
+        // VulkanGeneric を選び、かつ spirv が Some なので、QKᵀ・P·V の
+        // 両方の GEMM ステップが実際に VulkanDevice::launch_kernel
+        // (KernelSource::SpirV) 経由でディスパッチされる
+        // (launch_naive_gemm の Native カーネル経由にはならない)。
+        let vulkan_out = scaled_dot_product_attention_with_spirv(
+            vulkan_device.as_ref(),
+            &q,
+            &k,
+            &v,
+            seq_len,
+            head_dim,
+            Some(&spirv),
+        )
+        .unwrap();
+
+        assert_eq!(cpu_out.len(), vulkan_out.len());
+        for (i, (&cv, &vv)) in cpu_out.iter().zip(vulkan_out.iter()).enumerate() {
+            assert!((cv - vv).abs() < 1e-3, "idx {i}: cpu={cv}, vulkan={vv}");
         }
     }
 
