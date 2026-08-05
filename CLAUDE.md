@@ -1135,3 +1135,55 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     未検証)、(2) 将来的にLlama/Mistral等の異なるアーキテクチャへ
     対応する場合は、この`key_prefix`方式では吸収しきれない可能性が
     高い(テンソル名の構造自体が異なるため)。
+
+- **2026-08-05 前回HANDOFF項目(1)を検証: `gpt2-medium`/`gpt2-large`/
+  `gpt2-xl`のテンソル名規約を実際に確認**:
+  1. **safetensorsヘッダーを実際に読んで確認**(フルダウンロード前に、
+     Hugging Face上の`model.safetensors`へRangeリクエストで先頭8バイト
+     〈ヘッダー長〉+ヘッダーJSON本体のみを取得する方式):
+     `openai-community/gpt2-medium`(316テンソル)・`gpt2-large`
+     (472テンソル)・`gpt2-xl`(628テンソル)のいずれも、`transformer.`
+     プレフィックス付きテンソルは0件、`wte.weight`/`wpe.weight`/
+     `ln_f.weight`/`ln_f.bias`はプレフィックス無しの形で存在することを
+     確認した。つまりこの3サイズはいずれも`gpt2`(base)と同じ
+     プレフィックス無し規約であり、`distilgpt2`のみが例外
+     (`transformer.`プレフィックス付き)という位置づけが裏付けられた。
+  2. **型チェックだけで終わらせず実E2Eで検証**: このマシンには
+     既に`aruaru-llm`が`gpt2-medium`/`gpt2-large`/`gpt2-xl`を含む
+     全カタログをダウンロード済み(先行セッションの成果物)で、かつ
+     常駐サーバーが稼働中だったため、これを使って実際に
+     `POST /v1/models/select`→`POST /v1/generate`を実行した。
+     `gpt2-medium`・`gpt2-large`はいずれも切り替え成功、生成も
+     正常応答(例: `gpt2-medium`で"The capital of France is"→
+     " Paris, and the capital of France is Paris."、
+     `gpt2-large-greedy-decode-v0-open-cuda-llm-cpu`等の期待通りの
+     エンジンラベル付き)。**コード変更は一切不要**(既存の
+     `key_prefix`自動判定ロジックがそのまま両方を正しく処理した)。
+  3. **正直な開示・新たに判明した制限**: `gpt2-xl`(1.5B、6.4GB)への
+     切り替えは`"open-cuda-llm: failed to read model.safetensors in
+     ... out of memory"`で実際に失敗した。原因はコードの不具合では
+     なく、このマシンの空きメモリ不足(切り替え試行時点で物理メモリ
+     32GB中の空き実測約4GB、既に`gpt2-large`ロード済みで
+     `aruaru-llm`プロセス自体が約10GB使用中、加えてWSL・他の並列
+     開発セッション等が同時稼働していたための資源逼迫)と判断——
+     `gpt2-xl`のテンソル名規約自体はヘッダー確認で他2サイズと同一と
+     確認済みであり、コードパスは同じはずだが、実機での完全なE2E
+     生成成功までは確認できていない(誇張しないための明記)。
+     この際、サーバープロセスがOOM後にクラッシュして応答不能に
+     なったため、再起動して既定モデル(`gpt2`)がロードされた状態へ
+     復旧させ、他セッションが使っている可能性のある常駐サーバーの
+     状態を元通りにした。
+  4. **検証結果**: `cargo build --workspace --release`は変更なし
+     (今回はコード変更を伴わない検証作業のため未実行)。ドキュメント
+     (本ファイル)のみ更新。
+  - 次にすべきこと: (1) `gpt2-xl`実機ロードのメモリ不足問題——
+     十分な空きメモリが確保できるタイミング(他の並列セッションが
+     アイドルな時等)に再度`select`を試し、実際に生成まで到達する
+     ことを確認する。恒常的な対策としては、大きいモデルを読み込む
+     前に他の使用中モデルを明示的に解放する仕組み(現状は
+     プロセス内に複数モデルを保持したままの可能性がある)の要否を
+     `aruaru-llm`側で調査する価値がある。(2) 前回HANDOFFの(2)
+     (Llama/Mistral等異なるアーキテクチャは`key_prefix`方式では
+     吸収しきれない)は未着手のまま変更なし。(3)
+     Qualcomm/ARM/Imagination実機・AMD ROCm/Intel oneAPI導入待ちの
+     項目群も変更なし。
