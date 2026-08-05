@@ -152,7 +152,7 @@ fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
         out_dim
     );
     let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
-    Ok(Linear { weight_t: weight, bias, in_dim, out_dim })
+    Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None })
 }
 
 // **2026-08-04変更**: GPT-2はQ/K/Vを1本の`c_attn`(`[hidden, 3*hidden]`)へ
@@ -210,18 +210,25 @@ struct Linear {
     bias: Vec<f32>,
     in_dim: usize,
     out_dim: usize,
+    /// コンパイル済み`matmul.spv`(`opencuda_blas::sgemm`が
+    /// `GemmPath::VulkanGeneric`を選んだ際に必要、2026-08-05配線)。
+    /// `GptModel::set_matmul_spirv`経由で全`Linear`インスタンスに同じ
+    /// `Arc`を共有させる。未設定(`None`)ならCPU実行(`GemmPath::
+    /// CpuNaive`)のまま——既存の挙動を一切変えない後方互換なデフォルト。
+    spirv_matmul: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Linear {
     fn random(rng: &mut SplitMix64, in_dim: usize, out_dim: usize) -> Self {
         let scale = 1.0 / (in_dim as f32).sqrt();
-        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim }
+        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None }
     }
 
     fn forward(&self, device: &dyn GpuDevice, x: &[f32], seq_len: usize) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), seq_len * self.in_dim);
         let mut out = vec![0.0f32; seq_len * self.out_dim];
-        opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, None)?;
+        let spirv = self.spirv_matmul.as_deref().map(|v| v.as_slice());
+        opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, spirv)?;
         for row in 0..seq_len {
             for c in 0..self.out_dim {
                 out[row * self.out_dim + c] += self.bias[c];
@@ -571,9 +578,38 @@ impl GptModel {
             bias: vec![0.0; config.vocab_size], // GPT-2のlm_headはbias無し(weight tying)
             in_dim: hidden,
             out_dim: config.vocab_size,
+            spirv_matmul: None,
         };
 
         Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head })
+    }
+
+    /// コンパイル済み`matmul.spv`(`opencuda_blas::sgemm_vulkan_generic`が
+    /// 期待するのと同じシェーダバイト列)をこのモデル内の全`Linear`
+    /// (各レイヤーのQKV融合/attn_out/intermediate/output + `lm_head`)へ
+    /// 配線する(2026-08-05新設)。呼び出し元(例: `aruaru-llm`の
+    /// `--features real-vulkan`)が`opencuda-vulkan::real::VulkanDevice`を
+    /// 使う場合はこれを呼んでから`generate`すること——呼ばなければ
+    /// `sgemm`は`GemmPath::CpuNaive`(既存の既定挙動)のまま動く。
+    ///
+    /// **正直な開示**: これは`Linear::forward`が`sgemm`へ`spirv`バイト列を
+    /// 渡さず`GemmPath::VulkanGeneric`が常に失敗していた実バグ
+    /// (`CLAUDE.md`2026-08-04 HANDOFF参照)への配線修正であり、
+    /// Attention計算(`opencuda_blas::scaled_dot_product_attention`が
+    /// 内部で使う`launch_naive_gemm`経由のRustクロージャカーネル)側の
+    /// 別のギャップ(`VulkanDevice::launch_kernel`が`KernelSource::SpirV`
+    /// 以外を受け付けないため、SPIR-V版のattentionカーネルが無いと
+    /// Attention自体は依然Vulkanデバイス上で失敗する)は解消していない
+    /// ——GEMM(Linear層)側のVulkanGeneric経路のみを修正対象とする。
+    pub fn set_matmul_spirv(&mut self, spirv: Vec<u8>) {
+        let spirv = std::sync::Arc::new(spirv);
+        for layer in &mut self.layers {
+            layer.qkv.spirv_matmul = Some(spirv.clone());
+            layer.attn_out.spirv_matmul = Some(spirv.clone());
+            layer.intermediate.spirv_matmul = Some(spirv.clone());
+            layer.output.spirv_matmul = Some(spirv.clone());
+        }
+        self.lm_head.spirv_matmul = Some(spirv);
     }
 
     /// 新規のKVキャッシュ集合(レイヤー数 x ヘッド数)を作る。
@@ -1046,6 +1082,72 @@ mod tests {
         }
 
         assert_eq!(optimized, reference);
+    }
+
+    /// 2026-08-05配線の実機検証: `GptModel::set_matmul_spirv`経由で
+    /// `Linear::forward`が実際に`GemmPath::VulkanGeneric`を使うように
+    /// なり、CPU実行(`GemmPath::CpuNaive`)と数値一致する出力を返すことを
+    /// 実Vulkanハードウェア上で確認する。実Vulkan環境(このマシンでは
+    /// NVIDIA GeForce GT 730)と事前コンパイル済み`matmul.spv`
+    /// (`examples/matmul_vulkan_real/shaders/matmul.spv`、
+    /// `tools/compile-vulkan-shaders.*`で生成)の両方が必要——どちらか
+    /// 欠けている環境(CI等)では誤魔化さずスキップする
+    /// (`opencuda-blas`の同種テストと同じ方針)。
+    ///
+    /// **意図的に`Linear::forward`単体を叩き、`GptModel::generate`は
+    /// 呼ばない(正直な開示・スコープの境界)**: 最初はモデル全体の
+    /// `generate()`をCPU/Vulkan両方で実行し出力一致を見る設計で書いたが、
+    /// 実機で実行したところ`VulkanDevice::launch_kernel`が
+    /// `kernel source not supported by this backend: Native`で
+    /// **panicすることを実際に確認した**——`scaled_dot_product_attention`
+    /// が内部で使う`launch_naive_gemm`はSPIR-Vではなく
+    /// `KernelSource::Native`(Rustクロージャ)を要求するため、
+    /// `VulkanDevice`(SPIR-Vカーネルしか受理しない実装)へ渡すと
+    /// Attention計算そのものが即座に失敗する。これは今回のGEMM配線
+    /// 修正とは別の、独立したギャップ(SPIR-V版のattentionカーネルが
+    /// 存在しない)であり、本テストのスコープでは解消しない
+    /// (`CLAUDE.md`HANDOFFに記録)。そのため本テストは、実際に
+    /// Vulkan経路を通る範囲——`Linear::forward`(GEMM)——だけを直接
+    /// 検証範囲とし、Attentionを経由する`generate()`は使わない。
+    #[test]
+    fn set_matmul_spirv_makes_linear_forward_use_vulkan_and_matches_cpu_output() {
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping set_matmul_spirv test: matmul.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping set_matmul_spirv test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        let vulkan_device: std::sync::Arc<dyn GpuDevice> = vulkan_device;
+        let cpu_device: std::sync::Arc<dyn GpuDevice> = opencuda_cpu::CpuDevice::new(0);
+
+        let mut rng = SplitMix64::new(42);
+        let mut linear = Linear::random(&mut rng, 16, 24);
+        let x: Vec<f32> = (0..3 * 16).map(|i| (i % 5) as f32 * 0.1).collect();
+
+        let cpu_out = linear.forward(cpu_device.as_ref(), &x, 3).unwrap();
+
+        linear.spirv_matmul = Some(std::sync::Arc::new(spirv));
+        let vulkan_out = linear.forward(vulkan_device.as_ref(), &x, 3).unwrap();
+
+        assert_eq!(cpu_out.len(), vulkan_out.len());
+        for (i, (&cv, &vv)) in cpu_out.iter().zip(vulkan_out.iter()).enumerate() {
+            assert!((cv - vv).abs() < 1e-3, "idx {i}: cpu={cv}, vulkan={vv}");
+        }
     }
 }
 

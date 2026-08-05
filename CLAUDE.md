@@ -225,6 +225,54 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-05 `Linear::forward`が`matmul.spv`を渡さずGemmPath::
+  VulkanGenericが機能しなかった実バグを修正・実機検証(直下2026-08-04
+  エントリ「最優先課題」への対応、ユーザー指示「open-directx open-cuda
+  aruaru-llmの連携・実用性・完成度を向上」)**:
+  1. **修正**: `crates/open-cuda-llm/src/lib.rs`の`Linear`構造体に
+     `spirv_matmul: Option<Arc<Vec<u8>>>`フィールドを追加(既定`None`、
+     既存の全構築箇所〈`Linear::random`・`load_conv1d`・`lm_head`直接
+     構築〉で明示的に`None`を設定し後方互換を維持)。`Linear::forward`は
+     `sgemm`呼び出しの`spirv`引数にこのフィールドを渡すよう変更(従来は
+     常に`None`固定だった)。新規`GptModel::set_matmul_spirv(&mut self,
+     spirv: Vec<u8>)`が、モデル内の全`Linear`(各レイヤーのQKV融合/
+     attn_out/intermediate/output+`lm_head`)へ同じ`Arc`を配線する。
+  2. **実機検証(型チェックのみで完了と報告しない方針を徹底)**:
+     新規テスト`set_matmul_spirv_makes_linear_forward_use_vulkan_and_
+     matches_cpu_output`が、実Vulkan環境(NVIDIA GeForce GT 730)+
+     事前コンパイル済み`matmul.spv`で`Linear::forward`を実際にCPU経路
+     (`GemmPath::CpuNaive`)とVulkan経路(`GemmPath::VulkanGeneric`)の
+     両方で実行し、出力が数値一致(誤差1e-3以内)することを確認した
+     ——これで「配線しても即座に失敗する」という2026-08-04の実バグは
+     解消された。
+  3. **発見した第二のブロッカー(正直な開示、今回は解消せず)**: 当初は
+     `GptModel::generate()`をCPU/Vulkan双方で走らせ出力一致を見る
+     テストとして書いたが、実機で実行したところ
+     `VulkanDevice::launch_kernel`が`kernel source not supported by
+     this backend: Native`で**実際にpanicした**。原因は
+     `scaled_dot_product_attention`が内部で使う`launch_naive_gemm`が
+     `KernelSource::Native`(Rustクロージャカーネル)を要求するが、
+     `VulkanDevice`は`KernelSource::SpirV`しか受理しないため——GEMM
+     (Linear層)側の配線を直しても、**Attention計算自体は依然Vulkan
+     デバイス上で即座に失敗する**。SPIR-V版のattentionカーネルが
+     新規に必要な、今回のGEMM配線修正より規模の大きいギャップと判断し、
+     無理に着手せず正直に記録するに留めた(テストのスコープを
+     `Linear::forward`単体の検証に絞ることで、この既知のブロッカーを
+     踏まずに今回の修正だけを実証できる形にした)。
+  4. **検証**: `cargo build -p open-cuda-llm --release`/`cargo test -p
+     open-cuda-llm --release`**10件全green**(既存9件+新規1件、
+     `manual_bench_*`は既存通り`--ignored`)、`cargo clippy -p
+     open-cuda-llm --all-targets --release -- -D warnings`警告0件、
+     `cargo build --workspace --release`リグレッション無し。
+  - 次にすべきこと: (1) SPIR-V版attentionカーネルの新規実装
+    (`scaled_dot_product_attention`をVulkanデバイス上で実行可能に
+    する、規模の大きい増分)、(2) `aruaru-llm`側で`GptModel::
+    set_matmul_spirv`を実際に呼ぶ配線(GEMM部分だけでもVulkan経由に
+    できるが、上記(1)が無い限り`generate()`全体はAttentionで失敗
+    するため、実際に呼んでも現状は`generate()`が動かない点に注意)、
+    (3) ユーザー指示の優先順位(1. open-directx 2. open-cuda
+    3. aruaru-llm)に沿って、次はopen-directx側の作業へ切り替える。
+
 - **2026-08-04(続き) `aruaru-llm`側の実機検証で判明: `Linear::forward`が
   `matmul.spv`を`sgemm`へ渡していないため`GemmPath::VulkanGeneric`が
   機能しない(次回セッションの最優先課題として記録)**: 直下エントリ
