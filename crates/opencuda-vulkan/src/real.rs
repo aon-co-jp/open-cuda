@@ -85,8 +85,16 @@ impl VulkanDevice {
             );
         }
 
-        let mut selected = None;
+        // `id`が実際に複数GPUの選択に使われていなかった実バグを修正
+        // (2026-08-06、dream-os側の複数GPU対応調査で発覚)。以前は常に
+        // 「computeキューを持つ最初に見つかった物理デバイス」を開いて
+        // おり、`id`引数は`DeviceInfo.id`(報告用ラベル)にしか反映され
+        // なかった。ここでは、computeキューを持つ物理デバイスだけを
+        // 列挙し、その中から`id`番目を実際に選択する——`id=0`(既存の
+        // 全呼び出し元のデフォルト)は従来通り「最初に見つかった
+        // computeデバイス」のままなので後方互換を維持する。
         let mut seen_devices: Vec<String> = Vec::with_capacity(physical_devices.len());
+        let mut compute_capable: Vec<(vk::PhysicalDevice, u32)> = Vec::new();
         for &pd in &physical_devices {
             let props = unsafe { instance.get_physical_device_properties(pd) };
             let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) }
@@ -100,20 +108,29 @@ impl VulkanDevice {
                 .enumerate()
                 .find(|(_, f)| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
             {
-                selected = Some((pd, family_index as u32));
-                break;
+                compute_capable.push((pd, family_index as u32));
             }
         }
 
-        let (physical_device, queue_family_index) = match selected {
-            Some(v) => v,
+        if compute_capable.is_empty() {
+            unsafe { instance.destroy_instance(None) };
+            bail!(
+                "no Vulkan compute queue family found on any enumerated device. \
+                 Enumerated devices: [{}]. A compute-capable queue family (VK_QUEUE_COMPUTE_BIT) \
+                 is required; this usually means the driver only exposes a graphics/present-only \
+                 queue, which is unexpected for a modern GPU driver",
+                seen_devices.join(", ")
+            );
+        }
+
+        let (physical_device, queue_family_index) = match compute_capable.get(id) {
+            Some(&v) => v,
             None => {
                 unsafe { instance.destroy_instance(None) };
                 bail!(
-                    "no Vulkan compute queue family found on any enumerated device. \
-                     Enumerated devices: [{}]. A compute-capable queue family (VK_QUEUE_COMPUTE_BIT) \
-                     is required; this usually means the driver only exposes a graphics/present-only \
-                     queue, which is unexpected for a modern GPU driver",
+                    "requested device id {id} is out of range: only {} compute-capable Vulkan \
+                     device(s) found. Enumerated devices: [{}]",
+                    compute_capable.len(),
                     seen_devices.join(", ")
                 );
             }
@@ -895,4 +912,47 @@ fn estimate_device_local_memory(props: &vk::PhysicalDeviceMemoryProperties) -> u
         }
     }
     total
+}
+
+#[cfg(test)]
+mod device_selection_tests {
+    use super::*;
+
+    /// `id=0`は既存の全呼び出し元が使う既定値であり、修正後も従来通り
+    /// 「最初に見つかったcomputeデバイス」を開けることを実機で確認する
+    /// (2026-08-06、dream-os側の複数GPU対応調査で発覚した`id`未使用
+    /// バグの修正に対する後方互換性の実機検証)。
+    #[test]
+    fn real_id_zero_still_opens_the_first_compute_device_on_real_hardware() {
+        match VulkanDevice::new(0) {
+            Ok(device) => {
+                assert!(!device.info().name.is_empty(), "expected a non-empty device name");
+            }
+            Err(e) => {
+                eprintln!("skipping: no real Vulkan device available on this machine: {e}");
+            }
+        }
+    }
+
+    /// 実機にGPUが1枚しかない場合、`id=1`以降は明確なエラーになる
+    /// べきで、黙って`id=0`のデバイスへフォールバックしてはならない
+    /// (このマシンにはNVIDIA GT730が1枚のみのため、複数GPUでの実際の
+    /// 選択そのものはこのマシンでは検証できない——正直な開示、
+    /// `dream-os/CLAUDE.md`参照)。
+    #[test]
+    fn real_out_of_range_id_returns_a_clear_error_on_real_hardware() {
+        // まず実機でVulkanが使えるかどうかを確認する(使えない環境では
+        // このテスト自体が無意味なためスキップ)。
+        if VulkanDevice::new(0).is_err() {
+            eprintln!("skipping: no real Vulkan device available on this machine");
+            return;
+        }
+        match VulkanDevice::new(9999) {
+            Ok(_) => panic!("expected device id 9999 to fail on a machine with far fewer GPUs"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("out of range"), "expected an 'out of range' error, got: {msg}");
+            }
+        }
+    }
 }
