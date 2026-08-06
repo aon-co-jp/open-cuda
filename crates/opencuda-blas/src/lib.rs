@@ -353,6 +353,43 @@ pub fn sgemm_vulkan_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize
     Ok(c)
 }
 
+/// 行ごと(row-wise) softmaxを実Vulkan SPIR-Vカーネルで計算する
+/// (2026-08-06新設、CLAUDE.md HANDOFF 2026-08-05「次にすべきこと(1)
+/// softmax専用のSPIR-Vカーネル」への着手)。
+///
+/// `data`は`rows x cols`（行優先）。各行に対して数値安定な softmax
+/// （各行の最大値を引いてからexp・合計・正規化）を、1ワークグループ=1行、
+/// 共有メモリでのブロック内リダクションにより計算する
+/// (`examples/softmax_vulkan_real/shaders/softmax.comp`と同じ契約、
+/// SPIR-Vバイト列は`sgemm_vulkan_generic`と同じ理由で呼び出し側が渡す
+/// 設計)。
+///
+/// **正直な開示**: これは
+/// [`scaled_dot_product_attention_with_spirv`]の内部で使われる
+/// **ハイブリッド版のsoftmax（GPU GEMM + CPU softmax）を置き換える配線は
+/// まだ行っていない**——このカーネル自体は独立した再利用可能な部品として
+/// 実装・実機検証済みだが、既存のAttention経路に組み込む変更は影響範囲の
+/// 検討（既存APIのシグネチャ変更が必要）のため次の増分に残す。
+pub fn softmax_vulkan_generic(device: &dyn GpuDevice, rows: usize, cols: usize, data: &[f32], spirv: &[u8]) -> Result<Vec<f32>> {
+    if data.len() != rows * cols {
+        anyhow::bail!("softmax_vulkan_generic: data.len()={} != rows*cols={}", data.len(), rows * cols);
+    }
+
+    let dd = ScopedAlloc::new(device, std::mem::size_of_val(data))?;
+    device.memcpy_h2d(dd.ptr(), f32_to_bytes(data))?;
+
+    let kernel = CompiledKernel::spirv("softmax", "main", spirv);
+    // シェーダは1ワークグループ=1行(local_size_x=256)を前提とするため、
+    // grid.x=rowsになるよう LaunchConfig::linear(rows*256, 256) を使う。
+    let cfg = LaunchConfig::linear((rows * 256) as u32, 256);
+    device.launch_kernel(&kernel, &cfg, &[KernelArg::Ptr(dd.ptr()), KernelArg::Usize(rows), KernelArg::Usize(cols)])?;
+    device.synchronize()?;
+
+    let mut out = vec![0.0f32; rows * cols];
+    device.memcpy_d2h(f32_from_bytes_mut(&mut out), dd.ptr())?;
+    Ok(out)
+}
+
 /// 素朴な（非Flash）scaled dot-product attention。
 ///
 /// `q`/`k`/`v` はいずれも `seq_len x head_dim`（行優先、単一ヘッド分）。
@@ -1133,6 +1170,70 @@ mod tests {
         assert_eq!(c_vulkan.len(), c_cpu.len());
         for (i, (&gv, &gc)) in c_vulkan.iter().zip(c_cpu.iter()).enumerate() {
             assert!((gv - gc).abs() < 1e-3, "idx {i}: vulkan={gv}, cpu={gc}");
+        }
+    }
+
+    #[test]
+    fn softmax_vulkan_generic_matches_cpu_reference_on_real_hardware() {
+        // 2026-08-06新設: softmax_vulkan_generic(1ワークグループ=1行+共有メモリ
+        // リダクション)を実Vulkan環境で検証。sgemm_vulkan_generic系テストと
+        // 同じ方針で、spvファイル未コンパイル/Vulkanデバイス無しの環境では
+        // assertを誤魔化さずスキップする。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/softmax_vulkan_real/shaders/softmax.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping softmax_vulkan_generic test: softmax.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping softmax_vulkan_generic test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+
+        // 行数・列数ともに256を割り切らない値で、ループ境界(local_size_x=256
+        // より多い列、行数がワークグループ数を素直に決める側)を確認する。
+        let rows = 5;
+        let cols = 41;
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let r = i / cols;
+                let c = i % cols;
+                ((r * 17 + c * 3) % 29) as f32 - 14.0
+            })
+            .collect();
+
+        // CPU側リファレンス(数値安定softmax、rayon不要な小規模計算)。
+        let mut expected = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let slice = &data[r * cols..(r + 1) * cols];
+            let m = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = slice.iter().map(|&x| (x - m).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (c, e) in exps.into_iter().enumerate() {
+                expected[r * cols + c] = e / sum;
+            }
+        }
+
+        let got = softmax_vulkan_generic(vulkan_device.as_ref(), rows, cols, &data, &spirv).unwrap();
+
+        assert_eq!(got.len(), expected.len());
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((g - e).abs() < 1e-4, "idx {i}: vulkan={g}, expected={e}");
+        }
+        for r in 0..rows {
+            let sum: f32 = got[r * cols..(r + 1) * cols].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "row {r} does not sum to 1.0: {sum}");
         }
     }
 

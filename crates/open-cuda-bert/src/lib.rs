@@ -55,13 +55,21 @@ struct Linear {
     bias: Vec<f32>,
     in_dim: usize,
     out_dim: usize,
+    /// コンパイル済み`matmul.spv`(`opencuda_blas::sgemm`が
+    /// `GemmPath::VulkanGeneric`を選んだ際に必要、`open-cuda-llm::Linear`
+    /// (2026-08-05配線)と同じパターン)。`BertModel::set_matmul_spirv`
+    /// 経由で全`Linear`インスタンスに同じ`Arc`を共有させる。未設定
+    /// (`None`)ならCPU実行(`GemmPath::CpuNaive`)のまま——既存の挙動を
+    /// 一切変えない後方互換なデフォルト。
+    spirv_matmul: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Linear {
     fn forward(&self, device: &dyn GpuDevice, x: &[f32], seq_len: usize) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), seq_len * self.in_dim);
         let mut out = vec![0.0f32; seq_len * self.out_dim];
-        opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, None)?;
+        let spirv = self.spirv_matmul.as_deref().map(|v| v.as_slice());
+        opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, spirv)?;
         for row in 0..seq_len {
             for c in 0..self.out_dim {
                 out[row * self.out_dim + c] += self.bias[c];
@@ -139,7 +147,8 @@ impl EncoderLayer {
             let q_h = extract_head(&q);
             let k_h = extract_head(&k);
             let v_h = extract_head(&v);
-            let out_h = opencuda_blas::scaled_dot_product_attention(device, &q_h, &k_h, &v_h, seq_len, head_dim)?;
+            let spirv = self.query.spirv_matmul.as_deref().map(|v| v.as_slice());
+            let out_h = opencuda_blas::scaled_dot_product_attention_with_spirv(device, &q_h, &k_h, &v_h, seq_len, head_dim, spirv)?;
             for row in 0..seq_len {
                 context[row * hidden_size + col_start..row * hidden_size + col_start + head_dim]
                     .copy_from_slice(&out_h[row * head_dim..(row + 1) * head_dim]);
@@ -213,7 +222,7 @@ fn load_linear(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
         in_dim
     );
     let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
-    Ok(Linear { weight_t: transpose(&weight, out_dim, in_dim), bias, in_dim, out_dim })
+    Ok(Linear { weight_t: transpose(&weight, out_dim, in_dim), bias, in_dim, out_dim, spirv_matmul: None })
 }
 
 fn load_layer_norm(tensors: &safetensors::SafeTensors, prefix: &str, eps: f32) -> Result<LayerNorm> {
@@ -227,6 +236,26 @@ impl BertModel {
     /// ベクトルのバッファサイズを知りたい場合などに使う。
     pub fn hidden_size(&self) -> usize {
         self.config.hidden_size
+    }
+
+    /// `open-cuda-llm::GptModel::set_matmul_spirv`と同じパターン
+    /// (2026-08-05配線、詳細は当該HANDOFF参照): コンパイル済み`matmul.spv`
+    /// を全レイヤーの全`Linear`(query/key/value/attn_out/intermediate/
+    /// output)へ同じ`Arc`で配線する。呼び出し側が実Vulkanデバイス上で
+    /// `embed_tokens`を実行する際、これを呼ばないと`sgemm`の
+    /// `GemmPath::VulkanGeneric`が`spirv`未提供エラーで失敗する
+    /// (`aruaru-llm`側の`scoring`/`security`ウォームアップ失敗として
+    /// 2026-08-05に報告されていた既知のギャップへの対応)。
+    pub fn set_matmul_spirv(&mut self, spirv: Vec<u8>) {
+        let spirv = std::sync::Arc::new(spirv);
+        for layer in &mut self.layers {
+            layer.query.spirv_matmul = Some(spirv.clone());
+            layer.key.spirv_matmul = Some(spirv.clone());
+            layer.value.spirv_matmul = Some(spirv.clone());
+            layer.attn_out.spirv_matmul = Some(spirv.clone());
+            layer.intermediate.spirv_matmul = Some(spirv.clone());
+            layer.output.spirv_matmul = Some(spirv.clone());
+        }
     }
 
     /// `dir`配下の`config.json`・`model.safetensors`を読み込む。

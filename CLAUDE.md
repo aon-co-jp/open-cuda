@@ -1187,3 +1187,77 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
      吸収しきれない)は未着手のまま変更なし。(3)
      Qualcomm/ARM/Imagination実機・AMD ROCm/Intel oneAPI導入待ちの
      項目群も変更なし。
+
+- **2026-08-06 softmax専用のSPIR-Vカーネルを新規実装・実機検証(前回HANDOFF
+  「次にすべきこと(1)」への着手、ユーザー指示の優先順位確認: aruaru-llm側は
+  既に`set_matmul_spirv`を実配線済み〈commit `6452ae4`〉と確認できたため
+  今回はopen-cuda本体の実装増分に着手)**:
+  1. **事前調査**: `aruaru-llm/src/generation.rs`を読み、`wire_matmul_spirv`
+     関数が既に`GptModel::set_matmul_spirv`経由でQKV/attn_out/intermediate/
+     output/lm_headの全`Linear`層へmatmul.spvを配線済みであることを確認した
+     (2026-08-05付コメントで前回HANDOFFの実バグ修正commit `6452ae4`を参照)。
+     API不整合は見つからず、open-cuda側の対応は不要と判断。また
+     `open-directx`(`F:\runo\open-directx`)を確認したところ、CLAUDE.mdの
+     旧記述(「空リポジトリ」)とは異なり、既に`directx-graphics-vulkan`
+     (`render_triangle`実機検証済み)・`directx-shader-translate`
+     (DXIL/DXBC/HLSL変換、多数の`.dxbc`/`.dxil`シェーダを含む)の2クレートを
+     持つ独立プロジェクトへ発展していることを確認した。ただしこれは
+     グラフィックスパイプライン(triangle rasterization)寄りの実装であり、
+     本タスクのAttention/GEMM(コンピュートシェーダ)経路との直接連携は無い
+     (現時点でopen-cuda側から呼び出す配線は無し、両者は独立に発展中)。
+  2. **このマシンの実GPU環境を再確認**: `nvidia-smi`実行結果、依然
+     **NVIDIA GeForce GT 730の1台のみ**(ドライバ475.14、VRAM 2048MiB、
+     Driver-reported CUDA 11.4)——GT 730より高性能なGPUはこのマシンには
+     存在しない(前回までのHANDOFFの制約が継続)。
+  3. **実装**: `examples/softmax_vulkan_real/shaders/softmax.comp`
+     (GLSL、`local_size_x=256`、1ワークグループ=1行を担当し、共有メモリ
+     `shared float sdata[256]`でmax・sumの二分木リダクションを行う数値安定
+     softmax)。`opencuda-vulkan::real::VulkanDevice`に
+     `ensure_softmax_args`/`run_softmax_spirv`を追加(`vector_add`等と同じ
+     `args: &[KernelArg]`契約、ポインタ1つ+usize2つの3引数)、
+     `launch_kernel`のカーネル名分岐に`"softmax"`を追加。
+     `opencuda-blas::softmax_vulkan_generic(device, rows, cols, data, spirv)`
+     をホスト側ラッパーとして新設(`sgemm_vulkan_generic`と同じ設計、
+     `LaunchConfig::linear(rows*256, 256)`でgrid.x=rowsになるよう調整)。
+     新規example crate`softmax_vulkan_real`(CPUリファレンス実装との
+     数値一致・各行の合計が1.0になることを検証)を`tools/
+     compile-vulkan-shaders.{sh,ps1,cmd}`のコンパイル対象へ追加、
+     ワークスペースメンバーへ登録。
+  4. **正直な開示・スコープ**: このカーネル自体は独立した再利用可能な
+     部品として実装・実機検証済みだが、**既存の
+     `scaled_dot_product_attention_with_spirv`(GPU GEMM + CPU softmaxの
+     ハイブリッド)内部のCPU softmaxをこのカーネルへ置き換える配線は
+     まだ行っていない**(既存APIのシグネチャ変更が必要になるため、
+     影響範囲の検討を伴う次の増分として切り出した)。`softmax_vulkan_generic`
+     の関数docコメントにもこの開示を明記済み。
+  5. **実機検証(型チェックのみで完了と報告しない方針を徹底)**:
+     `cargo run -p softmax_vulkan_real --release`をこのマシン(NVIDIA
+     GeForce GT 730)で実際に実行し、`device: OpenCUDA Vulkan Device
+     (NVIDIA GeForce GT 730)`という実機ログとともに、8x37行列(256の
+     倍数でない列数)でVulkan版がCPUリファレンスと誤差1e-4以内で一致し、
+     各行の合計が1.0になることを確認した。
+  6. **検証結果**: `cargo build --workspace --release`警告0件・成功。
+     `cargo test -p opencuda-blas --release`**24件全green**(既存23件+
+     新規`softmax_vulkan_generic_matches_cpu_reference_on_real_hardware`
+     1件、実機Vulkanでスキップ無しで実行)。`cargo test --workspace
+     --release`全クレートregression無し(全て`test result: ok`)。
+     `cargo clippy -p opencuda-vulkan -p opencuda-blas -p softmax_vulkan_real
+     --all-targets --release --features real-vulkan -- -D warnings`
+     **警告0件**。
+  7. **完成度調査(grep)**: リポジトリ全体で`todo!()`/`unimplemented!()`/
+     TODO/FIXME/stubを再調査。実質的な未着手項目は`opencuda-multidev::
+     transfer_between_devices`の`TODO(Phase 3)`(ホストメモリ経由の
+     d2h→h2d、複数デバイス構成が実マシンに無いため元々検証不能な項目)
+     のみで、他は過去HANDOFFで既に開示済みのcuBLAS/rocBLAS/oneMKLスタブ・
+     ドキュメント上の言及に限られる——新たな見逃しは見つからなかった。
+  - 次にすべきこと: (1) 本増分の`softmax_vulkan_generic`を
+    `scaled_dot_product_attention_with_spirv`(または新規の完全fused
+    attention関数)へ実際に配線し、「GPU GEMM + CPU softmax」の
+    ハイブリッドから「GPU GEMM + GPU softmax」へ移行する、(2)
+    `flash_attention`のSPIR-V対応(タイル単位でのGPUディスパッチ、
+    現状は純粋ホスト側Rust実装のまま)、(3)
+    Qualcomm/ARM/Imagination実機・AMD ROCm/Intel oneAPI導入待ちの
+    項目群は変更なし、(4) `open-directx`と`open-cuda`はいずれも実体を
+    持つプロジェクトへ発展したが、両者間の直接連携(コンピュート
+    シェーダ経路とDXIL/DXBC変換パイプラインの統合)はまだ設計段階、
+    ユーザー優先順位に沿って次回検討する。

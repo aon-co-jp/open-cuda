@@ -1,0 +1,70 @@
+#version 450
+
+// softmax: 行ごとの(row-wise) softmaxをin-placeで計算する。
+// 1ワークグループ=1行を担当し、共有メモリでmax/sumのブロック内リダクションを行う
+// (Attentionのscores行列のように、行数×列数のバッファに対して行方向softmaxが
+// 必要な用途を想定、2026-08-06追加)。
+//
+// 正確性優先(DEVELOPMENT-NEXT.md方針): タイル化やwarpレベルのシャッフル命令は
+// 使わず、素朴な共有メモリ二分木リダクションのみを用いる。
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Data {
+    float data[];
+};
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+} params;
+
+shared float sdata[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= params.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * params.cols;
+
+    // 1. 行の最大値(数値安定のため)。
+    float m = -3.402823466e+38;
+    for (uint i = tid; i < params.cols; i += 256u) {
+        m = max(m, data[base + i]);
+    }
+    sdata[tid] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        }
+        barrier();
+    }
+    float rowmax = sdata[0];
+    barrier();
+
+    // 2. exp(x - max) を書き込みつつ合計を取る。
+    float sum = 0.0;
+    for (uint i = tid; i < params.cols; i += 256u) {
+        float e = exp(data[base + i] - rowmax);
+        data[base + i] = e;
+        sum += e;
+    }
+    sdata[tid] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier();
+    }
+    float rowsum = sdata[0];
+    barrier();
+
+    // 3. 正規化。
+    for (uint i = tid; i < params.cols; i += 256u) {
+        data[base + i] = data[base + i] / rowsum;
+    }
+}
