@@ -225,6 +225,27 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-06(続き3) `dream-os`(新規リポジトリ)向けに`sha256d_mine`
+  カーネルディスパッチを追加(ユーザー指示、DreamOS PoCでのマイニング
+  相当ハッシュ計算カーネル実装の一環)**: `VulkanDevice::launch_kernel`の
+  カーネル名ホワイトリスト(`vector_add`/`matmul`/`raid6_*`/`softmax`)に
+  `sha256d_mine`を追加。既存の`ensure_softmax_args`/`run_softmax_spirv`と
+  同じ設計パターン(2バッファ+2xu32 push constant、共有`dispatch_spirv`
+  経路を利用)で`ensure_sha256d_mine_args`/`run_sha256d_mine_spirv`を
+  新設(`crates/opencuda-vulkan/src/real.rs`)。呼び出し元は
+  `F:\runo\dream-os\crates\dream-os-kernel`(新規リポジトリ、`../
+  open-cuda/crates/opencuda-*`へのpath依存)。**検証**: `cargo build -p
+  opencuda-vulkan --features real-vulkan --release`警告0件。実際の
+  カーネル動作検証(GPU計算がCPU参照実装`sha2`クレートと一致すること)は
+  `dream-os`側の`tests/mining_real_vulkan.rs`で実施済み(このマシンの
+  NVIDIA GT730・Android実機〈Adreno 619〉双方で実証、詳細は`dream-os/
+  CLAUDE.md`参照)。
+  - 次にすべきこと: `opencuda-vulkan::VulkanDevice::new(id)`の`id`引数が
+    実際には物理デバイス選択に使われず常に最初のcomputeデバイスを開く
+    設計になっている実バグ(`dream-os`側の複数GPU対応調査で発覚)を
+    修正する——複数GPU実機が無いためこのマシンでは検証不可能だが、
+    コードロジック上の修正自体は可能。
+
 - **2026-08-06(続き2) softmax専用SPIR-Vカーネルを`scaled_dot_product_attention`
   経路へ実配線し、「GPU GEMM + CPU softmax」から「GPU GEMM + GPU softmax」へ
   移行・実機検証完了(直上エントリ「次にすべきこと(1)」への対応、

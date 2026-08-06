@@ -473,6 +473,37 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[data_buffer], &push)
     }
 
+    /// `dream-os`(2026-08-06、マイニング相当の実ハッシュ計算カーネルPoC)
+    /// 向けの汎用2バッファ+2xu32 push constantディスパッチ。
+    /// `sha256d_mine`: base_message(readonly)・digests(writeonly)の2バッファ、
+    /// nonce_base・countの2xu32 push constant、というsoftmaxと同型の契約。
+    fn ensure_sha256d_mine_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, u32, u32)> {
+        if args.len() != 4 {
+            bail!("sha256d_mine expects 4 args: base_message, digests, nonce_base, count");
+        }
+        let base = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 (base_message) must be pointer"))?;
+        let digests = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 (digests) must be pointer"))?;
+        let nonce_base = match &args[2] {
+            KernelArg::U32(v) => *v,
+            other => bail!("arg2 (nonce_base) must be U32, got {other:?}"),
+        };
+        let count = match &args[3] {
+            KernelArg::U32(v) => *v,
+            other => bail!("arg3 (count) must be U32, got {other:?}"),
+        };
+        let (base_buf, ..) = self.get_allocation(base)?;
+        let (digests_buf, ..) = self.get_allocation(digests)?;
+        Ok((base_buf, digests_buf, nonce_base, count))
+    }
+
+    fn run_sha256d_mine_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (base_buf, digests_buf, nonce_base, count) = self.ensure_sha256d_mine_args(args)?;
+        let mut push = Vec::with_capacity(8);
+        push.extend_from_slice(&nonce_base.to_ne_bytes());
+        push.extend_from_slice(&count.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[base_buf, digests_buf], &push)
+    }
+
     /// SPIR-Vコンピュートシェーダを起動する共通経路。
     ///
     /// `buffers` の各要素は set=0 の連番 binding (STORAGE_BUFFER) に束ねられ、
@@ -704,9 +735,10 @@ impl GpuDevice for VulkanDevice {
             "raid6_xor_parity" => self.run_raid6_xor_parity_spirv(spirv, &kernel.entry, cfg, args),
             "raid6_q_parity" => self.run_raid6_q_parity_spirv(spirv, &kernel.entry, cfg, args),
             "softmax" => self.run_softmax_spirv(spirv, &kernel.entry, cfg, args),
+            "sha256d_mine" => self.run_sha256d_mine_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
                 "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
-                 raid6_xor_parity, raid6_q_parity, and softmax; got `{other}`"
+                 raid6_xor_parity, raid6_q_parity, softmax, and sha256d_mine; got `{other}`"
             ),
         }
     }
