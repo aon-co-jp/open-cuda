@@ -435,6 +435,44 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[data_buffer, coeffs_buffer, parity_buffer], &push)
     }
 
+    /// `softmax` の引数契約を検証する(2026-08-06追記、CLAUDE.md HANDOFF
+    /// 2026-08-05「次にすべきこと(1) softmax専用のSPIR-Vカーネル」への着手)。
+    ///
+    /// `data`バッファは`rows x cols`の行優先レイアウトで、in-placeに
+    /// 行ごと(row-wise) softmaxへ書き換える。`vector_add`等と同じく
+    /// ポインタ1つ+usize2つの3引数契約。
+    fn ensure_softmax_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, u32, u32)> {
+        if args.len() != 3 {
+            bail!("softmax expects 3 args: data, rows, cols");
+        }
+        let data = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 (data) must be pointer"))?;
+        let rows = args[1].as_usize().ok_or_else(|| anyhow!("arg1 (rows) must be usize/u32"))?;
+        let cols = args[2].as_usize().ok_or_else(|| anyhow!("arg2 (cols) must be usize/u32"))?;
+
+        let (data_buf, _, _, data_len, _, _) = self.get_allocation(data)?;
+
+        let f32_size = std::mem::size_of::<f32>();
+        let data_bytes = rows
+            .checked_mul(cols)
+            .and_then(|v| v.checked_mul(f32_size))
+            .ok_or_else(|| anyhow!("softmax data byte size overflow"))?;
+        if data_bytes > data_len {
+            bail!("softmax data buffer too small: need {data_bytes} bytes, have {data_len}");
+        }
+
+        let rows_u32 = u32::try_from(rows).context("softmax rows does not fit in u32 push constant")?;
+        let cols_u32 = u32::try_from(cols).context("softmax cols does not fit in u32 push constant")?;
+        Ok((data_buf, rows_u32, cols_u32))
+    }
+
+    fn run_softmax_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (data_buffer, rows, cols) = self.ensure_softmax_args(args)?;
+        let mut push = Vec::with_capacity(8);
+        push.extend_from_slice(&rows.to_ne_bytes());
+        push.extend_from_slice(&cols.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[data_buffer], &push)
+    }
+
     /// SPIR-Vコンピュートシェーダを起動する共通経路。
     ///
     /// `buffers` の各要素は set=0 の連番 binding (STORAGE_BUFFER) に束ねられ、
@@ -665,9 +703,10 @@ impl GpuDevice for VulkanDevice {
             "matmul" | "matmul_f32" => self.run_matmul_spirv(spirv, &kernel.entry, cfg, args),
             "raid6_xor_parity" => self.run_raid6_xor_parity_spirv(spirv, &kernel.entry, cfg, args),
             "raid6_q_parity" => self.run_raid6_q_parity_spirv(spirv, &kernel.entry, cfg, args),
+            "softmax" => self.run_softmax_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
                 "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
-                 raid6_xor_parity, and raid6_q_parity; got `{other}`"
+                 raid6_xor_parity, raid6_q_parity, and softmax; got `{other}`"
             ),
         }
     }

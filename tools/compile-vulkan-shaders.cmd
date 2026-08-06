@@ -38,3 +38,10 @@ set OUT=%SHADER_DIR%\raid6_q_parity.spv
 glslc "%SRC%" -o "%OUT%"
 if errorlevel 1 exit /b %errorlevel%
 echo OK: compiled %SRC% -^> %OUT%
+
+set SHADER_DIR=%ROOT%\examples\softmax_vulkan_real\shaders
+set SRC=%SHADER_DIR%\softmax.comp
+set OUT=%SHADER_DIR%\softmax.spv
+glslc "%SRC%" -o "%OUT%"
+if errorlevel 1 exit /b %errorlevel%
+echo OK: compiled %SRC% -^> %OUT%
