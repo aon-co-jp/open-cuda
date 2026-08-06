@@ -521,6 +521,49 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[base_buf, digests_buf], &push)
     }
 
+    /// `dream-os`(2026-08-06、東芝Simulated Bifurcation Machineに
+    /// インスパイアされた量子アニーリング風組合せ最適化カーネルPoC)向け
+    /// の3バッファ+4x(u32/f32) push constantディスパッチ。
+    #[allow(clippy::type_complexity)]
+    fn ensure_sbm_ising_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer, u32, f32, f32, f32)> {
+        if args.len() != 7 {
+            bail!("sbm_ising expects 7 args: j_matrix, init_x, out_spins, steps, dt, c0, a0");
+        }
+        let j_matrix = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 (j_matrix) must be pointer"))?;
+        let init_x = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 (init_x) must be pointer"))?;
+        let out_spins = args[2].as_ptr().ok_or_else(|| anyhow!("arg2 (out_spins) must be pointer"))?;
+        let steps = match &args[3] {
+            KernelArg::U32(v) => *v,
+            other => bail!("arg3 (steps) must be U32, got {other:?}"),
+        };
+        let dt = match &args[4] {
+            KernelArg::F32(v) => *v,
+            other => bail!("arg4 (dt) must be F32, got {other:?}"),
+        };
+        let c0 = match &args[5] {
+            KernelArg::F32(v) => *v,
+            other => bail!("arg5 (c0) must be F32, got {other:?}"),
+        };
+        let a0 = match &args[6] {
+            KernelArg::F32(v) => *v,
+            other => bail!("arg6 (a0) must be F32, got {other:?}"),
+        };
+        let (j_buf, ..) = self.get_allocation(j_matrix)?;
+        let (init_buf, ..) = self.get_allocation(init_x)?;
+        let (out_buf, ..) = self.get_allocation(out_spins)?;
+        Ok((j_buf, init_buf, out_buf, steps, dt, c0, a0))
+    }
+
+    fn run_sbm_ising_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (j_buf, init_buf, out_buf, steps, dt, c0, a0) = self.ensure_sbm_ising_args(args)?;
+        let mut push = Vec::with_capacity(16);
+        push.extend_from_slice(&steps.to_ne_bytes());
+        push.extend_from_slice(&dt.to_ne_bytes());
+        push.extend_from_slice(&c0.to_ne_bytes());
+        push.extend_from_slice(&a0.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[j_buf, init_buf, out_buf], &push)
+    }
+
     /// SPIR-Vコンピュートシェーダを起動する共通経路。
     ///
     /// `buffers` の各要素は set=0 の連番 binding (STORAGE_BUFFER) に束ねられ、
@@ -753,9 +796,10 @@ impl GpuDevice for VulkanDevice {
             "raid6_q_parity" => self.run_raid6_q_parity_spirv(spirv, &kernel.entry, cfg, args),
             "softmax" => self.run_softmax_spirv(spirv, &kernel.entry, cfg, args),
             "sha256d_mine" => self.run_sha256d_mine_spirv(spirv, &kernel.entry, cfg, args),
+            "sbm_ising" => self.run_sbm_ising_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
                 "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
-                 raid6_xor_parity, raid6_q_parity, softmax, and sha256d_mine; got `{other}`"
+                 raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, and sbm_ising; got `{other}`"
             ),
         }
     }
