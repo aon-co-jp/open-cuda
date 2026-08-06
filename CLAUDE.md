@@ -225,6 +225,87 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-06(続き2) softmax専用SPIR-Vカーネルを`scaled_dot_product_attention`
+  経路へ実配線し、「GPU GEMM + CPU softmax」から「GPU GEMM + GPU softmax」へ
+  移行・実機検証完了(直上エントリ「次にすべきこと(1)」への対応、
+  `aruaru-llm`側セッションから継続して着手、ユーザー指示「aruaru-llm連携性
+  向上」)**:
+  1. **実装**: `opencuda-blas::scaled_dot_product_attention_with_spirv_and_
+     softmax(device, q, k, v, seq_len, head_dim, matmul_spirv, softmax_spirv)`
+     を新設。`matmul_spirv`・`softmax_spirv`の両方が`Some`かつ
+     `select_gemm_path`が`GemmPath::VulkanGeneric`を選ぶ場合のみ、QKᵀ・
+     行ごとのsoftmax(`softmax_vulkan_generic`経由)・P·Vの**すべてを実際に
+     Vulkanデバイス上でディスパッチする**。片方でも`None`/CPU経路の場合は
+     softmaxも含めて従来通りホスト側CPU(rayon並列)にフォールバックする
+     (GEMM経路とsoftmax経路を常に一致させる設計、H2D/D2H往復が中途半端に
+     増えるだけの構成を避けるため)。既存の`scaled_dot_product_attention_
+     with_spirv`(GEMMのみSPIR-V対応)は`softmax_spirv=None`固定で新関数を
+     呼ぶ薄いラッパーへ変更し、後方互換を維持した(既存呼び出し元は
+     無改修)。
+  2. **`open-cuda-llm::GptModel`・`open-cuda-bert::BertModel`双方に
+     `set_softmax_spirv`を追加**: `set_matmul_spirv`と同じ設計パターン
+     (`Arc<Vec<u8>>`を保持し`forward_step`/`forward_prefill`/
+     `EncoderLayer::forward`経由で伝播)。`DecoderLayer::forward_step`/
+     `forward_prefill`・`EncoderLayer::forward`のシグネチャに
+     `softmax_spirv: Option<&[u8]>`引数を追加し、Attention呼び出し箇所を
+     新関数`scaled_dot_product_attention_with_spirv_and_softmax`へ切り替えた。
+  3. **実機検証(型チェックのみで完了と報告しない方針を徹底、NVIDIA
+     GeForce GT 730)**:
+     - `opencuda-blas`新規テスト
+       `scaled_dot_product_attention_with_spirv_and_softmax_matches_cpu_
+       on_real_hardware`が、matmul.spv・softmax.spv両方を実Vulkanデバイスへ
+       渡し、CPU版(`GemmPath::CpuNaive`)と誤差1e-3以内で一致することを確認。
+     - **本命**: `open-cuda-llm`新規テスト
+       `generate_end_to_end_matches_cpu_on_real_vulkan_hardware_after_set_
+       matmul_and_softmax_spirv`が、`set_matmul_spirv`+`set_softmax_spirv`
+       両方を配線したモデルで`generate()`を実Vulkanデバイス上で実行し、
+       CPU実行と生成トークン列が完全一致(byte-identical)することを確認
+       (`cargo test -p open-cuda-llm --release generate_end_to_end --
+       --nocapture` → 2テストとも`ok`)。
+     - `aruaru-llm`側(`--features real-vulkan`)で実際にサーバーを起動し
+       (`RUST_LOG=info`)、起動ログで`generation`/`scoring`双方について
+       `loaded matmul.spv (2732 bytes) ... via set_matmul_spirv`・
+       `loaded softmax.spv (4680 bytes) ... via set_softmax_spirv`の両方が
+       記録されることを確認。実際に`POST /v1/generate`
+       (`{"prompt":"The quick brown fox","max_new_tokens":5}`)へHTTP
+       リクエストを送り、`"es are a great way"`(CPU版の既知の継続文
+       `"es are a great way to get a little bit of a"`の先頭一致)・
+       `"engine":"gpt2-greedy-decode-v0-open-cuda-llm-vulkan"`(`-vulkan`
+       接尾辞、実際にVulkan経由で動いたことをエンジンラベルからも確認)
+       という正しい応答を得た。
+  4. **検証**: `cargo build --workspace --release`警告0件・成功。
+     `cargo test --workspace --release`**全クレートregression無し**
+     (`opencuda-blas`25件・`open-cuda-llm`13件〈うち1件ignore〉・
+     `open-cuda-bert`2件、他は既存通り、全て`test result: ok`)。
+     `cargo clippy -p opencuda-blas -p open-cuda-llm --all-targets
+     --release -- -D warnings`(および`cargo clippy --workspace
+     --all-targets --release`)**警告0件**。`aruaru-llm`側も
+     `cargo test --release`/`cargo test --release --features
+     real-vulkan`いずれも既存46件全green(regression無し)。
+  5. **正直な開示・性能**: `POST /v1/generate`(`max_new_tokens=5`)の
+     実測所要時間は**約35.9秒**——CPU版(既存記録: 20トークンで約6〜7秒)
+     と比較して大幅に遅い。これは2026-07-26 HANDOFFで示した「1トークン
+     デコードは`seq_len=1`のGEMM/softmaxが極めて軽く、Vulkanの
+     ディスパッチ固定オーバーヘッド(コマンドバッファ記録・
+     `vkQueueSubmit`・フェンス待機)がGPU計算時間より支配的になり、
+     CPU実行より遅くなりうる」という設計上の懸念が、今回**softmax専用
+     カーネルの追加ディスパッチ(レイヤーあたりQKᵀ・softmax・P·Vの3回、
+     従来のGEMMのみ版の1.5倍のディスパッチ回数)によりさらに悪化する形で
+     実測された**——「正しく動く」ことは実証できたが「速くなる」ことは
+     実証していない、誇張しない結論として記録する。
+  - 次にすべきこと: (1) デコード側(`forward_step`、`seq_len=1`)への
+    Vulkanディスパッチはオーバーヘッドが支配的で実用上不利なことが
+    改めて確認されたため、プリフィル(`forward_prefill`、`seq_len>1`の
+    バッチGEMM)側でのみVulkan経路を使い、デコード側はCPU固定にする
+    「経路ごとの使い分け」の設計を検討する価値がある(現状は
+    `set_matmul_spirv`/`set_softmax_spirv`を呼べばプリフィル・デコード
+    両方が一律Vulkan経由になる)、(2) 真にGPU常駐率を上げるには
+    Attention全体を1回のディスパッチにまとめる融合(fused)カーネルが
+    必要で、これは今回のような複数カーネルの直列呼び出しでは原理的に
+    解消できない(ディスパッチ回数そのものを減らす設計が必要)、(3)
+    `flash_attention`(タイル化+オンラインsoftmax)側は依然ホスト側CPU
+    実装のまま未着手。
+
 - **2026-08-05(続き) SPIR-V版Attention(GPU GEMM + CPU softmaxハイブリッド)を
   実装し、`GptModel::generate()`が実Vulkanハードウェア上で最後まで完走する
   ことをエンドツーエンド検証(直下エントリ「次にすべきこと(1)」への対応)**:

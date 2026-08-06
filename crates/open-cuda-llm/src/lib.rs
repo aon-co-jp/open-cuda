@@ -312,7 +312,15 @@ impl DecoderLayer {
     /// (causalマスクは「まだキャッシュに存在しない未来のトークンは
     /// そもそも追加されていない」ことで自然に実現される、明示的な
     /// マスク行列は不要)。pre-LN(GPT-2方式、上記構造体docコメント参照)。
-    fn forward_step(&self, device: &dyn GpuDevice, hidden: &[f32], cache: &mut [KvCacheHead], hidden_size: usize, num_heads: usize) -> Result<Vec<f32>> {
+    fn forward_step(
+        &self,
+        device: &dyn GpuDevice,
+        hidden: &[f32],
+        cache: &mut [KvCacheHead],
+        hidden_size: usize,
+        num_heads: usize,
+        softmax_spirv: Option<&[u8]>,
+    ) -> Result<Vec<f32>> {
         let head_dim = hidden_size / num_heads;
 
         let mut normed = hidden.to_vec();
@@ -343,7 +351,16 @@ impl DecoderLayer {
                 row.copy_from_slice(q_h);
             }
             let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
-            let out = opencuda_blas::scaled_dot_product_attention_with_spirv(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim, spirv)?;
+            let out = opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
+                device,
+                &q_full,
+                &cache_head.k,
+                &cache_head.v,
+                n,
+                head_dim,
+                spirv,
+                softmax_spirv,
+            )?;
             context[col_start..col_start + head_dim].copy_from_slice(&out[0..head_dim]);
         }
 
@@ -391,7 +408,17 @@ impl DecoderLayer {
     /// 「挙動を変えない最適化」であり、`forward_step`をprompt長ぶん
     /// ループした場合とビット完全に一致する(open-cuda-llm側テスト
     /// `prefill_batch_matches_sequential_forward_step`で検証)。
-    fn forward_prefill(&self, device: &dyn GpuDevice, hidden_batch: &[f32], seq_len: usize, caches: &mut [KvCacheHead], hidden_size: usize, num_heads: usize) -> Result<Vec<f32>> {
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill(
+        &self,
+        device: &dyn GpuDevice,
+        hidden_batch: &[f32],
+        seq_len: usize,
+        caches: &mut [KvCacheHead],
+        hidden_size: usize,
+        num_heads: usize,
+        softmax_spirv: Option<&[u8]>,
+    ) -> Result<Vec<f32>> {
         let head_dim = hidden_size / num_heads;
         debug_assert_eq!(hidden_batch.len(), seq_len * hidden_size);
 
@@ -422,7 +449,16 @@ impl DecoderLayer {
                     q_full_row.copy_from_slice(q_h);
                 }
                 let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
-                let out = opencuda_blas::scaled_dot_product_attention_with_spirv(device, &q_full, &cache_head.k, &cache_head.v, n, head_dim, spirv)?;
+                let out = opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
+                    device,
+                    &q_full,
+                    &cache_head.k,
+                    &cache_head.v,
+                    n,
+                    head_dim,
+                    spirv,
+                    softmax_spirv,
+                )?;
                 context[row * hidden_size + col_start..row * hidden_size + col_start + head_dim].copy_from_slice(&out[0..head_dim]);
             }
         }
@@ -480,6 +516,14 @@ pub struct GptModel {
     layers: Vec<DecoderLayer>,
     final_ln: LayerNorm,
     lm_head: Linear,
+    /// コンパイル済み`softmax.spv`(`opencuda_blas::softmax_vulkan_generic`が
+    /// 期待するのと同じシェーダバイト列)。2026-08-06新設、
+    /// [`set_softmax_spirv`](Self::set_softmax_spirv)経由で配線される。
+    /// `None`のまま(既定)なら、`spirv_matmul`が配線済みでAttentionの
+    /// GEMM自体はVulkan経由になっていても、softmaxステップは従来通り
+    /// ホスト側CPU(rayon並列)のまま(`scaled_dot_product_attention_
+    /// with_spirv_and_softmax`の後方互換フォールバック規約通り)。
+    softmax_spirv: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl GptModel {
@@ -499,7 +543,7 @@ impl GptModel {
             .collect();
         let final_ln = LayerNorm::identity(hidden, config.layer_norm_eps);
         let lm_head = Linear::random(&mut rng, hidden, config.vocab_size);
-        Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head }
+        Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None }
     }
 
     /// `dir`配下の`config.json`・`model.safetensors`(Hugging Face GPT-2形式、
@@ -583,7 +627,7 @@ impl GptModel {
             spirv_matmul: None,
         };
 
-        Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head })
+        Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None })
     }
 
     /// コンパイル済み`matmul.spv`(`opencuda_blas::sgemm_vulkan_generic`が
@@ -594,15 +638,16 @@ impl GptModel {
     /// 使う場合はこれを呼んでから`generate`すること——呼ばなければ
     /// `sgemm`は`GemmPath::CpuNaive`(既存の既定挙動)のまま動く。
     ///
-    /// **正直な開示**: これは`Linear::forward`が`sgemm`へ`spirv`バイト列を
-    /// 渡さず`GemmPath::VulkanGeneric`が常に失敗していた実バグ
-    /// (`CLAUDE.md`2026-08-04 HANDOFF参照)への配線修正であり、
+    /// **2026-08-05当時の開示(現在は解消済み)**: 当初はこの関数だけでは
     /// Attention計算(`opencuda_blas::scaled_dot_product_attention`が
     /// 内部で使う`launch_naive_gemm`経由のRustクロージャカーネル)側の
     /// 別のギャップ(`VulkanDevice::launch_kernel`が`KernelSource::SpirV`
-    /// 以外を受け付けないため、SPIR-V版のattentionカーネルが無いと
-    /// Attention自体は依然Vulkanデバイス上で失敗する)は解消していない
-    /// ——GEMM(Linear層)側のVulkanGeneric経路のみを修正対象とする。
+    /// 以外を受け付けない)によりAttention自体がVulkanデバイス上で失敗
+    /// していたが、`opencuda_blas::scaled_dot_product_attention_with_spirv`
+    /// (2026-08-05、`open-cuda`側`CLAUDE.md`参照)の追加によりGEMM
+    /// (QKᵀ・P·V)はVulkanディスパッチ可能になった。softmaxステップを
+    /// GPU常駐にするには、別途[`set_softmax_spirv`](Self::set_softmax_spirv)
+    /// を呼ぶこと(2026-08-06追加)。
     pub fn set_matmul_spirv(&mut self, spirv: Vec<u8>) {
         let spirv = std::sync::Arc::new(spirv);
         for layer in &mut self.layers {
@@ -612,6 +657,20 @@ impl GptModel {
             layer.output.spirv_matmul = Some(spirv.clone());
         }
         self.lm_head.spirv_matmul = Some(spirv);
+    }
+
+    /// コンパイル済み`softmax.spv`(`opencuda_blas::softmax_vulkan_generic`
+    /// が期待するのと同じシェーダバイト列)を配線する(2026-08-06新設)。
+    /// [`set_matmul_spirv`](Self::set_matmul_spirv)と併用することで、
+    /// Attention計算のQKᵀ・softmax・P·Vのすべてが実Vulkanデバイス上で
+    /// ディスパッチされる(「GPU GEMM + CPU softmax」のハイブリッドから
+    /// 「GPU GEMM + GPU softmax」への移行)。`set_matmul_spirv`を呼ばずに
+    /// これだけ呼んでも、GEMM側が`GemmPath::VulkanGeneric`を選ばない
+    /// 限りsoftmaxもCPUのままとなる(`opencuda_blas::scaled_dot_
+    /// product_attention_with_spirv_and_softmax`の設計、GEMM経路と
+    /// softmax経路を常に一致させる方針)。
+    pub fn set_softmax_spirv(&mut self, spirv: Vec<u8>) {
+        self.softmax_spirv = Some(std::sync::Arc::new(spirv));
     }
 
     /// 新規のKVキャッシュ集合(レイヤー数 x ヘッド数)を作る。
@@ -630,8 +689,9 @@ impl GptModel {
         let pos_row = &self.position_embeddings[pos * hidden_size..(pos + 1) * hidden_size];
         let mut hidden: Vec<f32> = word_row.iter().zip(pos_row.iter()).map(|(w, p)| w + p).collect();
 
+        let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = layer.forward_step(device, &hidden, cache, hidden_size, self.config.num_heads)?;
+            hidden = layer.forward_step(device, &hidden, cache, hidden_size, self.config.num_heads, softmax_spirv)?;
         }
 
         self.final_ln.forward(&mut hidden, 1, hidden_size);
@@ -658,8 +718,9 @@ impl GptModel {
             }
         }
 
+        let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden_batch = layer.forward_prefill(device, &hidden_batch, seq_len, cache, hidden_size, self.config.num_heads)?;
+            hidden_batch = layer.forward_prefill(device, &hidden_batch, seq_len, cache, hidden_size, self.config.num_heads, softmax_spirv)?;
         }
 
         // 最終位置のみLayerNorm+lm_headを適用すれば十分(`generate`が
@@ -1204,6 +1265,67 @@ mod tests {
         let vulkan_out = vulkan_model.generate(&vulkan_device, &prompt, 6).unwrap();
 
         assert_eq!(cpu_out, vulkan_out, "CPU and Vulkan generation should produce byte-identical token sequences for the same seed/prompt");
+    }
+
+    /// **2026-08-06新設**: `set_matmul_spirv`に加えて`set_softmax_spirv`も
+    /// 呼んだ場合(「GPU GEMM + GPU softmax」経路)でも、`generate()`が
+    /// 実Vulkanハードウェア上で最後まで完走し、CPU実行と生成トークン列が
+    /// 完全一致することを確認する(直上テストの「GPU GEMM + CPU softmax」
+    /// 版に対応するGPU常駐softmax版)。
+    #[test]
+    fn generate_end_to_end_matches_cpu_on_real_vulkan_hardware_after_set_matmul_and_softmax_spirv() {
+        let matmul_spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let matmul_spirv = match std::fs::read(&matmul_spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping generate_end_to_end (matmul+softmax) test: matmul.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    matmul_spirv_path.display()
+                );
+                return;
+            }
+        };
+        let softmax_spirv_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/softmax_vulkan_real/shaders/softmax.spv");
+        let softmax_spirv = match std::fs::read(&softmax_spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping generate_end_to_end (matmul+softmax) test: softmax.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    softmax_spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping generate_end_to_end (matmul+softmax) test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        let vulkan_device: std::sync::Arc<dyn GpuDevice> = vulkan_device;
+        let cpu_device: std::sync::Arc<dyn GpuDevice> = opencuda_cpu::CpuDevice::new(0);
+
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let prompt = ByteTokenizer::encode("hi");
+
+        let cpu_model = GptModel::load_random(config.clone(), 42);
+        let cpu_out = cpu_model.generate(&cpu_device, &prompt, 6).unwrap();
+
+        let mut vulkan_model = GptModel::load_random(config, 42);
+        vulkan_model.set_matmul_spirv(matmul_spirv);
+        vulkan_model.set_softmax_spirv(softmax_spirv);
+        let vulkan_out = vulkan_model.generate(&vulkan_device, &prompt, 6).unwrap();
+
+        assert_eq!(
+            cpu_out, vulkan_out,
+            "CPU and Vulkan(GPU GEMM + GPU softmax) generation should produce byte-identical token sequences for the same seed/prompt"
+        );
     }
 }
 
