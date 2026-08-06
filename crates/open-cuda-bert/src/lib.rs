@@ -124,7 +124,16 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn forward(&self, device: &dyn GpuDevice, hidden: &[f32], seq_len: usize, hidden_size: usize, num_heads: usize) -> Result<Vec<f32>> {
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        device: &dyn GpuDevice,
+        hidden: &[f32],
+        seq_len: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        softmax_spirv: Option<&[u8]>,
+    ) -> Result<Vec<f32>> {
         let head_dim = hidden_size / num_heads;
 
         let q = self.query.forward(device, hidden, seq_len)?;
@@ -148,7 +157,9 @@ impl EncoderLayer {
             let k_h = extract_head(&k);
             let v_h = extract_head(&v);
             let spirv = self.query.spirv_matmul.as_deref().map(|v| v.as_slice());
-            let out_h = opencuda_blas::scaled_dot_product_attention_with_spirv(device, &q_h, &k_h, &v_h, seq_len, head_dim, spirv)?;
+            let out_h = opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
+                device, &q_h, &k_h, &v_h, seq_len, head_dim, spirv, softmax_spirv,
+            )?;
             for row in 0..seq_len {
                 context[row * hidden_size + col_start..row * hidden_size + col_start + head_dim]
                     .copy_from_slice(&out_h[row * head_dim..(row + 1) * head_dim]);
@@ -181,6 +192,10 @@ pub struct BertModel {
     token_type_embeddings: Vec<f32>,
     emb_ln: LayerNorm,
     layers: Vec<EncoderLayer>,
+    /// コンパイル済み`softmax.spv`。2026-08-06新設、`open-cuda-llm::
+    /// GptModel::softmax_spirv`と同じパターン([`set_softmax_spirv`]
+    /// (Self::set_softmax_spirv)経由で配線)。
+    softmax_spirv: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 fn tensor_f32(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>> {
@@ -258,6 +273,14 @@ impl BertModel {
         }
     }
 
+    /// `open-cuda-llm::GptModel::set_softmax_spirv`と同じパターン
+    /// (2026-08-06新設): コンパイル済み`softmax.spv`を配線する。
+    /// `set_matmul_spirv`と併用することで、Attention計算のQKᵀ・softmax・
+    /// P·Vのすべてが実Vulkanデバイス上でディスパッチされる。
+    pub fn set_softmax_spirv(&mut self, spirv: Vec<u8>) {
+        self.softmax_spirv = Some(std::sync::Arc::new(spirv));
+    }
+
     /// `dir`配下の`config.json`・`model.safetensors`を読み込む。
     pub fn load(dir: &Path) -> Result<Self> {
         let config_json = std::fs::read_to_string(dir.join("config.json"))
@@ -289,7 +312,7 @@ impl BertModel {
             });
         }
 
-        Ok(Self { config, word_embeddings, position_embeddings, token_type_embeddings, emb_ln, layers })
+        Ok(Self { config, word_embeddings, position_embeddings, token_type_embeddings, emb_ln, layers, softmax_spirv: None })
     }
 
     /// トークンID列(単一シーケンス、パディング無し)から文埋め込みを計算する。
@@ -318,8 +341,9 @@ impl BertModel {
         self.emb_ln.forward(&mut hidden, seq_len, hidden_size);
 
         let device_ref = device.as_ref();
+        let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
         for layer in &self.layers {
-            hidden = layer.forward(device_ref, &hidden, seq_len, hidden_size, self.config.num_attention_heads)?;
+            hidden = layer.forward(device_ref, &hidden, seq_len, hidden_size, self.config.num_attention_heads, softmax_spirv)?;
         }
 
         // 平均プーリング(パディング無し前提のため全トークンを対象)。
