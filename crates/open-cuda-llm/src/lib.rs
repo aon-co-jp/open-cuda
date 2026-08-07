@@ -293,6 +293,11 @@ struct DecoderLayer {
     ln_2: LayerNorm,
     intermediate: Linear,
     output: Linear,
+    /// **2026-08-07新設**: [`GptModel::enable_mla_kv_compression`]配線先。
+    /// ヘッドごとのMLA低ランク射影(`opencuda_blas::mla_compress_kv`/
+    /// `mla_decompress_kv`土台)、`None`(既定)なら従来通りKVキャッシュを
+    /// フル精度のまま保持する(後方互換、既存テストへの影響ゼロ)。
+    mla: Option<Vec<MlaHeadProjection>>,
 }
 
 impl DecoderLayer {
@@ -304,6 +309,7 @@ impl DecoderLayer {
             ln_2: LayerNorm::identity(hidden, eps),
             intermediate: Linear::random(rng, hidden, intermediate),
             output: Linear::random(rng, intermediate, hidden),
+            mla: None,
         }
     }
 
@@ -341,8 +347,11 @@ impl DecoderLayer {
             let k_h = &k[col_start..col_start + head_dim];
             let v_h = &v[col_start..col_start + head_dim];
 
-            cache_head.push(k_h, v_h);
+            let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
+            let proj = self.mla.as_ref().map(|v| &v[h]);
+            cache_head.push(device, k_h, v_h, proj, spirv)?;
             let n = cache_head.n;
+            let (k_all, v_all) = cache_head.current_kv(device, head_dim, proj, spirv)?;
 
             // qを n 回複製して n x n の attention を計算し、先頭行(全行
             // 同一)だけを使う(モジュールdocコメント参照、素朴だが正しい)。
@@ -350,12 +359,11 @@ impl DecoderLayer {
             for row in q_full.chunks_exact_mut(head_dim) {
                 row.copy_from_slice(q_h);
             }
-            let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
             let out = opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
                 device,
                 &q_full,
-                &cache_head.k,
-                &cache_head.v,
+                &k_all,
+                &v_all,
                 n,
                 head_dim,
                 spirv,
@@ -441,19 +449,21 @@ impl DecoderLayer {
                 let k_h = &k_row[col_start..col_start + head_dim];
                 let v_h = &v_row[col_start..col_start + head_dim];
 
-                cache_head.push(k_h, v_h);
+                let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
+                let proj = self.mla.as_ref().map(|v| &v[h]);
+                cache_head.push(device, k_h, v_h, proj, spirv)?;
                 let n = cache_head.n;
+                let (k_all, v_all) = cache_head.current_kv(device, head_dim, proj, spirv)?;
 
                 let mut q_full = vec![0.0f32; n * head_dim];
                 for q_full_row in q_full.chunks_exact_mut(head_dim) {
                     q_full_row.copy_from_slice(q_h);
                 }
-                let spirv = self.qkv.spirv_matmul.as_deref().map(|v| v.as_slice());
                 let out = opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
                     device,
                     &q_full,
-                    &cache_head.k,
-                    &cache_head.v,
+                    &k_all,
+                    &v_all,
                     n,
                     head_dim,
                     spirv,
@@ -488,22 +498,77 @@ impl DecoderLayer {
     }
 }
 
+/// **2026-08-07新設**: [`opencuda_blas::mla_compress_kv`]/`mla_decompress_kv`を
+/// ヘッド単位で使うための射影行列一式(DeepSeek-V3のMLA構想と同じ
+/// down-projection/up-projectionのペア)。[`GptModel::enable_mla_kv_compression`]
+/// が乱数初期化する——実運用の学習済み重みではない点は`opencuda-blas`側の
+/// 既存の開示と同じ(このクレートでの「配線」は、計算経路が正しく
+/// KVキャッシュ経路まで繋がることの実証が目的)。
+struct MlaHeadProjection {
+    /// `head_dim x d_c`。
+    down_proj: Vec<f32>,
+    /// `d_c x head_dim`。
+    up_proj: Vec<f32>,
+    d_c: usize,
+}
+
 /// ヘッド単位のKVキャッシュ(`DecoderLayer::forward_step`内で使用)。
+///
+/// **2026-08-07変更**: [`MlaHeadProjection`]が渡された場合、フル精度の
+/// `k`/`v`ではなく、低ランク射影された潜在表現(`k_latent`/`v_latent`、
+/// `d_c`次元)のみを保持する(実際のメモリ削減の配線——
+/// `opencuda-blas::mla_compress_kv`/`mla_decompress_kv`が単体の部品として
+/// 存在するだけだった状態を、KVキャッシュの実経路まで繋いだ)。
+/// `None`(既定)の場合は従来通りフル精度のまま`k`/`v`に積む
+/// (後方互換、既存の数値一致テストへの影響ゼロ)。
 struct KvCacheHead {
     k: Vec<f32>,
     v: Vec<f32>,
+    k_latent: Vec<f32>,
+    v_latent: Vec<f32>,
     n: usize,
 }
 
 impl KvCacheHead {
     fn empty() -> Self {
-        Self { k: Vec::new(), v: Vec::new(), n: 0 }
+        Self { k: Vec::new(), v: Vec::new(), k_latent: Vec::new(), v_latent: Vec::new(), n: 0 }
     }
 
-    fn push(&mut self, k_row: &[f32], v_row: &[f32]) {
-        self.k.extend_from_slice(k_row);
-        self.v.extend_from_slice(v_row);
+    /// 1トークンぶん(`head_dim`長)のk/vをキャッシュへ追加する。
+    /// `proj`が`Some`なら、フル精度のまま保持せず`mla_compress_kv`で
+    /// `d_c`次元へ圧縮してから保存する(`spirv`は`sgemm`のVulkan経路用、
+    /// 既存の`Linear::forward`呼び出しと同じ規約)。
+    fn push(&mut self, device: &dyn GpuDevice, k_row: &[f32], v_row: &[f32], proj: Option<&MlaHeadProjection>, spirv: Option<&[u8]>) -> Result<()> {
+        match proj {
+            Some(p) => {
+                let head_dim = k_row.len();
+                let k_lat = opencuda_blas::mla_compress_kv(device, 1, head_dim, p.d_c, k_row, &p.down_proj, spirv)?;
+                let v_lat = opencuda_blas::mla_compress_kv(device, 1, head_dim, p.d_c, v_row, &p.down_proj, spirv)?;
+                self.k_latent.extend_from_slice(&k_lat);
+                self.v_latent.extend_from_slice(&v_lat);
+            }
+            None => {
+                self.k.extend_from_slice(k_row);
+                self.v.extend_from_slice(v_row);
+            }
+        }
         self.n += 1;
+        Ok(())
+    }
+
+    /// これまでキャッシュした`n x head_dim`のk/vを返す。`proj`が`Some`の
+    /// 場合は潜在表現から`mla_decompress_kv`で復元する(学習済み重みを
+    /// 使わない限り元のk/vとは一致しない点は`opencuda-blas`側の開示通り、
+    /// このクレートはあくまで「復元してAttentionへ渡す」経路の配線を担う)。
+    fn current_kv(&self, device: &dyn GpuDevice, head_dim: usize, proj: Option<&MlaHeadProjection>, spirv: Option<&[u8]>) -> Result<(Vec<f32>, Vec<f32>)> {
+        match proj {
+            Some(p) => {
+                let k = opencuda_blas::mla_decompress_kv(device, self.n, p.d_c, head_dim, &self.k_latent, &p.up_proj, spirv)?;
+                let v = opencuda_blas::mla_decompress_kv(device, self.n, p.d_c, head_dim, &self.v_latent, &p.up_proj, spirv)?;
+                Ok((k, v))
+            }
+            None => Ok((self.k.clone(), self.v.clone())),
+        }
     }
 }
 
@@ -615,6 +680,7 @@ impl GptModel {
                 ln_2: load_layer_norm(&tensors, &format!("{p}.ln_2"), config.layer_norm_eps)?,
                 intermediate: load_conv1d(&tensors, &format!("{p}.mlp.c_fc"), hidden, config.intermediate_size)?,
                 output: load_conv1d(&tensors, &format!("{p}.mlp.c_proj"), config.intermediate_size, hidden)?,
+                mla: None,
             });
         }
 
@@ -671,6 +737,48 @@ impl GptModel {
     /// softmax経路を常に一致させる方針)。
     pub fn set_softmax_spirv(&mut self, spirv: Vec<u8>) {
         self.softmax_spirv = Some(std::sync::Arc::new(spirv));
+    }
+
+    /// **2026-08-07新設**: DeepSeek-V3のMLA(Multi-Head Latent Attention)に
+    /// インスパイアされた低ランクKVキャッシュ圧縮(`opencuda_blas::
+    /// mla_compress_kv`/`mla_decompress_kv`、2026-08-06追加)を、このモデルの
+    /// 実際のKVキャッシュ経路(`forward_step`/`forward_prefill`が使う
+    /// `KvCacheHead`)へ配線する(前回HANDOFF「次にすべきこと(1)」への対応、
+    /// それまでは`opencuda-blas`単体の部品のまま呼び出し元が未接続だった)。
+    ///
+    /// `d_c`: ヘッドあたりの圧縮後次元(`head_dim`より小さい値を指定、
+    /// `opencuda_blas::mla_memory_reduction_percent(head_dim, d_c)`で削減率を
+    /// 事前に確認できる)。`seed`: 射影行列(`down_proj`/`up_proj`)の
+    /// 決定的な乱数初期化シード。
+    ///
+    /// **正直な開示**: `opencuda-blas`側のdocコメント通り、射影行列は
+    /// 学習済み重みではなく乱数初期化のため、圧縮・復元後のk/vは元の
+    /// 値と一致しない(情報の一部が失われる)。この関数が担保するのは
+    /// 「低ランク圧縮の計算経路が実際のKVキャッシュ・Attention計算まで
+    /// 正しく配線され、`generate`がエンドツーエンドで動作する」ことで
+    /// あり、生成品質の維持を主張するものではない——既に学習済みの
+    /// モデル(`load`で読み込んだ実重み)にこれを適用すると出力の質が
+    /// 劣化することが予想されるため、実運用では推奨しない
+    /// (将来、学習済みのMLA射影重みを読み込めるようになった場合に
+    /// 置き換えることを想定した土台)。
+    ///
+    /// `d_c >= head_dim`の場合はエラーを返す(圧縮になっていないため)。
+    pub fn enable_mla_kv_compression(&mut self, d_c: usize, seed: u64) -> Result<()> {
+        let head_dim = self.config.hidden_size / self.config.num_heads;
+        anyhow::ensure!(d_c > 0 && d_c < head_dim, "open-cuda-llm: enable_mla_kv_compression: d_c={d_c} must satisfy 0 < d_c < head_dim={head_dim}");
+
+        let mut rng = SplitMix64::new(seed);
+        for layer in &mut self.layers {
+            let projections = (0..self.config.num_heads)
+                .map(|_| MlaHeadProjection {
+                    down_proj: random_vec(&mut rng, head_dim * d_c, 0.02),
+                    up_proj: random_vec(&mut rng, d_c * head_dim, 0.02),
+                    d_c,
+                })
+                .collect();
+            layer.mla = Some(projections);
+        }
+        Ok(())
     }
 
     /// 新規のKVキャッシュ集合(レイヤー数 x ヘッド数)を作る。
@@ -847,6 +955,59 @@ mod tests {
         assert_eq!(generated.len(), 8);
         // decodeがpanicしないこと(語彙範囲外を混ぜても壊れない)も確認。
         let _ = ByteTokenizer::decode(&generated);
+    }
+
+    /// **2026-08-07新設**: `enable_mla_kv_compression`をKVキャッシュ経路
+    /// (`forward_step`/`forward_prefill`の両方、プリフィル+逐次デコード)へ
+    /// 実際に配線したことのE2E検証。前回HANDOFF「次にすべきこと(1)」への
+    /// 対応(それまでは`opencuda-blas::mla_compress_kv`/`mla_decompress_kv`が
+    /// 単体の部品として実装されているだけで、呼び出し元が未接続だった)。
+    #[test]
+    fn mla_kv_compression_enabled_model_generates_without_panicking() {
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE); // hidden=32, num_heads=4 => head_dim=8
+        let mut model = GptModel::load_random(config, 123);
+        model.enable_mla_kv_compression(2, 999).unwrap(); // head_dim=8 -> d_c=2 (75%削減)
+        let device = device();
+        let prompt = ByteTokenizer::encode("mla compression path");
+        let generated = model.generate(&device, &prompt, 6).unwrap();
+        assert_eq!(generated.len(), 6);
+    }
+
+    /// `d_c >= head_dim`は圧縮になっていないため拒否されることを確認。
+    #[test]
+    fn mla_kv_compression_rejects_non_reducing_d_c() {
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE); // head_dim=8
+        let mut model = GptModel::load_random(config, 1);
+        assert!(model.enable_mla_kv_compression(8, 1).is_err());
+        assert!(model.enable_mla_kv_compression(0, 1).is_err());
+    }
+
+    /// KVキャッシュ圧縮を有効にしたモデルと無効なモデルとで、同一プロンプト
+    /// に対する生成結果が(射影が乱数のため情報が失われ)実際に異なりうる
+    /// ことを確認する回帰テスト——「配線したが実は何も変わっていない
+    /// (常に同じ経路に落ちる)」という見逃しを防ぐ。乱数の組み合わせ次第で
+    /// 稀に一致する可能性はゼロではないため、複数シードで試して少なくとも
+    /// 1つは異なることを確認する(フレーキーさを避ける設計)。
+    #[test]
+    fn mla_kv_compression_actually_changes_generation_versus_uncompressed() {
+        let prompt = ByteTokenizer::encode("does compression change output");
+        let device = device();
+        let mut any_different = false;
+        for seed in [1u64, 2, 3, 4, 5] {
+            let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+            let baseline = GptModel::load_random(config.clone(), seed);
+            let out_baseline = baseline.generate(&device, &prompt, 6).unwrap();
+
+            let mut compressed = GptModel::load_random(config, seed);
+            compressed.enable_mla_kv_compression(2, seed).unwrap();
+            let out_compressed = compressed.generate(&device, &prompt, 6).unwrap();
+
+            if out_baseline != out_compressed {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "expected mla-compressed KV cache path to actually be exercised (output should differ from uncompressed baseline for at least one seed)");
     }
 
     #[test]
@@ -1326,6 +1487,46 @@ mod tests {
             cpu_out, vulkan_out,
             "CPU and Vulkan(GPU GEMM + GPU softmax) generation should produce byte-identical token sequences for the same seed/prompt"
         );
+    }
+
+    /// **2026-08-07新設**: `enable_mla_kv_compression`で配線したKVキャッシュ
+    /// 圧縮経路が、実Vulkanハードウェア(NVIDIA GT 730)上でも
+    /// `mla_compress_kv`/`mla_decompress_kv`のVulkan経路(`spirv`引数付き)を
+    /// 通してエラー無く最後まで完走することを確認する。`set_matmul_spirv`
+    /// (GEMM)経由でMLAの圧縮・復元用GEMMにも同じ`matmul.spv`が渡るため、
+    /// これが実Vulkanデバイス上でのMLA配線の実機検証にあたる(前回HANDOFF
+    /// 「次にすべきこと(1)」の最終検証)。CPU版とのトークン列一致は
+    /// 主張しない(射影行列が乱数のため、CPU/Vulkanどちらの経路でも
+    /// 情報の一部が失われる非可逆変換であり、両者が一致する保証は無い
+    /// ——実際に確認したいのは「実機で最後まで動くこと」)。
+    #[test]
+    fn mla_kv_compression_completes_on_real_vulkan_hardware() {
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("skipping mla_kv_compression_completes_on_real_vulkan_hardware: matmul.spv not compiled at {}: {e}", spirv_path.display());
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping mla_kv_compression_completes_on_real_vulkan_hardware: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        let vulkan_device: std::sync::Arc<dyn GpuDevice> = vulkan_device;
+
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE); // hidden=32, num_heads=4 => head_dim=8
+        let mut model = GptModel::load_random(config, 7);
+        model.set_matmul_spirv(spirv);
+        model.enable_mla_kv_compression(2, 42).unwrap(); // 75%削減
+
+        let prompt = ByteTokenizer::encode("mla on real vulkan hardware");
+        let generated = model.generate(&vulkan_device, &prompt, 6).unwrap();
+        assert_eq!(generated.len(), 6, "generate() should complete end-to-end through the compressed KV cache path on real Vulkan hardware");
     }
 }
 
