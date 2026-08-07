@@ -318,6 +318,7 @@ impl DecoderLayer {
     /// (causalマスクは「まだキャッシュに存在しない未来のトークンは
     /// そもそも追加されていない」ことで自然に実現される、明示的な
     /// マスク行列は不要)。pre-LN(GPT-2方式、上記構造体docコメント参照)。
+    #[allow(clippy::too_many_arguments)]
     fn forward_step(
         &self,
         device: &dyn GpuDevice,
@@ -326,6 +327,7 @@ impl DecoderLayer {
         hidden_size: usize,
         num_heads: usize,
         softmax_spirv: Option<&[u8]>,
+        flash_spirv: Option<(&[u8], usize)>,
     ) -> Result<Vec<f32>> {
         let head_dim = hidden_size / num_heads;
 
@@ -359,16 +361,30 @@ impl DecoderLayer {
             for row in q_full.chunks_exact_mut(head_dim) {
                 row.copy_from_slice(q_h);
             }
-            let out = opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
-                device,
-                &q_full,
-                &k_all,
-                &v_all,
-                n,
-                head_dim,
-                spirv,
-                softmax_spirv,
-            )?;
+            // **2026-08-07新設**: `flash_spirv`が配線済みなら、QKᵀ・softmax・
+            // P·Vを1回のディスパッチで完結する`flash_attention_with_spirv`
+            // (open-cuda側2026-08-07 HANDOFF「次にすべきこと(1)」対応)を使う。
+            // `q_full`/`k_all`/`v_all`はいずれもすでに`n*head_dim`長(先頭行
+            // 複製方式、モジュールdocコメント参照)で`flash_attention_with_
+            // spirv`の`seq_len=n`契約とそのまま一致するため、追加の変換は
+            // 不要。未配線(`None`、既定)の場合は従来通り
+            // `scaled_dot_product_attention_with_spirv_and_softmax`
+            // (GEMM+softmaxを別々にディスパッチする経路)にフォールバックする
+            // (後方互換、既存呼び出し元・テストへの影響なし)。
+            let out = if let Some((flash_bytes, block_size)) = flash_spirv {
+                opencuda_blas::flash_attention_with_spirv(device, &q_full, &k_all, &v_all, n, head_dim, block_size, flash_bytes)?
+            } else {
+                opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
+                    device,
+                    &q_full,
+                    &k_all,
+                    &v_all,
+                    n,
+                    head_dim,
+                    spirv,
+                    softmax_spirv,
+                )?
+            };
             context[col_start..col_start + head_dim].copy_from_slice(&out[0..head_dim]);
         }
 
@@ -426,6 +442,7 @@ impl DecoderLayer {
         hidden_size: usize,
         num_heads: usize,
         softmax_spirv: Option<&[u8]>,
+        flash_spirv: Option<(&[u8], usize)>,
     ) -> Result<Vec<f32>> {
         let head_dim = hidden_size / num_heads;
         debug_assert_eq!(hidden_batch.len(), seq_len * hidden_size);
@@ -459,16 +476,22 @@ impl DecoderLayer {
                 for q_full_row in q_full.chunks_exact_mut(head_dim) {
                     q_full_row.copy_from_slice(q_h);
                 }
-                let out = opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
-                    device,
-                    &q_full,
-                    &k_all,
-                    &v_all,
-                    n,
-                    head_dim,
-                    spirv,
-                    softmax_spirv,
-                )?;
+                // 上記`forward_step`と同じ理由(2026-08-07新設)でflash_spirv
+                // 優先の分岐にする。
+                let out = if let Some((flash_bytes, block_size)) = flash_spirv {
+                    opencuda_blas::flash_attention_with_spirv(device, &q_full, &k_all, &v_all, n, head_dim, block_size, flash_bytes)?
+                } else {
+                    opencuda_blas::scaled_dot_product_attention_with_spirv_and_softmax(
+                        device,
+                        &q_full,
+                        &k_all,
+                        &v_all,
+                        n,
+                        head_dim,
+                        spirv,
+                        softmax_spirv,
+                    )?
+                };
                 context[row * hidden_size + col_start..row * hidden_size + col_start + head_dim].copy_from_slice(&out[0..head_dim]);
             }
         }
@@ -589,6 +612,17 @@ pub struct GptModel {
     /// ホスト側CPU(rayon並列)のまま(`scaled_dot_product_attention_
     /// with_spirv_and_softmax`の後方互換フォールバック規約通り)。
     softmax_spirv: Option<std::sync::Arc<Vec<u8>>>,
+    /// コンパイル済み`flash_attention.spv`+ディスパッチ時の`block_size`
+    /// (`opencuda_blas::flash_attention_with_spirv`が期待するのと同じ
+    /// シェーダバイト列)。2026-08-07新設、
+    /// [`set_flash_attention_spirv`](Self::set_flash_attention_spirv)経由で
+    /// 配線される。`Some`の場合、Attention計算は`softmax_spirv`経由の
+    /// 「GEMM+softmaxを別々にディスパッチ」する経路より優先され、QKᵀ・
+    /// softmax・P·Vを1回のディスパッチで完結するfused flash attention
+    /// カーネルを使う(レイヤーあたりのAttentionディスパッチ回数が3回から
+    /// 1回へ削減される)。`None`のまま(既定)なら従来通り
+    /// `softmax_spirv`配線の有無に応じた経路のまま(後方互換)。
+    flash_attn_spirv: Option<(std::sync::Arc<Vec<u8>>, usize)>,
 }
 
 impl GptModel {
@@ -608,7 +642,7 @@ impl GptModel {
             .collect();
         let final_ln = LayerNorm::identity(hidden, config.layer_norm_eps);
         let lm_head = Linear::random(&mut rng, hidden, config.vocab_size);
-        Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None }
+        Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None }
     }
 
     /// `dir`配下の`config.json`・`model.safetensors`(Hugging Face GPT-2形式、
@@ -693,7 +727,7 @@ impl GptModel {
             spirv_matmul: None,
         };
 
-        Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None })
+        Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None })
     }
 
     /// コンパイル済み`matmul.spv`(`opencuda_blas::sgemm_vulkan_generic`が
@@ -737,6 +771,28 @@ impl GptModel {
     /// softmax経路を常に一致させる方針)。
     pub fn set_softmax_spirv(&mut self, spirv: Vec<u8>) {
         self.softmax_spirv = Some(std::sync::Arc::new(spirv));
+    }
+
+    /// **2026-08-07新設**: コンパイル済み`flash_attention.spv`
+    /// (`opencuda_blas::flash_attention_with_spirv`が期待するのと同じ
+    /// シェーダバイト列)を配線し、Attention計算をQKᵀ・softmax・P·Vが
+    /// 1回のディスパッチで完結するfused flash attentionカーネルへ切り替える
+    /// (open-cuda側2026-08-07 HANDOFF「次にすべきこと(1)」——
+    /// `scaled_dot_product_attention_with_spirv_and_softmax`〈GEMM/softmax
+    /// を別々にディスパッチ、レイヤーあたり3回〉から`flash_attention_with_
+    /// spirv`〈1回〉への切り替え——への対応)。`set_matmul_spirv`/
+    /// `set_softmax_spirv`と併用する必要はない(このモデルの内部Attention
+    /// 経路では、`flash_attn_spirv`が`Some`の場合はそちらを優先し、
+    /// `softmax_spirv`は無視する設計、他方Linear層のGEMM〈QKV/attn_out/
+    /// intermediate/output〉は引き続き`set_matmul_spirv`で別途配線する
+    /// 必要がある)。
+    ///
+    /// `block_size`は`opencuda_blas::flash_attention_with_spirv`の
+    /// タイルサイズ引数(`0`はエラー、`head_dim`・`block_size`とも256を
+    /// 超えるとシェーダの固定長ローカル配列の制約によりエラーになる、
+    /// 詳細は`opencuda-blas`側のdocコメント参照)。
+    pub fn set_flash_attention_spirv(&mut self, spirv: Vec<u8>, block_size: usize) {
+        self.flash_attn_spirv = Some((std::sync::Arc::new(spirv), block_size));
     }
 
     /// **2026-08-07新設**: DeepSeek-V3のMLA(Multi-Head Latent Attention)に
@@ -798,8 +854,9 @@ impl GptModel {
         let mut hidden: Vec<f32> = word_row.iter().zip(pos_row.iter()).map(|(w, p)| w + p).collect();
 
         let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
+        let flash_spirv = self.flash_attn_spirv.as_ref().map(|(bytes, bs)| (bytes.as_slice(), *bs));
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = layer.forward_step(device, &hidden, cache, hidden_size, self.config.num_heads, softmax_spirv)?;
+            hidden = layer.forward_step(device, &hidden, cache, hidden_size, self.config.num_heads, softmax_spirv, flash_spirv)?;
         }
 
         self.final_ln.forward(&mut hidden, 1, hidden_size);
@@ -827,8 +884,9 @@ impl GptModel {
         }
 
         let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
+        let flash_spirv = self.flash_attn_spirv.as_ref().map(|(bytes, bs)| (bytes.as_slice(), *bs));
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden_batch = layer.forward_prefill(device, &hidden_batch, seq_len, cache, hidden_size, self.config.num_heads, softmax_spirv)?;
+            hidden_batch = layer.forward_prefill(device, &hidden_batch, seq_len, cache, hidden_size, self.config.num_heads, softmax_spirv, flash_spirv)?;
         }
 
         // 最終位置のみLayerNorm+lm_headを適用すれば十分(`generate`が
@@ -1486,6 +1544,73 @@ mod tests {
         assert_eq!(
             cpu_out, vulkan_out,
             "CPU and Vulkan(GPU GEMM + GPU softmax) generation should produce byte-identical token sequences for the same seed/prompt"
+        );
+    }
+
+    /// **2026-08-07新設**: `set_flash_attention_spirv`(本HANDOFF増分、
+    /// open-cuda側2026-08-07 HANDOFF「次にすべきこと(1)」——素朴な
+    /// `scaled_dot_product_attention_with_spirv_and_softmax`から
+    /// `flash_attention_with_spirv`〈1ディスパッチで完結するfused
+    /// カーネル〉への切り替え——への対応)を配線した場合でも、`generate()`
+    /// が実Vulkanハードウェア上で最後まで完走し、CPU実行と生成トークン列が
+    /// 完全一致することを確認する。上記2テスト(GEMM+CPU softmax /
+    /// GEMM+GPU softmax)と並ぶ第3の経路。
+    #[test]
+    fn generate_end_to_end_matches_cpu_on_real_vulkan_hardware_after_set_matmul_and_flash_attention_spirv() {
+        let matmul_spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let matmul_spirv = match std::fs::read(&matmul_spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping generate_end_to_end (matmul+flash_attention) test: matmul.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    matmul_spirv_path.display()
+                );
+                return;
+            }
+        };
+        let flash_spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/flash_attention_vulkan_real/shaders/flash_attention.spv");
+        let flash_spirv = match std::fs::read(&flash_spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping generate_end_to_end (matmul+flash_attention) test: flash_attention.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    flash_spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping generate_end_to_end (matmul+flash_attention) test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        let vulkan_device: std::sync::Arc<dyn GpuDevice> = vulkan_device;
+        let cpu_device: std::sync::Arc<dyn GpuDevice> = opencuda_cpu::CpuDevice::new(0);
+
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let prompt = ByteTokenizer::encode("hi");
+
+        let cpu_model = GptModel::load_random(config.clone(), 42);
+        let cpu_out = cpu_model.generate(&cpu_device, &prompt, 6).unwrap();
+
+        let mut vulkan_model = GptModel::load_random(config, 42);
+        vulkan_model.set_matmul_spirv(matmul_spirv);
+        // block_size=4: GptConfig::tiny()のhead_dim=32/4=8、キャッシュ長も
+        // 今回のプロンプト長(2〜8トークン程度)で256を大きく下回るため、
+        // シェーダのMAX_DIM=256制約には掛からない。
+        vulkan_model.set_flash_attention_spirv(flash_spirv, 4);
+        let vulkan_out = vulkan_model.generate(&vulkan_device, &prompt, 6).unwrap();
+
+        assert_eq!(
+            cpu_out, vulkan_out,
+            "CPU and Vulkan(GPU GEMM + fused flash attention) generation should produce byte-identical token sequences for the same seed/prompt"
         );
     }
 

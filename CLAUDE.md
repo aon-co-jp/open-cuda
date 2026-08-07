@@ -259,6 +259,88 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-07(続き5) `open-cuda-llm`のAttention呼び出し経路に
+  `flash_attention_with_spirv`を配線(直下2026-08-07(続き)エントリ
+  「次にすべきこと(1)」への対応、ユーザー指示「dream-os/open-directx/
+  open-cuda/aruaru-llmの関連性・連携性・実用性・完成度を向上」)**:
+  1. **調査(着手前に4リポジトリの実態を再確認)**: `nvidia-smi`で
+     このマシンのGPUが依然NVIDIA GeForce GT 730(ドライバ475.14)の
+     1台のみであることを再確認。`dream-os`(`crates/dream-os-kernel`、
+     Toshiba SBM `sbm_ising` 64スピンPoC実装済み)・`open-directx`
+     (`directx-graphics-vulkan`/`directx-shader-translate`、境界チェック
+     付きチェーン6項まで実機検証済み)・`aruaru-llm`(`/v1/generate`・
+     `/v1/translate`の空入力400化まで完了)のCLAUDE.md HANDOFFを読み、
+     各リポジトリの「次にすべきこと」を突き合わせた結果、**このリポジトリ
+     自身が直前に残した「(1) Attention呼び出し経路をflash_attention_
+     with_spirvへ切り替える」が、最も具体的・低リスクで完成度に直結する
+     項目**と判断した(dream-os/open-directx側のSBM/DeepSeek組み込みは
+     依然「各リポジトリで最適化対象を先に特定する」という前提条件が
+     未達のまま、無理に着手すると憶測ベースの実装になるため見送った)。
+  2. **実装**: `crates/open-cuda-llm/src/lib.rs`の`DecoderLayer::
+     forward_step`/`forward_prefill`に`flash_spirv: Option<(&[u8],
+     usize)>`引数を追加。Attention呼び出し箇所を「`Some`なら
+     `opencuda_blas::flash_attention_with_spirv`(1回のディスパッチで
+     QKᵀ・オンラインsoftmax・P·Vが完結)、`None`なら従来通り
+     `scaled_dot_product_attention_with_spirv_and_softmax`(GEMM+softmaxを
+     別々にディスパッチ)」の分岐にした。`q_full`/`k_all`/`v_all`は既存の
+     「クエリ1行をキャッシュ長`n`回複製して`n×n` attentionを計算し先頭行
+     だけ使う」設計により**すでに`n*head_dim`長**(=`seq_len=n`)なので、
+     `flash_attention_with_spirv`の`seq_len`契約にそのまま合致し、
+     追加の形状変換は不要だった。`GptModel`に`flash_attn_spirv:
+     Option<(Arc<Vec<u8>>, usize)>`フィールド+
+     `set_flash_attention_spirv(spirv, block_size)`を新設
+     (`set_matmul_spirv`/`set_softmax_spirv`と同じ設計パターン、
+     `None`のまま〈既定〉なら後方互換で従来経路のまま)。
+  3. **実機検証(型チェックのみで完了と報告しない方針を徹底、NVIDIA
+     GeForce GT 730)**: 新規テスト
+     `generate_end_to_end_matches_cpu_on_real_vulkan_hardware_after_
+     set_matmul_and_flash_attention_spirv`(`open-cuda-llm`)が、
+     `set_matmul_spirv`+`set_flash_attention_spirv`(`block_size=4`)を
+     配線したモデルで`generate()`を実Vulkanデバイス上で実行し、CPU実行と
+     生成トークン列が完全一致(byte-identical)することを確認
+     (`cargo test -p open-cuda-llm --release generate_end_to_end --
+     --nocapture` → 3テスト〈matmulのみ/matmul+softmax/matmul+flash_
+     attention〉すべて`ok`)。
+  4. **検証結果**: `cargo build -p open-cuda-llm --release`警告0件・
+     成功。`cargo test -p open-cuda-llm --release`**17件全green**
+     (既存16件+新規1件、`manual_bench_*`は既存通り`--ignored`)。
+     `cargo test --workspace --release`**全クレートregression無し**
+     (全て`test result: ok`)。`cargo clippy -p open-cuda-llm
+     --all-targets --release -- -D warnings`**警告0件**
+     (`forward_step`の引数8個に既存の`forward_prefill`と同じく
+     `#[allow(clippy::too_many_arguments)]`を付与)。
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     も警告0件。
+  5. **正直な開示・スコープの限界**:
+     - これは`open-cuda-llm`(自己回帰デコーダ)のみへの配線であり、
+       `open-cuda-bert`(エンコーダ、KVキャッシュを持たないため
+       `flash_attention`の「クエリ複製でcausalマスクを代替する」設計
+       とは無関係)・`open-cuda-whisper`(Cross-Attentionは
+       `flash_attention_with_spirv`の`seq_len`同値前提と噛み合わないため
+       別途検討が必要)には配線していない。
+     - `aruaru-llm`側では今回`set_flash_attention_spirv`を実際に呼ぶ
+       配線(`generation.rs::wire_matmul_spirv`相当の追加)は**行って
+       いない**——`aruaru-llm`側のCLAUDE.md HANDOFF(2026-08-06(続き2))
+       に記録済みの実測(1トークンデコードでVulkanディスパッチ固定
+       オーバーヘッドがCPUより遅い)が、ディスパッチ回数を3→1へ減らす
+       今回の変更でどこまで緩和されるかは**未計測**。速度面の主張は
+       一切していない(「配線が正しく動く」ことのみ実証)。
+     - `dream-os`/`open-directx`との直接のコード連携は今回も無い
+       (このパスでは両リポジトリのファイルには一切触れていない)。
+     - `block_size`のチューニング(テストでは`4`固定)・`head_dim`/
+       `block_size`が256を超える場合の一般化は未着手(既存の
+       flash_attention実装の既知の制約のまま)。
+  - 次にすべきこと: (1) `aruaru-llm`側で`set_flash_attention_spirv`を
+    実際に呼ぶオプトイン配線+実機(GT 730)での速度計測
+    (「GEMM+CPU softmax」「GEMM+GPU softmax」「GEMM+fused flash
+    attention」の3経路を実測比較する価値がある)、(2)
+    `open-cuda-bert`/`open-cuda-whisper`側への同種の配線が意味を持つか
+    の検討(上記の理由により単純な流用はできない)、(3)
+    Qualcomm/ARM/Imagination実機・AMD ROCm/Intel oneAPI導入待ちの
+    項目群は変更なし、(4) dream-os/open-directx側のSBM/DeepSeek組み込み
+    構想は、各リポジトリで具体的な最適化対象が特定されるまで引き続き
+    保留。
+
 - **2026-08-07(続き) `flash_attention`(タイル化+オンラインsoftmax)にSPIR-V
   ディスパッチ経路を新設(2026-08-06(続き4)エントリ「次にすべきこと(3)」・
   直上2026-08-06(続き2)エントリ「次にすべきこと(3)」への対応、それまで
