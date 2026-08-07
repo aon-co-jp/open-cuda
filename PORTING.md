@@ -122,6 +122,20 @@ DXIL SM6.0でも64bit整数演算(`uint64_t`)はオプション機能
 64bit整数の対応可否が不明なターゲットへ暗号/大整数演算を移植する場合の
 パターンとして参考にできる。
 
+## 9. DeepSeek-V3のMLA風の低ランクKVキャッシュ圧縮(2026-08-06追加)
+
+`opencuda-blas::mla_compress_kv`/`mla_decompress_kv`は、既存の実機検証
+済み`sgemm`(CPU/Vulkan両対応)を土台に、down-projection(`d_h→d_c`)/
+up-projection(`d_c→d_h`)という低ランク射影を実装したもの。
+`open-cuda-llm::GptModel::enable_mla_kv_compression(d_c, seed)`で
+オプトイン的にKVキャッシュ経路へ配線済み(既定は従来通りフル精度、
+後方互換)。**正直な開示**: 射影行列はランダム初期化のみで学習済み
+重みを持たないため、圧縮は非可逆(生成品質を保持しない)——この配線が
+実証するのは「計算経路が`generate()`まで正しく繋がっていること」で
+あり、「DeepSeek実運用の圧縮品質を再現すること」ではない。他プロジェクト
+へ移植する場合も、学習済み射影重みを別途用意しない限り同じ限界が
+付随する点に注意。
+
 ## 現状(2026-07-30)
 
 `opencuda-core`/`opencuda-cpu`/`opencuda-vulkan`/`opencuda-directx`/
