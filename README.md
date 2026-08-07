@@ -1,5 +1,21 @@
 # open-cuda
 
+> 📌 **最近の更新(2026-08-07)**: `open-cuda-llm`の`DecoderLayer`に
+> 融合flash attentionカーネル(`flash_attention_with_spirv`)を実配線。
+> `GptModel::set_flash_attention_spirv()`未設定時は従来の3段階
+> ディスパッチへ自動フォールバック(完全後方互換)。NVIDIA GT 730実機で
+> Vulkan経由の生成トークン列がCPU版とバイト単位で一致することを新規
+> テストで確認、`cargo test --workspace --release`・`cargo clippy -D
+> warnings`とも green。詳細は[CLAUDE.md](CLAUDE.md)のHANDOFF参照。
+>
+> *English*: Wired the fused flash-attention kernel
+> (`flash_attention_with_spirv`) into `open-cuda-llm`'s `DecoderLayer`,
+> via `GptModel::set_flash_attention_spirv()` — falls back to the
+> existing 3-dispatch path when unset (fully backward compatible).
+> Verified on real NVIDIA GT 730 hardware: Vulkan-generated token
+> sequences are byte-identical to the CPU path. See
+> [CLAUDE.md](CLAUDE.md) HANDOFF for details.
+
 > 📌 **2026-08-06実装済み**: DeepSeek-V3のMLA(Multi-Head Latent
 > Attention)にインスパイアされた低ランクKVキャッシュ圧縮
 > (`opencuda-blas::mla_compress_kv`/`mla_decompress_kv`)を実装。
