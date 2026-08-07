@@ -45,3 +45,10 @@ set OUT=%SHADER_DIR%\softmax.spv
 glslc "%SRC%" -o "%OUT%"
 if errorlevel 1 exit /b %errorlevel%
 echo OK: compiled %SRC% -^> %OUT%
+
+set SHADER_DIR=%ROOT%\examples\flash_attention_vulkan_real\shaders
+set SRC=%SHADER_DIR%\flash_attention.comp
+set OUT=%SHADER_DIR%\flash_attention.spv
+glslc "%SRC%" -o "%OUT%"
+if errorlevel 1 exit /b %errorlevel%
+echo OK: compiled %SRC% -^> %OUT%

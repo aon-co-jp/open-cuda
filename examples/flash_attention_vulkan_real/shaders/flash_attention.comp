@@ -1,0 +1,98 @@
+#version 450
+
+// flash_attention: タイル化+オンラインsoftmaxによるFlash Attentionを、
+// 1スレッド=1クエリ行(row)として、Kブロック（サイズ block_size）を
+// シーケンシャルに巡回しながらオンラインsoftmaxの漸化式で計算する
+// (2026-08-07新設)。
+//
+// 正直な設計上の制約: head_dim・block_sizeそれぞれ最大256（固定長の
+// ローカル配列を使うため）。ホスト側(opencuda-blas::flash_attention_
+// with_spirv)でこの上限を超える場合はエラーを返す(黙って壊れた結果を
+// 返さない)。1スレッドが1行を丸ごと担当するため、head_dimに対する
+// ベクトル化・共有メモリ最適化は行っていない（正確性優先、
+// softmax.comp/matmul.compと同じ方針）。
+//
+// 数学的には CPU 版 opencuda-blas::flash_attention と同じアルゴリズム
+// （Q側は行ごとに独立、K/V側をblock_sizeでタイル化してオンラインsoftmaxの
+// 漸化式を適用する）。
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf { float k[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf { float v[]; };
+layout(set = 0, binding = 3) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Params {
+    uint seq_len;
+    uint head_dim;
+    uint block_size;
+    float scale;
+} params;
+
+#define MAX_DIM 256
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= params.seq_len) {
+        return;
+    }
+
+    uint head_dim = params.head_dim;
+    uint block_size = params.block_size;
+
+    float acc[MAX_DIM];
+    for (uint d = 0u; d < head_dim; d++) {
+        acc[d] = 0.0;
+    }
+
+    float m_i = -3.402823466e+38;
+    float l_i = 0.0;
+
+    uint q_base = row * head_dim;
+
+    for (uint kv_start = 0u; kv_start < params.seq_len; kv_start += block_size) {
+        uint kv_end = min(kv_start + block_size, params.seq_len);
+        uint bc = kv_end - kv_start;
+
+        // このK/Vブロックに対するスコア(scale済み)と、ブロック内最大値。
+        float block_scores[MAX_DIM];
+        float block_max = -3.402823466e+38;
+        for (uint j = 0u; j < bc; j++) {
+            uint k_base = (kv_start + j) * head_dim;
+            float dot = 0.0;
+            for (uint d = 0u; d < head_dim; d++) {
+                dot += q[q_base + d] * k[k_base + d];
+            }
+            dot *= params.scale;
+            block_scores[j] = dot;
+            block_max = max(block_max, dot);
+        }
+
+        float new_m = max(m_i, block_max);
+        // m_iが初期値(-FLT_MAX)のときはcorrection=0扱い(累積値がまだ0のため無害)。
+        float correction = exp(m_i - new_m);
+
+        l_i *= correction;
+        for (uint d = 0u; d < head_dim; d++) {
+            acc[d] *= correction;
+        }
+
+        float block_l = 0.0;
+        for (uint j = 0u; j < bc; j++) {
+            float p = exp(block_scores[j] - new_m);
+            block_l += p;
+            uint v_base = (kv_start + j) * head_dim;
+            for (uint d = 0u; d < head_dim; d++) {
+                acc[d] += p * v[v_base + d];
+            }
+        }
+        l_i += block_l;
+        m_i = new_m;
+    }
+
+    uint o_base = row * head_dim;
+    for (uint d = 0u; d < head_dim; d++) {
+        o[o_base + d] = acc[d] / l_i;
+    }
+}

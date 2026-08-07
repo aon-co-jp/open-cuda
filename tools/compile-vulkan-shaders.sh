@@ -21,3 +21,4 @@ compile matmul_vulkan_real matmul
 compile raid6_xor_parity_vulkan_real raid6_xor_parity
 compile raid6_q_parity_vulkan_real raid6_q_parity
 compile softmax_vulkan_real softmax
+compile flash_attention_vulkan_real flash_attention

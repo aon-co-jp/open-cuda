@@ -677,6 +677,94 @@ pub fn flash_attention(
     Ok(output)
 }
 
+/// [`flash_attention`] のSPIR-V対応版(2026-08-07新設、CLAUDE.md HANDOFF
+/// 2026-08-06(続き4)「次にすべきこと(3) `flash_attention`のSPIR-V対応」
+/// への着手)。
+///
+/// `spirv`に`examples/flash_attention_vulkan_real/shaders/flash_attention.spv`
+/// と同一契約のバイト列を渡すと、タイル化+オンラインsoftmaxのFlash
+/// Attentionアルゴリズム全体(QKᵀ・オンラインsoftmax・P·Vの累積)を
+/// **1回のcompute shaderディスパッチ**として実Vulkanデバイス上で実行する
+/// (1スレッド=1クエリ行、K/Vをシェーダ内部で`block_size`単位にループし、
+/// オンラインsoftmaxの漸化式をシェーダ内で完結させる設計——ホスト側から
+/// タイルごとに複数回ディスパッチする方式ではない)。数学的には
+/// [`flash_attention`]（CPU版）と同じ結果になるはずだが、丸め誤差の
+/// 蓄積順序がCPU版(rayon並列、行ごとに独立)と完全には一致しないため、
+/// 数値比較には誤差許容(既存の他SPIR-Vカーネルと同じ1e-3程度)が必要。
+///
+/// **正直な制約**: シェーダは固定長ローカル配列(`MAX_DIM=256`)を使うため
+/// `head_dim`・`block_size`とも256を超えると失敗する
+/// (`ensure_flash_attention_args`側でチェック、黙って壊れた結果を返さない)。
+/// また、CPU版は`block_size`がQ側のブロック分割にも使われる名残りの
+/// パラメータ名だが、実際にはQ側は常に1行=1スレッドで独立に処理する点は
+/// CPU版と同じ(CPU版もQをブロック分割はせず、K/V側だけをタイル化して
+/// いる——コメント参照)。
+///
+/// `device`にはSpirVカーネルの`"flash_attention"`エントリを実行できる
+/// `GpuDevice`実装（`opencuda-vulkan::real::VulkanDevice`、`real-vulkan`
+/// feature有効時）を渡す。
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_with_spirv(
+    device: &dyn GpuDevice,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    spirv: &[u8],
+) -> Result<Vec<f32>> {
+    if q.len() != seq_len * head_dim {
+        anyhow::bail!("flash_attention_with_spirv: q.len()={} != seq_len*head_dim={}", q.len(), seq_len * head_dim);
+    }
+    if k.len() != seq_len * head_dim {
+        anyhow::bail!("flash_attention_with_spirv: k.len()={} != seq_len*head_dim={}", k.len(), seq_len * head_dim);
+    }
+    if v.len() != seq_len * head_dim {
+        anyhow::bail!("flash_attention_with_spirv: v.len()={} != seq_len*head_dim={}", v.len(), seq_len * head_dim);
+    }
+    if block_size == 0 {
+        anyhow::bail!("flash_attention_with_spirv: block_size must be > 0");
+    }
+
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let dq = ScopedAlloc::new(device, std::mem::size_of_val(q))?;
+    let dk = ScopedAlloc::new(device, std::mem::size_of_val(k))?;
+    let dv = ScopedAlloc::new(device, std::mem::size_of_val(v))?;
+    let do_ = ScopedAlloc::new(device, seq_len * head_dim * std::mem::size_of::<f32>())?;
+
+    device.memcpy_h2d(dq.ptr(), f32_to_bytes(q))?;
+    device.memcpy_h2d(dk.ptr(), f32_to_bytes(k))?;
+    device.memcpy_h2d(dv.ptr(), f32_to_bytes(v))?;
+
+    let kernel = CompiledKernel::spirv("flash_attention", "main", spirv);
+    // シェーダの local_size_x=64 に合わせて、1スレッド=1クエリ行になるよう
+    // linear(ceil(seq_len/64)*64, 64) を使う(softmax.compの
+    // linear(rows*256, 256)と同じ考え方)。
+    let workgroups = seq_len.div_ceil(64) as u32;
+    let cfg = LaunchConfig::linear(workgroups * 64, 64);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(dq.ptr()),
+            KernelArg::Ptr(dk.ptr()),
+            KernelArg::Ptr(dv.ptr()),
+            KernelArg::Ptr(do_.ptr()),
+            KernelArg::Usize(seq_len),
+            KernelArg::Usize(head_dim),
+            KernelArg::Usize(block_size),
+            KernelArg::F32(scale),
+        ],
+    )?;
+    device.synchronize()?;
+
+    let mut out = vec![0.0f32; seq_len * head_dim];
+    device.memcpy_d2h(f32_from_bytes_mut(&mut out), do_.ptr())?;
+    Ok(out)
+}
+
 /// INT4量子化済みテンソル（グループ単位の対称量子化）。
 ///
 /// - `data`: 量子化値（4bit、[-8, 7]）を2値/バイトでニブルパックしたもの。
@@ -1667,6 +1755,58 @@ mod tests {
 
         let q2 = vec![1.0, 2.0, 3.0, 4.0];
         assert!(flash_attention(&q2, &k, &v, 2, 2, 0).is_err());
+    }
+
+    #[test]
+    fn flash_attention_spirv_matches_cpu_on_real_hardware() {
+        // 2026-08-07新設: `flash_attention.spv`が実Vulkanハードウェア上で
+        // CPU版`flash_attention`(タイル化+オンラインsoftmaxのリファレンス
+        // 実装)と数値一致することを検証する。flash_attention.spv/実Vulkan
+        // デバイスのいずれかが欠けている環境(CI等)では誤魔化さずスキップする。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/flash_attention_vulkan_real/shaders/flash_attention.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping flash_attention_spirv test: flash_attention.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping flash_attention_spirv test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+
+        let seq_len = 17;
+        let head_dim = 8;
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next_f32 = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let bits = (state >> 33) as u32;
+            (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let q: Vec<f32> = (0..seq_len * head_dim).map(|_| next_f32()).collect();
+        let k: Vec<f32> = (0..seq_len * head_dim).map(|_| next_f32()).collect();
+        let v: Vec<f32> = (0..seq_len * head_dim).map(|_| next_f32()).collect();
+
+        for block_size in [1usize, 4, seq_len] {
+            let cpu_out = flash_attention(&q, &k, &v, seq_len, head_dim, block_size).unwrap();
+            let gpu_out =
+                flash_attention_with_spirv(vulkan_device.as_ref(), &q, &k, &v, seq_len, head_dim, block_size, &spirv)
+                    .unwrap();
+            assert_eq!(cpu_out.len(), gpu_out.len());
+            for (i, (&cv, &gv)) in cpu_out.iter().zip(gpu_out.iter()).enumerate() {
+                assert!((cv - gv).abs() < 1e-3, "block_size={block_size}, idx {i}: cpu={cv}, gpu={gv}");
+            }
+        }
     }
 
     #[test]

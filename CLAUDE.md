@@ -259,6 +259,69 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-07(続き) `flash_attention`(タイル化+オンラインsoftmax)にSPIR-V
+  ディスパッチ経路を新設(2026-08-06(続き4)エントリ「次にすべきこと(3)」・
+  直上2026-08-06(続き2)エントリ「次にすべきこと(3)」への対応、それまで
+  ホスト側CPU実装のみだった`flash_attention`に実GPUディスパッチを追加)**:
+  1. **シェーダ設計**: `examples/flash_attention_vulkan_real/shaders/
+     flash_attention.comp`を新規作成。既存のsoftmax/matmulカーネルのような
+     「ホスト側から複数回ディスパッチしてタイルを回す」方式ではなく、
+     **1スレッド=1クエリ行**を担当し、K/V全体を`block_size`単位で
+     シェーダ内部のループとして巡回しながらオンラインsoftmaxの漸化式
+     (`m_i`/`l_i`/累積出力を毎タイル更新)を完結させる、**1回のディスパッチ
+     で完了する単一フューズドカーネル**として実装した(CPU版
+     `flash_attention`と同一のアルゴリズム・同一の数学的結果になる設計)。
+     `tools/compile-vulkan-shaders.{ps1,sh,cmd}`にも追加し、`glslc`で
+     `flash_attention.spv`へコンパイル済み。
+  2. **正直な制約**: シェーダは固定長ローカル配列(`MAX_DIM=256`)を使うため
+     `head_dim`・`block_size`ともに256を超えると失敗する設計にした
+     (`crates/opencuda-vulkan/src/real.rs`の`ensure_flash_attention_args`
+     側で明示的にチェックし、黙って配列外を読み書きする事態を避けている)。
+     head_dimに対する共有メモリ最適化・warp内リダクションは行っていない
+     (正確性優先、既存のsoftmax.comp/matmul.compと同じ方針)。
+  3. **実装**: `VulkanDevice::launch_kernel`のカーネル名ホワイトリストに
+     `flash_attention`を追加、`ensure_flash_attention_args`/
+     `run_flash_attention_spirv`(4バッファ+3xu32+1xf32 push constant、
+     既存の`dispatch_spirv`共有経路を利用)を`crates/opencuda-vulkan/
+     src/real.rs`に新設。`crates/opencuda-blas/src/lib.rs`には
+     `flash_attention_with_spirv(device, q, k, v, seq_len, head_dim,
+     block_size, spirv)`を新設(CPU版`flash_attention`は変更せず既存
+     リファレンス実装のまま残置)。
+  4. **スコープの正直な開示**: `open-cuda-llm`/`open-cuda-bert`側の
+     Attention呼び出し経路(`scaled_dot_product_attention_with_spirv_and_
+     softmax`)への配線は**今回は行っていない**——それらは素朴な(非Flash)
+     Attentionを使っており、`flash_attention`系はこれまで単体の関数として
+     しかテストされていない(HANDOFF記載通り)。今回追加した
+     `flash_attention_with_spirv`もモデル層(`DecoderLayer`/`EncoderLayer`)
+     には未接続で、`opencuda-blas`単体の部品として実装・実機検証したのみ。
+  5. **実機検証(型チェックのみで完了と報告しない方針を徹底、NVIDIA
+     GeForce GT 730)**: 新規テスト
+     `flash_attention_spirv_matches_cpu_on_real_hardware`(`opencuda-blas`)が、
+     `seq_len=17, head_dim=8`・`block_size ∈ {1, 4, 17}`の組み合わせで
+     GPUディスパッチ結果とCPU版`flash_attention`を誤差1e-3以内で比較し
+     全一致することを確認(`cargo test -p opencuda-blas --release
+     flash_attention_spirv_matches_cpu_on_real_hardware -- --nocapture`
+     → `test result: ok. 1 passed`、スキップされていないことをログで確認
+     済み)。
+  6. **検証結果**: `cargo build --workspace --release`警告0件・成功。
+     `cargo test -p opencuda-blas --release`**27件全green**(既存26件+
+     新規1件)。`cargo test --workspace --release`全クレート`test result:
+     ok`(regression無し)。`cargo clippy --workspace --all-targets
+     --release -- -D warnings`**警告0件**(`flash_attention_with_spirv`の
+     引数8個には既存の`sgemm`等と同じく`#[allow(clippy::too_many_
+     arguments)]`を付与)。
+  - 次にすべきこと: (1) `open-cuda-llm`/`open-cuda-bert`のAttention呼び出し
+    経路を、素朴なAttention(`scaled_dot_product_attention_with_spirv_and_
+    softmax`)から`flash_attention_with_spirv`へ切り替えるモデル層配線
+    (今回は影響範囲拡大を避けてスコープ外とした、既存の`softmax`専用
+    カーネル配線と同じ手順で対応可能なはず)。(2)
+    2026-08-06(続き2)エントリで指摘された「1トークンデコード
+    (`seq_len=1`)ではVulkanディスパッチ固定オーバーヘッドが支配的」という
+    懸念は`flash_attention`でも同様に当てはまると推測されるが未検証
+    (`seq_len=1`のケースでの実測ベンチマークは今回未実施)。(3)
+    `head_dim`・`block_size`が256を超える場合の対応(現状はエラーで拒否
+    するのみ、シェーダ側をタイル化して制約を緩和する余地がある)。
+
 - **2026-08-07 `mla_compress_kv`/`mla_decompress_kv`を`open-cuda-llm`の実際の
   KVキャッシュ経路(`KvCacheHead`)へ配線(直下2026-08-06(続き4)エントリ
   「次にすべきこと(1)」への対応)**: それまで`opencuda-blas`単体の部品
