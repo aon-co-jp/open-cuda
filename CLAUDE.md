@@ -259,6 +259,61 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-07 `mla_compress_kv`/`mla_decompress_kv`を`open-cuda-llm`の実際の
+  KVキャッシュ経路(`KvCacheHead`)へ配線(直下2026-08-06(続き4)エントリ
+  「次にすべきこと(1)」への対応)**: それまで`opencuda-blas`単体の部品
+  として実装されているだけで呼び出し元が未接続だった状態を解消した。
+  1. **実装**: `crates/open-cuda-llm/src/lib.rs`に`MlaHeadProjection`
+     (ヘッドごとのdown_proj/up_proj、`GptModel::enable_mla_kv_compression
+     (d_c, seed)`が乱数初期化)を新設し、`DecoderLayer`へ`mla:
+     Option<Vec<MlaHeadProjection>>`フィールドとして保持。`KvCacheHead`を
+     変更し、`push`が`proj: Option<&MlaHeadProjection>`を受け取って
+     `Some`の場合は`mla_compress_kv`で`d_c`次元へ圧縮してから
+     `k_latent`/`v_latent`へ格納(フル精度の`k`/`v`は保持しない)、
+     `current_kv`が`mla_decompress_kv`でAttention計算直前に復元する設計
+     (`None`〈既定〉の場合は従来通りフル精度のまま、既存の数値一致
+     テストへの影響ゼロ)。`forward_step`/`forward_prefill`双方の
+     呼び出し箇所を新シグネチャへ切り替えた。
+  2. **正直な開示**: `opencuda-blas`側の既存の開示通り、射影行列は
+     学習済みではなく乱数初期化のため、圧縮・復元後のk/vは元の値と
+     一致しない(非可逆)。この配線が実証するのは「低ランク圧縮の計算
+     経路がKVキャッシュ・Attention計算まで正しく繋がり、`generate()`が
+     エンドツーエンドで動作する」ことであり、生成品質の維持は主張しない
+     (`enable_mla_kv_compression`のdocコメントに明記、学習済み重みが
+     使えるようになった場合に置き換える土台として位置づけ)。
+  3. **実機検証(型チェックのみで完了と報告しない方針を徹底、NVIDIA
+     GeForce GT 730)**: 新規テスト
+     `mla_kv_compression_completes_on_real_vulkan_hardware`
+     (`open-cuda-llm`)が、`set_matmul_spirv`+`enable_mla_kv_compression`
+     両方を配線したモデルで`generate()`を実Vulkanデバイス上で実行し、
+     圧縮・復元のGEMM(`mla_compress_kv`/`mla_decompress_kv`)を含めて
+     最後まで完走することを確認(CPU/Vulkan間のトークン列一致は非可逆
+     変換のため主張しない設計、コメントに明記)。あわせてCPU側の
+     単体テスト2件: `mla_kv_compression_enabled_model_generates_
+     without_panicking`(基本動作)・
+     `mla_kv_compression_actually_changes_generation_versus_uncompressed`
+     (「配線したが実は経路を素通りしているだけ」という見逃しを防ぐため、
+     複数シードで圧縮ありと無しの生成結果が実際に異なることを確認する
+     回帰テスト)・`mla_kv_compression_rejects_non_reducing_d_c`
+     (`d_c >= head_dim`のガード)も追加。
+  4. **検証結果**: `cargo build -p open-cuda-llm --release`/
+     `cargo build --workspace --release`警告0件・成功。`cargo test -p
+     open-cuda-llm --release`**16件全green**(既存12件+新規4件、1件
+     `--ignored`)。`cargo test --workspace --release`**全クレート
+     regression無し**(全て`test result: ok`)。`cargo clippy -p
+     open-cuda-llm --all-targets --release -- -D warnings`**警告0件**。
+  - 次にすべきこと: (1) `open-cuda-bert`(エンコーダ)側は自己回帰
+    デコード用のKVキャッシュを持たないアーキテクチャのため、今回の
+    配線対象は`open-cuda-llm`のみ(想定通り、`open-cuda-bert`側は
+    対応不要と判断)。(2) 直下2026-08-06(続き4)エントリの残り課題
+    ——DeepSeekMoEのauxiliary-loss-free負荷分散([arXiv:2408.15664](https://arxiv.org/pdf/2408.15664))
+    の調査・適用検討(MoEアーキテクチャ自体がこのエコシステムに無いため
+    まず適用対象の有無を検討する必要がある)、FP8混合精度学習の調査
+    (このマシンのGPU〈GT730〉がFP8命令をサポートするか不明、要確認)
+    は未着手のまま変更なし。(3) 学習済みのMLA射影重み(`down_proj`/
+    `up_proj`)を実際に読み込めるようにするローダーは今回もスコープ外
+    (現状は`enable_mla_kv_compression`の乱数初期化のみ)。
+
 - **2026-08-06(続き4) DeepSeek-V3のMLA(Multi-Head Latent Attention)に
   インスパイアされた低ランクKVキャッシュ圧縮を実装・実機検証
   (ユーザー指示、8リポジトリへの東芝SBM/DeepSeek技術組み込み構想の
