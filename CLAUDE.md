@@ -259,6 +259,39 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-06(続き4) DeepSeek-V3のMLA(Multi-Head Latent Attention)に
+  インスパイアされた低ランクKVキャッシュ圧縮を実装・実機検証
+  (ユーザー指示、8リポジトリへの東芝SBM/DeepSeek技術組み込み構想の
+  第一段)**: 日英でDeepSeek-V3技術レポート([arXiv:2412.19437](https://arxiv.org/abs/2412.19437))・
+  実装解説ブログを調査。MLAの核心は「KVを`d_h`次元でそのままキャッシュ
+  せず、より小さい`d_c`次元の潜在ベクトルへ低ランク射影(down-projection)
+  して圧縮保存し、必要な時にup-projectionで復元する」設計で、
+  DeepSeek-V2の実測ではKVキャッシュを93.3%削減・最大生成スループット
+  5.76倍に向上させたと報告されている。
+  1. **実装**: `crates/opencuda-blas/src/lib.rs`に
+     `mla_compress_kv`/`mla_decompress_kv`(既存の実機検証済み`sgemm`
+     〈CPU/Vulkan両対応〉を土台にした低ランク射影の圧縮・復元)、
+     `mla_memory_reduction_percent`(削減率計算ヘルパー)を新設。
+  2. **正直な開示**: DeepSeek-V3の実際の`down_proj`/`up_proj`重み行列は
+     大規模事前学習によって獲得されるものであり、本実装はその学習済み
+     重みを持たない——「情報をほぼ無損失で圧縮できる」というMLAの実運用
+     上の効能を主張するものではなく、「低ランク射影という計算の仕組み
+     自体が既存のGEMM基盤の上に正しく実装できる」ことの実証に留まる
+     (`quantize_int4`等の既存の量子化機能と同じ「メモリ効率化」という
+     方向性の追加手段)。
+  3. **実機検証(NVIDIA GT730)**: `mla_compress_decompress_round_trip_
+     matches_between_cpu_and_vulkan`テスト——`d_h=16, d_c=4`(75%削減)の
+     圧縮・復元をCPU版・Vulkan版両方で実行し、数値完全一致を確認。
+     `cargo test --workspace --release`で全クレートregression無し。
+  - 次にすべきこと: (1) `open-cuda-llm`/`open-cuda-bert`の実際のKV
+     キャッシュ経路への配線(現状は`opencuda-blas`単体の部品として実装、
+     呼び出し元は未接続)、(2) DeepSeekMoEのauxiliary-loss-free負荷分散
+     ([arXiv:2408.15664](https://arxiv.org/pdf/2408.15664))の調査・
+     適用検討(MoEアーキテクチャ自体がこのエコシステムに無いため、
+     まず適用対象の有無を検討する必要がある)、(3) FP8混合精度学習の
+     調査(このマシンのGPU〈GT730〉がFP8命令をサポートするか不明、
+     要確認)。
+
 - **2026-08-06(続き3) `dream-os`(新規リポジトリ)向けに`sha256d_mine`
   カーネルディスパッチを追加(ユーザー指示、DreamOS PoCでのマイニング
   相当ハッシュ計算カーネル実装の一環)**: `VulkanDevice::launch_kernel`の

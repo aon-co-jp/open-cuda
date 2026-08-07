@@ -923,6 +923,72 @@ pub fn dequantize_int4_awq(t: &QuantizedInt4AwqTensor) -> Vec<f32> {
     out
 }
 
+/// DeepSeek-V3のMulti-head Latent Attention(MLA)にインスパイアされた、
+/// 低ランク射影によるKVキャッシュ圧縮(2026-08-06追加)。
+///
+/// ## 調査結果(日英でGoogle/GitHub/論文調査、正直な開示)
+///
+/// DeepSeek-V3 technical report([arXiv:2412.19437](https://arxiv.org/abs/2412.19437))
+/// によれば、MLAの核心は「KV(キー・バリュー)を`d_h`次元でそのまま
+/// キャッシュせず、それより遥かに小さい`d_c`次元の潜在ベクトルへ
+/// 低ランク射影(down-projection)して圧縮保存し、必要な時にup-projection
+/// で復元する」という設計。DeepSeek-V2の実測では**KVキャッシュを
+/// 93.3%削減、最大生成スループットを5.76倍に向上**させたと報告されている
+/// (出典: 日本語調査記事、[Qiita: DeepSeek-V4-FlashのKVキャッシュ削減](https://qiita.com/sukimaengineer/items/b2f143552cf6d1eadeae)等の
+/// 複数の解説記事で同様の数値を確認)。
+///
+/// ## 実装したもの(正直なスコープ)
+///
+/// 本関数は、MLAの**核心となる低ランク射影の仕組み(down-projection→
+/// 圧縮保存→up-projection→復元)**を、このクレートが既に持つ`sgemm`
+/// (CPU/Vulkan両対応、実機検証済み)を土台にそのまま実装したもの。
+/// **正直な開示**: DeepSeek-V3の実際の`down_proj`/`up_proj`重み行列は
+/// 大規模事前学習によって獲得されるものであり、本関数はその**学習済み
+/// 重みを持たない**(学習パイプライン自体は本クレートのスコープ外)。
+/// そのため「情報をほぼ無損失で圧縮できる」というMLAの実運用上の効能を
+/// 主張するものではなく、「低ランク射影という計算の仕組み自体が、
+/// 既存のGEMM基盤の上に正しく実装できる」ことの実証に留まる
+/// (`quantize_int4`等の既存の量子化機能と同じ「メモリ効率化」という
+/// 方向性の追加手段として位置づける)。
+///
+/// `kv`: `seq_len x d_h`(行優先)のキーまたはバリュー行列。
+/// `down_proj`: `d_h x d_c`の下方射影行列(`d_c < d_h`を推奨)。
+/// 戻り値: `seq_len x d_c`の圧縮された潜在表現。
+pub fn mla_compress_kv(device: &dyn GpuDevice, seq_len: usize, d_h: usize, d_c: usize, kv: &[f32], down_proj: &[f32], spirv: Option<&[u8]>) -> Result<Vec<f32>> {
+    anyhow::ensure!(kv.len() == seq_len * d_h, "mla_compress_kv: kv.len()={} != seq_len*d_h={}", kv.len(), seq_len * d_h);
+    anyhow::ensure!(down_proj.len() == d_h * d_c, "mla_compress_kv: down_proj.len()={} != d_h*d_c={}", down_proj.len(), d_h * d_c);
+
+    let mut latent = vec![0f32; seq_len * d_c];
+    sgemm(device, seq_len, d_h, d_c, 1.0, kv, down_proj, 0.0, &mut latent, spirv)?;
+    Ok(latent)
+}
+
+/// [`mla_compress_kv`]の逆変換(up-projection)。
+///
+/// `latent`: `seq_len x d_c`の圧縮された潜在表現。
+/// `up_proj`: `d_c x d_h`の上方射影行列。
+/// 戻り値: `seq_len x d_h`の復元されたKV行列(学習済み重みを使わない限り
+/// 元のKVとは一致しない、上記モジュールdoc参照)。
+pub fn mla_decompress_kv(device: &dyn GpuDevice, seq_len: usize, d_c: usize, d_h: usize, latent: &[f32], up_proj: &[f32], spirv: Option<&[u8]>) -> Result<Vec<f32>> {
+    anyhow::ensure!(latent.len() == seq_len * d_c, "mla_decompress_kv: latent.len()={} != seq_len*d_c={}", latent.len(), seq_len * d_c);
+    anyhow::ensure!(up_proj.len() == d_c * d_h, "mla_decompress_kv: up_proj.len()={} != d_c*d_h={}", up_proj.len(), d_c * d_h);
+
+    let mut reconstructed = vec![0f32; seq_len * d_h];
+    sgemm(device, seq_len, d_c, d_h, 1.0, latent, up_proj, 0.0, &mut reconstructed, spirv)?;
+    Ok(reconstructed)
+}
+
+/// KVキャッシュ圧縮による理論上のメモリ削減率(%)を計算するヘルパー
+/// (`d_c`が`d_h`よりどれだけ小さいかの単純比較、DeepSeek-V2が報告した
+/// 「93.3%削減」のような数値をこのエコシステムの他プロジェクトが参照
+/// できるようにする)。
+pub fn mla_memory_reduction_percent(d_h: usize, d_c: usize) -> f64 {
+    if d_h == 0 {
+        return 0.0;
+    }
+    (1.0 - (d_c as f64 / d_h as f64)) * 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,6 +1272,54 @@ mod tests {
         for (i, (&gv, &gc)) in c_vulkan.iter().zip(c_cpu.iter()).enumerate() {
             assert!((gv - gc).abs() < 1e-3, "idx {i}: vulkan={gv}, cpu={gc}");
         }
+    }
+
+    #[test]
+    fn mla_compress_decompress_round_trip_matches_between_cpu_and_vulkan() {
+        // MLA風の低ランクKV圧縮(2026-08-06新設)。sgemm_vulkan_generic系
+        // テストと同じ方針で、matmul.spv/実Vulkanデバイスが無い環境では
+        // assertを誤魔化さずスキップする。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("skipping mla test: matmul.spv not compiled at {}: {e}", spirv_path.display());
+                return;
+            }
+        };
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping mla test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+
+        let seq_len = 8;
+        let d_h = 16; // 実KVの次元(例)
+        let d_c = 4; // 圧縮後の潜在次元(d_c < d_h、DeepSeek-V2/V3と同じ低ランク方向)
+
+        let kv: Vec<f32> = (0..seq_len * d_h).map(|i| ((i % 11) as f32) * 0.1).collect();
+        let down_proj: Vec<f32> = (0..d_h * d_c).map(|i| ((i % 5) as f32) * 0.2 - 0.4).collect();
+        let up_proj: Vec<f32> = (0..d_c * d_h).map(|i| ((i % 7) as f32) * 0.15 - 0.3).collect();
+
+        let cpu_device = cpu_device();
+        let latent_cpu = mla_compress_kv(cpu_device.as_ref(), seq_len, d_h, d_c, &kv, &down_proj, None).unwrap();
+        let recon_cpu = mla_decompress_kv(cpu_device.as_ref(), seq_len, d_c, d_h, &latent_cpu, &up_proj, None).unwrap();
+
+        let latent_vulkan = mla_compress_kv(vulkan_device.as_ref(), seq_len, d_h, d_c, &kv, &down_proj, Some(&spirv)).unwrap();
+        let recon_vulkan = mla_decompress_kv(vulkan_device.as_ref(), seq_len, d_c, d_h, &latent_vulkan, &up_proj, Some(&spirv)).unwrap();
+
+        assert_eq!(latent_cpu.len(), seq_len * d_c);
+        for (i, (&gv, &gc)) in latent_vulkan.iter().zip(latent_cpu.iter()).enumerate() {
+            assert!((gv - gc).abs() < 1e-3, "latent idx {i}: vulkan={gv}, cpu={gc}");
+        }
+        for (i, (&gv, &gc)) in recon_vulkan.iter().zip(recon_cpu.iter()).enumerate() {
+            assert!((gv - gc).abs() < 1e-3, "reconstructed idx {i}: vulkan={gv}, cpu={gc}");
+        }
+
+        let reduction = mla_memory_reduction_percent(d_h, d_c);
+        assert!((reduction - 75.0).abs() < 1e-9, "expected 75% reduction for d_h=16,d_c=4, got {reduction}");
     }
 
     #[test]

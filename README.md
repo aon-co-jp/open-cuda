@@ -1,6 +1,29 @@
 # open-cuda
 
-> 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり(dream-os等8リポジトリ対象)。詳細は[CLAUDE.md](CLAUDE.md)参照。
+> 📌 **2026-08-06実装済み**: DeepSeek-V3のMLA(Multi-Head Latent
+> Attention)にインスパイアされた低ランクKVキャッシュ圧縮
+> (`opencuda-blas::mla_compress_kv`/`mla_decompress_kv`)を実装。
+> 日英で技術レポート([arXiv:2412.19437](https://arxiv.org/abs/2412.19437))・
+> 実装解説ブログを調査した上で、既存の実機検証済み`sgemm`基盤の上に
+> 低ランク射影(圧縮93.3%削減の実績が報告されている設計)を実装し、
+> 実機(GT730)でCPU/Vulkan両版の数値一致を確認済み。学習済み重みは
+> 持たない(仕組みの実証、正直な開示は`CLAUDE.md`のHANDOFF参照)。
+> 東芝SBM・DeepSeek技術の他リポジトリへの組み込みは引き続き検討中
+> (dream-os等8リポジトリ対象)。
+>
+> **Implemented 2026-08-06**: low-rank KV-cache compression inspired by
+> DeepSeek-V3's Multi-Head Latent Attention (MLA) —
+> `opencuda-blas::mla_compress_kv`/`mla_decompress_kv`. Researched the
+> technical report ([arXiv:2412.19437](https://arxiv.org/abs/2412.19437))
+> and implementation blogs in Japanese and English, then built the
+> low-rank projection mechanism (the design behind DeepSeek's reported
+> 93.3% KV-cache reduction) on top of the existing, real-hardware-
+> verified `sgemm` backend. Verified on real hardware (GT730) that the
+> CPU and Vulkan paths match numerically. Does not carry trained
+> weights (this demonstrates the mechanism, not the trained
+> compression quality — see the HANDOFF section of `CLAUDE.md` for the
+> honest disclosure). Applying Toshiba SBM / DeepSeek techniques to the
+> other 7 repos is still under consideration.
 
 > **Updated 2026-07-25**: The dev-policy file (`CLAUDE.md`) heading was
 > renamed from "Development Policy & Dev Environment Rules" to
