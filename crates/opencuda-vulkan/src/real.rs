@@ -490,6 +490,87 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[data_buffer], &push)
     }
 
+    /// `flash_attention` の引数契約を検証する(2026-08-07新設、CLAUDE.md
+    /// HANDOFF 2026-08-06(続き4)「次にすべきこと(3) `flash_attention`の
+    /// SPIR-V対応」への着手)。
+    ///
+    /// `q`/`k`/`v`/`o`はいずれも`seq_len x head_dim`(行優先)の4バッファ、
+    /// push constantは`seq_len`/`head_dim`/`block_size`(各u32)・`scale`
+    /// (f32)の4引数。シェーダ(`examples/flash_attention_vulkan_real/
+    /// shaders/flash_attention.comp`)は1スレッド=1クエリ行を担当し、
+    /// 固定長ローカル配列(`MAX_DIM=256`)を使うため、`head_dim`・
+    /// `block_size`とも256を超える場合はここでエラーにする(シェーダが
+    /// 黙って配列外を読む/書く事態を避ける)。
+    #[allow(clippy::type_complexity)]
+    fn ensure_flash_attention_args(
+        &self,
+        args: &[KernelArg],
+    ) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer, vk::Buffer, u32, u32, u32, f32)> {
+        if args.len() != 8 {
+            bail!("flash_attention expects 8 args: q, k, v, o, seq_len, head_dim, block_size, scale");
+        }
+        let q = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 (q) must be pointer"))?;
+        let k = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 (k) must be pointer"))?;
+        let v = args[2].as_ptr().ok_or_else(|| anyhow!("arg2 (v) must be pointer"))?;
+        let o = args[3].as_ptr().ok_or_else(|| anyhow!("arg3 (o) must be pointer"))?;
+        let seq_len = args[4].as_usize().ok_or_else(|| anyhow!("arg4 (seq_len) must be usize/u32"))?;
+        let head_dim = args[5].as_usize().ok_or_else(|| anyhow!("arg5 (head_dim) must be usize/u32"))?;
+        let block_size = args[6].as_usize().ok_or_else(|| anyhow!("arg6 (block_size) must be usize/u32"))?;
+        let scale = match &args[7] {
+            KernelArg::F32(v) => *v,
+            other => bail!("arg7 (scale) must be F32, got {other:?}"),
+        };
+
+        const MAX_DIM: usize = 256;
+        if head_dim > MAX_DIM {
+            bail!("flash_attention: head_dim={head_dim} exceeds shader's fixed MAX_DIM={MAX_DIM}");
+        }
+        if block_size == 0 {
+            bail!("flash_attention: block_size must be > 0");
+        }
+        if block_size > MAX_DIM {
+            bail!("flash_attention: block_size={block_size} exceeds shader's fixed MAX_DIM={MAX_DIM}");
+        }
+
+        let (q_buf, _, _, q_len, _, _) = self.get_allocation(q)?;
+        let (k_buf, _, _, k_len, _, _) = self.get_allocation(k)?;
+        let (v_buf, _, _, v_len, _, _) = self.get_allocation(v)?;
+        let (o_buf, _, _, o_len, _, _) = self.get_allocation(o)?;
+
+        let f32_size = std::mem::size_of::<f32>();
+        let needed = seq_len
+            .checked_mul(head_dim)
+            .and_then(|v| v.checked_mul(f32_size))
+            .ok_or_else(|| anyhow!("flash_attention buffer byte size overflow"))?;
+        if q_len < needed {
+            bail!("flash_attention q buffer too small: need {needed} bytes, have {q_len}");
+        }
+        if k_len < needed {
+            bail!("flash_attention k buffer too small: need {needed} bytes, have {k_len}");
+        }
+        if v_len < needed {
+            bail!("flash_attention v buffer too small: need {needed} bytes, have {v_len}");
+        }
+        if o_len < needed {
+            bail!("flash_attention o buffer too small: need {needed} bytes, have {o_len}");
+        }
+
+        let seq_len_u32 = u32::try_from(seq_len).context("flash_attention seq_len does not fit in u32 push constant")?;
+        let head_dim_u32 = u32::try_from(head_dim).context("flash_attention head_dim does not fit in u32 push constant")?;
+        let block_size_u32 = u32::try_from(block_size).context("flash_attention block_size does not fit in u32 push constant")?;
+        Ok((q_buf, k_buf, v_buf, o_buf, seq_len_u32, head_dim_u32, block_size_u32, scale))
+    }
+
+    fn run_flash_attention_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (q_buf, k_buf, v_buf, o_buf, seq_len, head_dim, block_size, scale) = self.ensure_flash_attention_args(args)?;
+        let mut push = Vec::with_capacity(16);
+        push.extend_from_slice(&seq_len.to_ne_bytes());
+        push.extend_from_slice(&head_dim.to_ne_bytes());
+        push.extend_from_slice(&block_size.to_ne_bytes());
+        push.extend_from_slice(&scale.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[q_buf, k_buf, v_buf, o_buf], &push)
+    }
+
     /// `dream-os`(2026-08-06、マイニング相当の実ハッシュ計算カーネルPoC)
     /// 向けの汎用2バッファ+2xu32 push constantディスパッチ。
     /// `sha256d_mine`: base_message(readonly)・digests(writeonly)の2バッファ、
@@ -797,9 +878,10 @@ impl GpuDevice for VulkanDevice {
             "softmax" => self.run_softmax_spirv(spirv, &kernel.entry, cfg, args),
             "sha256d_mine" => self.run_sha256d_mine_spirv(spirv, &kernel.entry, cfg, args),
             "sbm_ising" => self.run_sbm_ising_spirv(spirv, &kernel.entry, cfg, args),
+            "flash_attention" => self.run_flash_attention_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
                 "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
-                 raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, and sbm_ising; got `{other}`"
+                 raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, sbm_ising, and flash_attention; got `{other}`"
             ),
         }
     }
