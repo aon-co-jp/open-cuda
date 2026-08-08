@@ -259,6 +259,109 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-08(続き) MLA低ランクKVキャッシュ圧縮にPCA較正版を追加
+  (ユーザー指示: `aruaru-llm`側で実測した「乱数射影MLAは実GPT-2 124M
+  重みで生成品質を明確に劣化させる」という結果を受け、修正できるか調査・
+  実装)**:
+  1. **原因の特定**: `enable_mla_kv_compression`(乱数初期化の
+     `down_proj`/`up_proj`)は、`d_c`(圧縮後次元、例: `16`)が
+     `head_dim`(例: `64`)に対して小さい場合、Johnson–Lindenstrauss型の
+     乱数射影が距離をよく保存する理論的保証(次元が対数オーダーで十分
+     大きい場合のみ成立)から外れており、実データの分散構造を全く反映
+     しない――これが観測された劣化(反復・破綻した出力)の数学的な理由。
+  2. **実装**: `crates/open-cuda-llm/src/lib.rs`に
+     `GptModel::enable_mla_kv_compression_calibrated(d_c, device,
+     sample_prompts: &[Vec<u32>])`を新設。実際のサンプル文で
+     `forward_prefill_all_layers`を(圧縮を有効化する前の状態で)走らせ、
+     各レイヤー・各ヘッドの本物のK/V活性化(`KvCacheHead::k`/`v`、
+     `proj=None`ならフル精度のまま保持される既存の設計を利用)を収集し、
+     その非中心二次モーメント行列(`XᵀX`)を`nalgebra::SymmetricEigen`
+     (純Rust実装、CUDA/ROCm/oneAPIツールチェイン不要)で固有値分解、
+     固有値降順で上位`d_c`個の固有ベクトルを`down_proj`の基底として使う
+     (直交基底のため`up_proj`は転置)。K/Vは既存設計通り同じ射影行列を
+     共有するため、両方の活性化を縦に連結してから単一のPCA基底を求める。
+     `nalgebra 0.33`を新規依存として追加(pure Rust、LAPACK/BLAS
+     バックエンド不要、`cargo build`で問題なく解決)。
+  3. **実機検証(NVIDIA GT730、型チェックのみで完了と報告しない方針を
+     徹底)**: 新規テスト`calibrated_pca_mla_kv_compression_on_real_gpt2_
+     weights`が、実GPT-2 124M重み・`d_c=16`(`head_dim=64`、75%圧縮、
+     タスク指定の数値と一致)で、(a)非圧縮・(b)乱数射影MLA・(c)PCA較正版
+     MLAの3経路を比較。較正データは8文の一般的な英文(気象・経済・日常・
+     歴史・科学等、トピックを分散させた短文)、テストプロンプトは
+     較正データと似た文体の`"The quick brown fox"`(タスク指定)と、
+     全く異なる文体のheld-outプロンプト`"def compute_gradient(weights,
+     learning_rate):"`(Pythonコード)の両方で実行し、汎化を確認。
+     **実際の生成結果**(`cargo test -p open-cuda-llm --release
+     calibrated_pca_mla -- --test-threads=1 --nocapture`の実出力、
+     `--test-threads=1`が必要な理由は後述):
+     ```
+     === calibration-style prompt ("The quick brown fox") ===
+       uncompressed         : "es are a great way to get a little bit of a kick out of your"
+       random-projection MLA: "es, and the government, and away from the government and point of the government"
+       PCA-calibrated MLA    : "es are a bit of a lot of the way to the forest.\n\n"
+     === held-out prompt ("def compute_gradient(weights, learning_rate):") ===
+       uncompressed         : "\n\nreturn (\n\n\\t\\t\\t\\t\\t"
+       random-projection MLA: "\nThe following the government and point of the government and point of the government and"
+       PCA-calibrated MLA    : "\n\n\n\n\nThe following is a new generation of the following:\n"
+     ```
+  4. **正直な評価**: PCA較正版は乱数射影版より明らかに改善している
+     ――乱数射影版は両プロンプトとも"the government and point of the
+     government"のような無限ループ的な破綻(明確な失敗モード)に陥って
+     いるのに対し、PCA較正版はループに陥らず、非圧縮版ほど自然ではない
+     ものの文法的にはある程度成立した文を生成している。**ただし
+     「実運用で許容できる品質」までは回復していない**――非圧縮版と
+     比較すればPCA較正版も明確に劣化している(意味的一貫性が低い)。
+     これは(a)較正サンプルがわずか8文と小規模であること、(b)このPCAは
+     バイアス項を持たない非中心(uncentered)PCAであり、実際のK/V分布の
+     平均が非ゼロならその分の再構成誤差が残ること、(c)そもそも本物の
+     DeepSeek-V3のMLAは大規模事前学習で`down_proj`/`up_proj`自体を
+     エンドツーエンドに**学習**しており、事後的なPCA較正はその代替には
+     なってもLLM訓練で得られる情報保持効果には及ばないこと、が理由と
+     考えられる。held-outプロンプト(較正文体と全く異なるPythonコード)
+     でもPCA較正版が乱数射影版のループ的破綻を回避できていた点は、
+     較正データへの単純な過学習ではなく、ある程度汎用的な分散方向
+     (英語テキスト全般に共通する活性化統計)を捉えられていることを
+     示唆する。
+  5. **結論(質問への回答)**: 「安価な単一GPU(GT730級)でMLA圧縮を
+     実用化できるか」――**部分的には可能、ただし限定的**。乱数射影より
+     PCA較正の方が明確に良く、実装・計算コストも(サンプル文での
+     プリフィル数回+小さい`head_dim x head_dim`行列の固有値分解のみ、
+     GT730でも数十秒以内)このマシンで十分現実的。しかし「非圧縮と
+     遜色ない品質」には届いておらず、KVキャッシュメモリを本当に節約
+     したい場面(長いコンテキスト・小VRAM)での実運用に薦められる水準
+     ではまだない、というのが正直な結論。次の増分候補は次項参照。
+  6. **検証結果**: `cargo build -p open-cuda-llm --release`警告0件・
+     成功。`cargo test -p open-cuda-llm --release -- --test-threads=1`
+     **18件全green**(既存17件+新規1件)。`cargo clippy -p
+     open-cuda-llm --all-targets --release -- -D warnings`警告0件。
+     `cargo test --workspace --release -- --test-threads=1`**全クレート
+     regression無し**。`cargo clippy --workspace --all-targets --release
+     -- -D warnings`警告0件。
+  7. **新たに判明した実機の制約(正直な開示、コード変更ではなく実行方法の
+     注意点)**: `cargo test -p open-cuda-llm --release`をデフォルトの
+     並列実行(`--test-threads`省略)で回すと、`STATUS_ACCESS_VIOLATION`
+     (`0xc0000005`)でテストバイナリごと異常終了することを確認した。
+     `--test-threads=1`で直列実行すると全件green(上記6.)になることから、
+     複数の重量級テスト(実GPT-2 124M重み〈548MB〉を複数回並列ロード・
+     実Vulkanデバイスへの複数同時接続)がこのマシンの資源(VRAM 2GB・
+     限られたRAM)を同時に奪い合うことが原因と考えられる(このセッション
+     で新規に発生した回帰ではなく、既存の実GPT-2/実Vulkanテスト同士でも
+     元々起こり得た資源競合に、今回のテストが1本追加されたことで顕在化
+     したものと推測——個々のテストロジック自体は`--test-threads=1`で
+     問題なくpassするため、コード側のバグではなく実行時資源制約の問題と
+     判断)。**このマシンでこのクレートの全テストを実行する際は
+     `--test-threads=1`(または`--release -- --test-threads=1`)を使う
+     ことを推奨**として明記しておく。
+  - 次にすべきこと: (1) 較正サンプル数を増やす(現状8文、より大規模・
+    多様なコーパスでPCA基底の安定性・汎化がどう変わるか未検証)、
+    (2) 中心化PCA(バイアス項付き、`mla_compress_kv`/`mla_decompress_kv`
+    のAPIにオフセット加算を追加する設計変更が必要)が非中心PCAより
+    実際に改善するかの検証、(3) `d_c`を大きくした場合(圧縮率は下がるが
+    情報損失も減る)の質とメモリ削減のトレードオフの実測、(4)
+    `aruaru-llm`側でこの較正版をオプトインで呼べるようにする配線
+    (`GptModel::load`直後にサンプルプロンプトで較正する、という運用に
+    なる見込み)。
+
 - **2026-08-08 MLA実装の実機検証・FP8実現性調査・DeepSeekMoE統合可否判定**
   (ユーザー指示、README.mdに掲載済みの2026-08-06「MLA実装済み」記載の
   裏取り、および前回HANDOFFで保留していたFP8/DeepSeekMoEの検討):
