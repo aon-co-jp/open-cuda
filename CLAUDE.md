@@ -259,6 +259,68 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-08 MLA実装の実機検証・FP8実現性調査・DeepSeekMoE統合可否判定**
+  (ユーザー指示、README.mdに掲載済みの2026-08-06「MLA実装済み」記載の
+  裏取り、および前回HANDOFFで保留していたFP8/DeepSeekMoEの検討):
+  1. **MLA実機検証(結果: 合格)**: `opencuda-blas::mla_compress_kv`/
+     `mla_decompress_kv`(`crates/opencuda-blas/src/lib.rs` 1045〜1073行)
+     は実コードとして存在することを確認。実行コマンド
+     `cargo test -p opencuda-blas mla -- --nocapture`の実際の出力:
+     ```
+     running 1 test
+     test tests::mla_compress_decompress_round_trip_matches_between_cpu_and_vulkan ... ok
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.68s
+     ```
+     このテストはCPUバックエンドとVulkan実デバイス(後述のGT730)の両方で
+     compress→decompressのround tripを実行し数値一致を検証しており、
+     `eprintln!("skipping mla test: ...")`によるスキップ分岐は発火して
+     いない(=実GPU経路を通過した)ことをログで確認済み。README.mdの
+     「2026-08-06実装済み」表記は裏取りが取れた。
+  2. **FP8混合精度: このマシンでは非現実的と判断(実装せず)**。
+     `nvidia-smi --query-gpu=name --format=csv`で唯一の実GPUが
+     `NVIDIA GeForce GT 730`(Kepler世代、GK208、Compute Capability 3.5)
+     であることを再確認。FP8(E4M3/E5M2)のネイティブ演算をサポートする
+     Tensor Coreは、NVIDIA製品ではHopper(H100)/Ada Lovelace(RTX 40系)
+     世代(Compute Capability 8.9以降)以降にしか存在せず、Kepler世代の
+     GT730にはTensor Core自体が存在しない(既知のアーキテクチャ仕様、
+     追加のGPU固有ベンチマークは不要なレベルで確定的)。よって、GT730上で
+     FP8を謳うなら「ソフトウェアエミュレーション(FP32/FP16で計算し
+     ビット幅を切り詰めるだけ)」にならざるを得ず、DeepSeek-V3が実際に
+     得ている高速化(Tensor CoreによるFP8演算のネイティブ実行速度)は
+     一切再現できない。**実装しても名ばかりのFP8になり、性能上の意味も
+     教育的な実証価値も乏しいため見送った**(この判断はコード変更前の
+     調査のみで完了、`opencuda-blas`にFP8関連コードは追加していない)。
+  3. **DeepSeekMoE(スパースMoEルーティング)統合: 見送り(理由あり)**。
+     `crates/open-cuda-llm/src/lib.rs`の`DecoderLayer`(286行目〜)を
+     精査した結果、既存のFFN構造は`intermediate`(`Linear`、GELU適用)→
+     `output`(`Linear`)という**単一の密なFFNのみ**であり、複数エキスパート
+     ・ゲーティング/ルーターに相当する構造は一切存在しない。さらに
+     `GptModel::load`(715〜716行目)が読み込む実重みはHugging Face形式の
+     GPT-2(`openai-community/gpt2`、`mlp.c_fc`/`mlp.c_proj`という単一FFN
+     テンソル名)であり、そもそもMoE構成の学習済みチェックポイントを
+     持たない。ここでMoEルーティングを追加するには、(a)本物のMoE
+     チェックポイントが存在しない以上ランダム初期化の複数エキスパートを
+     でっち上げるしかなく、(b)ルーター・負荷分散損失・ゲーティングという
+     DeepSeekMoEの核心部分を「フックする先」が現行コードに存在しない
+     ため、実質的に「既存層への統合」ではなく「検証しようのない新規
+     架空実装」になってしまう。タスク指示の「具体的な統合ポイントが
+     無ければ実装を見送り、理由を明記する」方針に従い、**実装しない**。
+  ### 次にすべきこと
+  - FP8: このマシン(GT730)では引き続き非現実的。Hopper/Ada世代GPUが
+    調達できた場合にのみ再検討する(現時点で予定なし)。
+  - DeepSeekMoE: 実装するなら、まず(1)MoE構成の実在する学習済み
+    チェックポイント(小型でよい)を用意する、または(2)
+    `DecoderLayer`のFFNを複数の`intermediate`/`output`ペア+簡易
+    top-kルーターへ拡張し、`GptModel::load_random`側でランダム初期化
+    してでも「ルーティングの数値的挙動」自体を検証できるテストを
+    先に設計する、のどちらかの前提を整えてから着手すること(今回は
+    どちらも未着手)。
+  - MLA: round tripテスト以外に、実際のAttention計算経路
+    (`DecoderLayer::forward_step`/`forward_prefill`)へ`mla_compress_kv`/
+    `mla_decompress_kv`を配線しKVキャッシュのメモリ削減を実運用で
+    確認する統合は未着手(現状は`opencuda-blas`内の単体関数として
+    存在するのみ)。
+
 - **2026-08-07(続き5) `open-cuda-llm`のAttention呼び出し経路に
   `flash_attention_with_spirv`を配線(直下2026-08-07(続き)エントリ
   「次にすべきこと(1)」への対応、ユーザー指示「dream-os/open-directx/
