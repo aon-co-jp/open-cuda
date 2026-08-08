@@ -17,6 +17,12 @@ safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+# 2026-08-08新設: PCA較正版MLA圧縮(`enable_mla_kv_compression_calibrated`)の
+# 固有値分解(実活性化統計の共分散行列からの主成分抽出)用。純Rust実装
+# (LAPACK/BLASバックエンド不要)のため、このマシンにCUDA/ROCm/oneAPI
+# ツールチェインが無くてもビルド・実行できる(既存のcuBLAS等スタブと同じ
+# 「検証可能な範囲でのみ実装する」方針に合致)。
+nalgebra = "0.33"
 
 [dev-dependencies]
 opencuda-cpu.workspace = true
