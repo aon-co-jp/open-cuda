@@ -1,5 +1,26 @@
 # open-cuda
 
+> 📌 **最近の更新(2026-08-08)**: 下記2026-08-06の「MLA実装済み」を
+> 実機で再検証(`cargo test -p opencuda-blas mla -- --nocapture` →
+> `1 passed; 0 failed`、GT730実機のVulkan経路を通過)。あわせて
+> FP8混合精度・DeepSeekMoEの2件を調査したが、**いずれも実装は見送り**
+> (FP8: 唯一の実GPU=NVIDIA GT730〈Kepler、CC 3.5〉にFP8対応Tensor Core
+> が存在せずソフトウェアエミュレーションにしかならないため。DeepSeekMoE:
+> `open-cuda-llm`の`DecoderLayer`は単一の密なFFNのみで複数エキスパート・
+> ルーターの実在する統合ポイントが無く、実在チェックポイントも無いため)。
+> 詳細・次にすべきことは[CLAUDE.md](CLAUDE.md)の2026-08-08 HANDOFF参照。
+>
+> *English*: Re-verified the 2026-08-06 "MLA implemented" note on real
+> hardware (`cargo test -p opencuda-blas mla -- --nocapture` →
+> `1 passed; 0 failed`, exercised the GT730's real Vulkan path).
+> Investigated FP8 mixed-precision and DeepSeekMoE but **declined to
+> implement either**: FP8 has no real hardware support on this
+> machine's only GPU (GT730, Kepler, CC 3.5 — no FP8 Tensor Cores, would
+> be software emulation only); DeepSeekMoE has no genuine integration
+> point since `open-cuda-llm`'s `DecoderLayer` has only a single dense
+> FFN (no expert/router structure) and no real MoE checkpoint exists.
+> See the 2026-08-08 HANDOFF entry in [CLAUDE.md](CLAUDE.md) for details.
+
 > 📌 **最近の更新(2026-08-07)**: `open-cuda-llm`の`DecoderLayer`に
 > 融合flash attentionカーネル(`flash_attention_with_spirv`)を実配線。
 > `GptModel::set_flash_attention_spirv()`未設定時は従来の3段階
