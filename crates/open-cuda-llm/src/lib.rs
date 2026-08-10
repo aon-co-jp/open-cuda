@@ -36,6 +36,7 @@
 //!   カーネルを`opencuda-blas`に追加するのが次の最適化)。
 
 use std::path::Path;
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use opencuda_core::GpuDevice;
@@ -691,12 +692,23 @@ impl GptModel {
     pub fn load(dir: &Path) -> Result<Self> {
         let config_json = std::fs::read_to_string(dir.join("config.json"))
             .with_context(|| format!("open-cuda-llm: failed to read config.json in {dir:?}"))?;
-        let raw_config: GPT2Config = serde_json::from_str(&config_json).context("open-cuda-llm: failed to parse config.json")?;
-        let config = raw_config.into_gpt_config()?;
-
         let weights_bytes = std::fs::read(dir.join("model.safetensors"))
             .with_context(|| format!("open-cuda-llm: failed to read model.safetensors in {dir:?}"))?;
-        let tensors = safetensors::SafeTensors::deserialize(&weights_bytes).context("open-cuda-llm: failed to parse model.safetensors")?;
+        Self::load_from_bytes(&config_json, &weights_bytes)
+    }
+
+    /// [`load`](Self::load)のファイルI/Oを持たない版(2026-08-10新設、
+    /// WASM/ブラウザ向け配線の一環)。`config.json`の文字列本体と
+    /// `model.safetensors`のバイト列を直接渡す——`std::fs`を一切呼ばない
+    /// ため、`wasm32-unknown-unknown`(ファイルシステムを持たないブラウザ
+    /// 環境)からも呼び出せる。実際のパース・テンソル読み込みロジックは
+    /// `load`と完全に共通(`load`はこの関数の薄いI/Oラッパーへ変更した、
+    /// 挙動は無変更)。
+    pub fn load_from_bytes(config_json: &str, weights_bytes: &[u8]) -> Result<Self> {
+        let raw_config: GPT2Config = serde_json::from_str(config_json).context("open-cuda-llm: failed to parse config.json")?;
+        let config = raw_config.into_gpt_config()?;
+
+        let tensors = safetensors::SafeTensors::deserialize(weights_bytes).context("open-cuda-llm: failed to parse model.safetensors")?;
 
         let hidden = config.hidden_size;
 
@@ -1136,6 +1148,16 @@ impl GptTokenizer {
     pub fn load(dir: &Path) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("open-cuda-llm: failed to load tokenizer.json: {e}"))?;
+        Ok(Self { inner })
+    }
+
+    /// [`load`](Self::load)のファイルI/Oを持たない版(2026-08-10新設、
+    /// WASM/ブラウザ向け配線の一環)。`tokenizer.json`の文字列本体を
+    /// 直接渡す——`std::fs`を一切呼ばないため`wasm32-unknown-unknown`
+    /// からも呼び出せる。
+    pub fn load_from_str(tokenizer_json: &str) -> Result<Self> {
+        let inner = tokenizers::Tokenizer::from_str(tokenizer_json)
+            .map_err(|e| anyhow::anyhow!("open-cuda-llm: failed to parse tokenizer.json: {e}"))?;
         Ok(Self { inner })
     }
 

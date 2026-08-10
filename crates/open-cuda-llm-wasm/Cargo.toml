@@ -1,0 +1,23 @@
+[package]
+name = "open-cuda-llm-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "open-cuda-llm(GPT-2系自己回帰デコーダ)をwasm-bindgen経由でブラウザから呼べるようにする薄いラッパー(2026-08-10新設)。サーバー不要のオフラインブラウザ推論という構想の実証層。opencuda-cpuのCPU実行パスのみを使う(WebGPU等へのVulkan実行パス移植は別途の課題、詳細はCLAUDE.md参照)。"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+open-cuda-llm = { path = "../open-cuda-llm" }
+opencuda-cpu = { path = "../opencuda-cpu" }
+opencuda-core.workspace = true
+anyhow.workspace = true
+wasm-bindgen = "=0.2.126"
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
