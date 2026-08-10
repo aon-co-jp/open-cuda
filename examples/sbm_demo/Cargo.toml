@@ -1,0 +1,11 @@
+[package]
+name = "sbm_demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "東芝シミュレーテッド分岐(Simulated Bifurcation)アルゴリズムの動作実証デモ(Max-Cut/QUBO)。正直な開示: これは実運用向けの最適化機能ではなく、SBMアルゴリズム自体が正しく動くことを小規模な組合せ最適化問題(Max-Cut)で検証するための独立デモ。aruaru-llm/open-cuda/open-directxのいずれにも本物の適用対象(検証可能な組合せ最適化問題)が見当たらなかったため、GPUディスパッチには繋げず、CPU上の素のRust実装として位置づける。"
+
+[[bin]]
+name = "sbm_demo"
+path = "src/main.rs"
