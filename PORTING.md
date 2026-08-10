@@ -136,6 +136,26 @@ up-projection(`d_c→d_h`)という低ランク射影を実装したもの。
 へ移植する場合も、学習済み射影重みを別途用意しない限り同じ限界が
 付随する点に注意。
 
+## 繰り返しペナルティ(`GptModel::generate_with_repetition_penalty`、2026-08-10新設)
+
+対話ファインチューニング無しの素のGPT-2貪欲デコードが同一文字列を無限
+ループする既知の劣化モードへの対応。`open-cuda-llm::GptModel`に、既に
+登場したトークン(プロンプト+生成済み)のlogitへCTRL方式のペナルティ
+(`logit>0`なら`/penalty`、`logit<=0`なら`*penalty`)を適用してから
+argmaxする`generate_with_repetition_penalty(device, prompt_ids,
+max_new_tokens, penalty)`を追加した。既存の`generate()`は`penalty=1.0`
+で呼ぶ薄いラッパー(`penalty==1.0`なら早期returnし一切のlogit変更を
+行わないため、既存呼び出し元の挙動は完全に無変更)。
+
+移植手順:
+1. 呼び出し側を`generate()`から`generate_with_repetition_penalty(...,
+   penalty)`へ切り替える(`penalty=1.0`のままなら挙動は変わらない)。
+2. 経験的な既定値は`1.3`(`aruaru-llm`側の実測、`open-english`と同じ
+   プロンプト構造での実GPT-2 124M重み検証に基づく)——プロンプト・
+   ユースケースが異なる場合は再調整が必要な点に注意。
+3. サンプリング(温度・top-k/top-p)は組み合わせていない(貪欲デコード+
+   繰り返しペナルティのみ)。
+
 ## 現状(2026-07-30)
 
 `opencuda-core`/`opencuda-cpu`/`opencuda-vulkan`/`opencuda-directx`/
