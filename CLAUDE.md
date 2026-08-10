@@ -259,6 +259,72 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-10 `GptModel::generate_with_repetition_penalty`(CTRL方式の
+  繰り返しペナルティ)を新設、`aruaru-llm`側報告の反復ループバグへ
+  根本対応(ユーザー指示「反復バグの根本解決の為にaruaru-llm側の繰り返し
+  ペナルティ実装して」)**:
+  1. **背景**: `aruaru-llm`(`open-english`フロントエンド利用中)から、
+     対話ファインチューニング無しの素のGPT-2貪欲デコードが
+     "Student: Hello\nStudent: Hello\n..."のような同一文字列を無限
+     ループする実バグの報告があった。これまでの緩和策(フロントエンド側
+     での応急トリム・`max_new_tokens`縮小)は表示上の症状を抑えるのみで
+     根本原因(貪欲デコード自体に反復を防ぐ機構が無い)は未解決だった。
+  2. **実装**: `crates/open-cuda-llm/src/lib.rs`に
+     `generate_with_repetition_penalty(device, prompt_ids,
+     max_new_tokens, repetition_penalty)`を新設。既に登場したトークン
+     (プロンプト+生成済み、両方)のlogitへ、CTRL論文
+     (Keskar et al. 2019)方式のペナルティ(`logit>0`なら`/penalty`、
+     `logit<=0`なら`*penalty`)を適用してからargmaxする。既存の
+     `generate()`は`generate_with_repetition_penalty(..., 1.0)`を呼ぶ
+     薄いラッパーへ変更(`penalty==1.0`の場合は`apply_repetition_penalty`
+     内で早期returnし一切のlogit変更を行わないため、既存の全テスト・
+     呼び出し元の数値的な挙動は完全に無変更)。
+  3. **実機検証(型チェックのみで完了と報告しない方針を徹底、実GPT-2
+     124M重み)**: 新規テスト
+     `repetition_penalty_reduces_degenerate_loop_on_real_gpt2_weights`が、
+     `open-english`と同じプロンプト構造(`"...Student: Hello\nTrainer:"`)
+     で実際に検証: (a) `penalty=1.0`(ペナルティ無し)では実際に
+     `"Student:"`が2回以上出現する劣化ループへ陥ることを確認(この既知の
+     失敗モードを再現できていることの裏取り)、(b) `penalty=1.3`では
+     `"Student:"`の出現回数が実際に減ること、(c) `penalty=1.0`時は
+     `generate()`(既存API)と完全にバイト一致することを確認。実際の
+     生成結果(`--nocapture`実出力):
+     ```
+     no repetition penalty : " Hello\nStudent: Hello\nTrainer: Hello\nStudent: Hello\nTrainer: Hello\n..."
+     repetition_penalty=1.3: " I am the student of your class, and you have been teaching for over
+       two years now? Student: Yes sir! You're my teacher here today... Trattoria is very nice to me too"
+     ```
+     ペナルティ無し版は実際に劣化ループへ陥り、`penalty=1.3`版は文法的に
+     自然な会話文へ変わることを実証した。
+  4. **検証結果**: `cargo build -p open-cuda-llm --release`警告0件・
+     成功。`cargo test -p open-cuda-llm --release -- --test-threads=1`
+     **20件全green**(既存19件+新規1件、既存の全テストへ回帰なし)。
+     `cargo clippy -p open-cuda-llm --all-targets --release -- -D
+     warnings`警告0件。
+  5. **`aruaru-llm`側の配線**: `src/generation.rs`に
+     `default_repetition_penalty()`(`ARUARU_LLM_REPETITION_PENALTY`
+     環境変数、既定`1.3`)を新設し、`generate()`の呼び出しを
+     `generate_with_repetition_penalty`経由へ変更(既定で有効化)。
+     実際にサーバーを起動し、`POST /v1/generate`へ`open-english`と同じ
+     プロンプト(`"...Student: Hello\nTrainer:"`)を送って
+     `"I'm sorry for the delay in your appointment but it's not too
+     late to get back on track! Thank you so"`(反復なし)という応答を
+     実HTTPで確認済み。`cargo test --release`(aruaru-llm)**46件全green**
+     (既存機能への回帰なし)。
+  6. **正直な開示・スコープ**: (a) このペナルティは`/v1/generate`
+     (GPT-2自己回帰生成)のみに適用、`/v1/chat`(意図分類、貪欲デコード
+     自体を使わない)には無関係。(b) ペナルティの強さ(`1.3`)は
+     この1シナリオでの実測に基づく経験的な既定値であり、あらゆる
+     プロンプトで最適とは限らない——`ARUARU_LLM_REPETITION_PENALTY`で
+     呼び出し側が調整できる設計とした。(c) サンプリング(温度・top-k/
+     top-p)は依然未実装(貪欲デコード+繰り返しペナルティのみ)。
+  - 次にすべきこと: (1) 他のリポジトリ(`open-directx`)側の連携強化・
+    GPU/NPUハードウェアアクセラレーターの再検証(前回までのHANDOFFで
+    「このGT730では1トークンデコードでCPUより遅い」と実測済みのため、
+    より高性能なGPU実機が得られた場合にのみ再検討)、(2) フロントエンド
+    JS(open-english)をRust+RPoemへ移植する大規模タスク(別セッションで
+    スコープを切って着手すべき規模、ユーザーからも言及あり)。
+
 - **2026-08-08(続き) MLA低ランクKVキャッシュ圧縮にPCA較正版を追加
   (ユーザー指示: `aruaru-llm`側で実測した「乱数射影MLAは実GPT-2 124M
   重みで生成品質を明確に劣化させる」という結果を受け、修正できるか調査・

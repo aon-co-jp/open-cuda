@@ -1014,7 +1014,9 @@ impl GptModel {
 
     /// 貪欲デコード(argmax、サンプリング温度無し)で`max_new_tokens`個
     /// トークンを生成する。`prompt_ids`自体は出力に含めない
-    /// (呼び出し側で連結すること)。
+    /// (呼び出し側で連結すること)。繰り返しペナルティ無し
+    /// (`repetition_penalty=1.0`)で`generate_with_repetition_penalty`を
+    /// 呼ぶ薄いラッパー——既存呼び出し元の挙動は完全に無変更(後方互換)。
     ///
     /// **2026-08-04変更(プリフィル/デコード分離)**: プロンプトの初回
     /// forwardは`forward_prefill_all_layers`(バッチGEMM)で処理し、
@@ -1022,6 +1024,27 @@ impl GptModel {
     /// (`seq_len=1`)のままとする(`aruaru-llm`側CLAUDE.md 2026-07-26
     /// HANDOFFで指摘された設計変更(a))。
     pub fn generate(&self, device: &std::sync::Arc<dyn GpuDevice>, prompt_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+        self.generate_with_repetition_penalty(device, prompt_ids, max_new_tokens, 1.0)
+    }
+
+    /// `generate`と同じ貪欲デコードだが、既に登場したトークン(プロンプト+
+    /// これまでに生成済みのトークン、両方を対象)のlogitへ繰り返しペナルティを
+    /// 適用する(CTRL論文〈Keskar et al. 2019〉のrepetition penalty方式:
+    /// logitが正なら`/penalty`、負なら`*penalty`——`penalty>1.0`で
+    /// そのトークンが再び選ばれにくくなる)。
+    ///
+    /// `aruaru-llm`側ユーザー報告「しつこく繰り返すバグ」(対話ファイン
+    /// チューニング無しの素のGPT-2貪欲デコードが同一文字列の無限ループに
+    /// 陥る、既知のGPT-2系の劣化モード)への根本対応。`repetition_penalty
+    /// =1.0`を渡すと`generate`と完全に同一の挙動になる(早期returnで
+    /// 一切のペナルティ処理を行わない、既存テストとの数値一致を保証)。
+    pub fn generate_with_repetition_penalty(
+        &self,
+        device: &std::sync::Arc<dyn GpuDevice>,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        repetition_penalty: f32,
+    ) -> Result<Vec<u32>> {
         anyhow::ensure!(!prompt_ids.is_empty(), "open-cuda-llm: prompt_ids must not be empty");
         let device_ref = device.as_ref();
         let mut caches = self.new_caches();
@@ -1029,17 +1052,36 @@ impl GptModel {
         let mut logits = self.forward_prefill_all_layers(device_ref, prompt_ids, &mut caches)?;
         let pos = prompt_ids.len();
 
+        let mut seen: std::collections::HashSet<u32> = prompt_ids.iter().copied().collect();
+        apply_repetition_penalty(&mut logits, &seen, repetition_penalty);
+
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut next = argmax(&logits);
         for pos_now in (pos..).take(max_new_tokens) {
             generated.push(next);
+            seen.insert(next);
             if pos_now >= self.config.max_seq_len {
                 break;
             }
             logits = self.forward_step(device_ref, next, pos_now, &mut caches)?;
+            apply_repetition_penalty(&mut logits, &seen, repetition_penalty);
             next = argmax(&logits);
         }
         Ok(generated)
+    }
+}
+
+/// `logits`のうち`seen`に含まれるトークンIDへ繰り返しペナルティを適用する。
+/// `penalty == 1.0`(既定・ペナルティ無し)の場合は`logits`を一切変更せず
+/// 即座に返る——`generate`(既存呼び出し元)の数値的な挙動を完全に保つ。
+fn apply_repetition_penalty(logits: &mut [f32], seen: &std::collections::HashSet<u32>, penalty: f32) {
+    if penalty == 1.0 {
+        return;
+    }
+    for &tok in seen {
+        if let Some(logit) = logits.get_mut(tok as usize) {
+            *logit = if *logit > 0.0 { *logit / penalty } else { *logit * penalty };
+        }
     }
 }
 
@@ -1402,6 +1444,56 @@ mod tests {
         eprintln!("random-init weights greedy continuation: {random_text:?} (token ids: {random_out:?})");
 
         assert_ne!(real_out, random_out, "real GPT-2 weights should produce different greedy output than random init for the same prompt");
+    }
+
+    /// **2026-08-10新設**: `aruaru-llm`側ユーザー報告「しつこく繰り返す
+    /// バグ」(対話ファインチューニング無しの素のGPT-2貪欲デコードが
+    /// "Student: Hello"等の同一文字列を無限ループする)に対する
+    /// `generate_with_repetition_penalty`の実効性を実GPT-2 124M重みで
+    /// 検証する。open-english側と同じプロンプト構造(会話プロンプト+
+    /// "Student: <発話>\nTrainer:")で再現し、ペナルティ無し版が実際に
+    /// "Student:"を繰り返すこと、ペナルティ適用版がその繰り返しを避ける
+    /// (生成列内の"Student:"相当のトークン列の出現回数が減る)ことを確認。
+    #[test]
+    fn repetition_penalty_reduces_degenerate_loop_on_real_gpt2_weights() {
+        let dir = gpt2_model_dir();
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: real GPT-2 weights not present at {dir:?} (see CLAUDE.md HANDOFF for download instructions)");
+            return;
+        }
+
+        let model = GptModel::load(&dir).unwrap();
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let prompt = "You are a friendly English conversation trainer at a maid cafe.\nStudent: Hello\nTrainer:";
+        let prompt_ids = tokenizer.encode(prompt).unwrap();
+        assert!(!prompt_ids.is_empty());
+
+        let device = device();
+        let no_penalty = model.generate_with_repetition_penalty(&device, &prompt_ids, 40, 1.0).unwrap();
+        let with_penalty = model.generate_with_repetition_penalty(&device, &prompt_ids, 40, 1.3).unwrap();
+
+        let no_penalty_text = tokenizer.decode(&no_penalty).unwrap();
+        let with_penalty_text = tokenizer.decode(&with_penalty).unwrap();
+        eprintln!("no repetition penalty : {no_penalty_text:?}");
+        eprintln!("repetition_penalty=1.3: {with_penalty_text:?}");
+
+        let count_student = |s: &str| s.matches("Student:").count();
+        let no_penalty_repeats = count_student(&no_penalty_text);
+        let with_penalty_repeats = count_student(&with_penalty_text);
+
+        // ペナルティ無し版は実際に劣化ループへ陥ること(この既知の失敗
+        // モードを再現できていること自体の裏取り)を確認したうえで、
+        // ペナルティ版がその繰り返し回数を実際に減らすことを検証する。
+        assert!(no_penalty_repeats >= 2, "expected the unpenalized baseline to actually exhibit the known repetition loop, got: {no_penalty_text:?}");
+        assert!(
+            with_penalty_repeats < no_penalty_repeats,
+            "repetition_penalty=1.3 should reduce 'Student:' recurrences versus no penalty (no_penalty={no_penalty_repeats}, with_penalty={with_penalty_repeats})"
+        );
+
+        // penalty=1.0の場合は`generate`(既存API)と完全に同一の出力になる
+        // ことも確認する(後方互換性の実証)。
+        let via_generate = model.generate(&device, &prompt_ids, 40).unwrap();
+        assert_eq!(via_generate, no_penalty, "generate() must be byte-identical to generate_with_repetition_penalty(..., 1.0)");
     }
 
     /// **2026-08-08新設**: [`GptModel::enable_mla_kv_compression_calibrated`]

@@ -1,5 +1,35 @@
 # open-cuda
 
+> 📌 **最近の更新(2026-08-10)**: `open-cuda-llm::GptModel`に
+> `generate_with_repetition_penalty`(CTRL方式の繰り返しペナルティ、
+> penalty>1.0で既に登場したトークンのlogitを弱める)を新設した。既存の
+> `generate()`は`penalty=1.0`で呼ぶ薄いラッパーへ変更(数値的に完全同一の
+> 挙動、既存テスト・呼び出し元への回帰なし)。`aruaru-llm`側ユーザー報告
+> 「対話ファインチューニング無しの素のGPT-2貪欲デコードが同一文字列
+> (例: "Student: Hello")を無限ループする」への根本対応として、実GPT-2
+> 124M重みで新規テスト
+> `repetition_penalty_reduces_degenerate_loop_on_real_gpt2_weights`を追加
+> し、ペナルティ無しでは実際にループへ陥ること・`penalty=1.3`で実際に
+> ループが解消し文法的に自然な文へ変わることを確認済み。`aruaru-llm`側
+> `/v1/generate`が既定`penalty=1.3`でこの新APIを呼ぶよう配線されている
+> (`ARUARU_LLM_REPETITION_PENALTY`環境変数で上書き可)。詳細は
+> [CLAUDE.md](CLAUDE.md)の2026-08-10 HANDOFF参照。
+>
+> *English*: Added `generate_with_repetition_penalty` (CTRL-style
+> repetition penalty — penalty>1.0 weakens the logits of tokens already
+> seen) to `open-cuda-llm::GptModel`. The existing `generate()` is now a
+> thin wrapper calling it with `penalty=1.0` (byte-identical behavior, no
+> regression to existing tests/callers). This directly addresses a
+> reported `aruaru-llm` bug where the base (non-fine-tuned) GPT-2's
+> greedy decoding loops the same string forever (e.g. "Student: Hello").
+> Added a new test on real GPT-2 124M weights,
+> `repetition_penalty_reduces_degenerate_loop_on_real_gpt2_weights`,
+> confirming the loop actually reproduces without the penalty and
+> actually stops (producing grammatically natural text) at
+> `penalty=1.3`. `aruaru-llm`'s `/v1/generate` now calls this new API
+> with `penalty=1.3` by default (override via `ARUARU_LLM_REPETITION_
+> PENALTY`). See the 2026-08-10 HANDOFF entry in [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-08-08)**: 下記2026-08-06の「MLA実装済み」を
 > 実機で再検証(`cargo test -p opencuda-blas mla -- --nocapture` →
 > `1 passed; 0 failed`、GT730実機のVulkan経路を通過)。あわせて
