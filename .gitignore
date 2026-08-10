@@ -7,3 +7,10 @@
 # ライセンス上の理由でリポジトリには含めない。crates/opencuda-llm/src/lib.rs
 # のテスト・CLAUDE.md HANDOFF参照、各自Hugging Faceから取得すること)。
 crates/open-cuda-llm/models/
+
+# open-cuda-llm-wasmの動作確認用wasm-bindgen生成物(.wasm/JSグルー、
+# `wasm-bindgen --target web --out-dir www/pkg ...`で都度再生成する運用、
+# .spv/.dxilと同じ扱い)。`www/index.html`(手書きのスモークテストページ)
+# 自体はコミット対象。
+/www/pkg/
+/www/pkg-node/

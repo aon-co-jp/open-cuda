@@ -11,6 +11,7 @@ members = [
     "crates/opencuda-multidev",
     "crates/open-cuda-bert",
     "crates/open-cuda-llm",
+    "crates/open-cuda-llm-wasm",
     "crates/open-cuda-whisper",
     "examples/vector_add",
     "examples/vector_add_vulkan",

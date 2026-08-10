@@ -259,6 +259,104 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-10(続き) `open-cuda-llm`をwasm32-unknown-unknownへ対応+
+  `open-cuda-llm-wasm`新設(wasm-bindgen層、実ブラウザでロード確認済み)
+  ——「オフラインのブラウザアプリとしてGPT-2推論を動かす」構想の第一段**:
+  1. **wasm32ビルド対応(恒久化)**: `crates/open-cuda-llm/Cargo.toml`の
+     `tokenizers`依存を`[target.'cfg(not(target_arch = "wasm32"))'.
+     dependencies]`(既存の`onig`feature、Cのoniguruma経由)と
+     `[target.'cfg(target_arch = "wasm32")'.dependencies]`
+     (`unstable_wasm`feature、純Rustの`fancy-regex`)に分離、
+     `getrandom`(`js`feature)をwasm32側に追加。理由:
+     `onig_sys`はwasm32-unknown-unknown(freestandingターゲット、
+     libc/sysroot無し)向けにCコードをコンパイルできないため。
+     `dev-dependencies`(`opencuda-cpu`/`opencuda-vulkan --features
+     real-vulkan`)も同じく`not(wasm32)`ターゲット節へ移動(Vulkan実行
+     パスはブラウザで使えないため、wasm32側のテストには含めない設計)。
+     **検証**: `cargo check -p open-cuda-llm --target
+     wasm32-unknown-unknown`成功。`cargo build --workspace`/
+     `cargo test -p open-cuda-llm --release -- --test-threads=1`
+     **19 passed, 1 ignored, 0 failed**(既存の全テストに回帰無し、
+     ネイティブ側は`cfg(not(wasm32))`で完全分離されているため挙動不変)。
+  2. **ファイルI/O分離**: `GptModel::load(dir: &Path)`(`std::fs`呼び出し、
+     freestandingなwasm32では使えない)から、パース本体を
+     `GptModel::load_from_bytes(config_json: &str, weights_bytes: &[u8])`
+     へ抽出(`load`はこの関数の薄いI/Oラッパーへ変更、挙動は完全に
+     無変更)。同様に`GptTokenizer::load(dir: &Path)`から
+     `GptTokenizer::load_from_str(tokenizer_json: &str)`を切り出した。
+     これにより、JS側がすでに取得済みの`config.json`/
+     `model.safetensors`/`tokenizer.json`のバイト列・文字列をそのまま
+     渡せる(ブラウザにファイルシステムは無いため、この分離が
+     wasm-bindgen層を実装する前提条件だった)。
+  3. **`crates/open-cuda-llm-wasm`新設**(`wasm-bindgen = "=0.2.126"`、
+     インストール済みの`wasm-bindgen-cli 0.2.126`とバージョンを一致
+     させる必要があった——`wasm-bindgen`crateとCLIはスキーマバージョンが
+     一致しないと`wasm-bindgen`コマンドが失敗する既知の制約)。
+     `LoadedModel`(`#[wasm_bindgen]`構造体、`config_json`/
+     `weights_bytes`/`tokenizer_json`から構築)・
+     `LoadedModel::generate(prompt, max_new_tokens, repetition_penalty)`
+     (`generate_with_repetition_penalty`をそのまま呼ぶ薄いラッパー)・
+     デバッグ用`tokenize_preview`を公開。**GPU実行パスは常にCPU
+     (`opencuda-cpu::CpuDevice`)固定**——`opencuda-vulkan`のVulkan実行
+     パスはブラウザには存在しないWindows/Linux専用API(Vulkan自体)を
+     要求するため使えない(WebGPU等への別途対応が必要、モジュール
+     docコメントに明記)。
+  4. **実際にビルド・`wasm-bindgen`実行・ブラウザロードまで検証(型
+     チェックのみで完了と報告しない方針を徹底)**:
+     - `cargo build -p open-cuda-llm-wasm --target wasm32-unknown-unknown
+       --release`成功、`target/wasm32-unknown-unknown/release/
+       open_cuda_llm_wasm.wasm`(3.3MB)を生成。
+     - `wasm-bindgen --target web --out-dir www/pkg
+       target/wasm32-unknown-unknown/release/open_cuda_llm_wasm.wasm`が
+       実際に成功し、`open_cuda_llm_wasm.js`(JSグルー、17KB)・
+       `open_cuda_llm_wasm_bg.wasm`(2.7MB、post-bindgen最適化後)・
+       `.d.ts`型定義を生成した(サイズは`tokenizers`/`fancy-regex`/
+       `nalgebra`等の依存グラフを考えると妥当な範囲)。
+     - `www/index.html`(素のJS、Node.js/webpack/vite不使用、リポジトリに
+       コミット済み)を新設し、Pythonの`http.server`でローカル配信、
+       **実際にブラウザ(このマシンのClaude Browser経由)で開き、
+       `init()`(wasm-bindgenが生成する初期化関数)が実際に成功し
+       "wasm module loaded OK"がDOMに表示されること・コンソールエラーが
+       無いことを確認した**(モックではなく実ブラウザでの実行)。
+  5. **正直な開示(誇張しない、CLAUDE.md方針通り)**:
+     - **モデル重みの配信方法(fetchでダウンロード→IndexedDBキャッシュ等)
+       は今回のスコープ外のまま**——`LoadedModel::new`はJS側が既に
+       取得済みのバイト列/文字列を受け取るだけの設計であり、実際に
+       ブラウザから`fetch()`でGPT-2の`model.safetensors`(数百MB)を
+       取得しキャッシュする処理は実装していない(別途の設計課題として
+       正直に切り出す、というタスク指示に従う)。
+     - **実重み(GPT-2 124M safetensors)を使った`LoadedModel::generate`
+       のブラウザ内フルE2E推論(実際の文章生成)は今回未検証**——
+       検証したのは(a)wasm32ビルドの成立・(b)wasm-bindgen生成物の実在・
+       (c)生成されたJSグルーが実ブラウザで実際にロードでき`init()`が
+       成功すること、の3点まで。数百MBの重みファイルをこのセッションで
+       ダウンロードして実推論させる工程は、ダウンロードの明示許可を
+       要する操作であり、かつタスク指示が「推論コード自体がWASMとして
+       動くかの実証が主眼、モデル配信は別課題」と明記しているため、
+       今回は実施していない。
+     - **`opencuda-cpu`(rayon並列実行)がブラウザのWeb Worker無し環境で
+       実際にスレッドを生成せず正しく動作するかは未検証**——
+       `cargo check --target wasm32-unknown-unknown`でのコンパイル成功
+       のみ確認(rayonはwasm32でスレッド機能を使わない設定でコンパイル
+       は通るが、実行時にどう振る舞うかはブラウザで`generate`を実際に
+       呼ぶまで分からない、次回課題として明記)。
+     - Vulkan実行パス(`real-vulkan`feature)はビルド時点で`open-cuda-
+       llm-wasm`の依存グラフに含めていない(dev-dependency側のみに
+       限定済み、`opencuda-vulkan`自体はブラウザでは無意味なため)。
+  6. **`.gitignore`更新**: `www/pkg/`・`www/pkg-node/`(`wasm-bindgen`の
+     生成物、`.spv`/`.dxil`と同じ「都度再生成するビルド成果物」扱い)を
+     追加。`www/index.html`(手書きのスモークテストページ)自体は
+     コミット対象。
+  - 次にすべきこと: (1) モデル重みの配信設計(fetch→IndexedDBキャッシュ、
+    チャンク分割ダウンロード・進捗表示・オフライン再利用)——タスク
+    指示通り本セッションでは実装せず別課題として明記するのみ、(2)
+    実重み(GPT-2 124M)をブラウザへ実際に読み込ませ`LoadedModel::
+    generate`をブラウザ内で呼んで文章生成できることのフルE2E検証
+    (ダウンロード許可を得た上で次回実施)、(3) `opencuda-cpu`の
+    ブラウザ実行時スレッド挙動の実機検証、(4) `console_error_panic_
+    hook`はデバッグ用に追加したのみで、本番想定のエラーハンドリング
+    (JS側へのより丁寧なエラーメッセージ整形等)は未整備。
+
 - **2026-08-10 `GptModel::generate_with_repetition_penalty`(CTRL方式の
   繰り返しペナルティ)を新設、`aruaru-llm`側報告の反復ループバグへ
   根本対応(ユーザー指示「反復バグの根本解決の為にaruaru-llm側の繰り返し
