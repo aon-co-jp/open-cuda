@@ -29,8 +29,8 @@ members = [
 version = "0.4.1"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["PHI"]
-repository = "https://github.com/PHI/opencuda"
+authors = ["aon-co-jp"]
+repository = "https://github.com/aon-co-jp/open-cuda"
 rust-version = "1.75"
 
 [workspace.dependencies]
