@@ -7,3 +7,4 @@
 # ライセンス上の理由でリポジトリには含めない。crates/opencuda-llm/src/lib.rs
 # のテスト・CLAUDE.md HANDOFF参照、各自Hugging Faceから取得すること)。
 crates/open-cuda-llm/models/
+.claude/worktrees/
