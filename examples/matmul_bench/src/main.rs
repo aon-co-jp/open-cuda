@@ -27,6 +27,54 @@ fn main() -> Result<()> {
 
     println!("matmul_bench: size={size}x{size}, iterations={iterations}");
 
+    // 2026-08-15追加(ユーザー指示: スマホの「実システムメモリ+仮想化
+    // メモリ」はPCと事情が違うので活かして欲しい): デスクトップPC
+    // (大容量RAM+ページファイル、確保しすぎてもOSが緩やかに対応)とは
+    // 異なり、Androidは物理メモリが少なく(実機で確認済み: 総容量
+    // 3.5GB、実際に空いているのは1.3GB程度——残りは他アプリ・
+    // キャッシュが使用中)、メモリ逼迫時はページングではなく
+    // Low Memory Killer(LMK)がプロセスを強制終了させる。統合GPU
+    // (UMA)はCPU/GPUで同じ物理メモリを共有するため、GPU用に確保した
+    // 分だけ他プロセスから見える空きメモリも減る——この特性を無視して
+    // PC感覚で大きな行列を確保すると、LMKに問答無用でkillされうる。
+    // `/proc/meminfo`(Linux/Android共通)が読めれば確保前に警告する
+    // (Windows等/procが無い環境では単にスキップし、確保自体は試みる)。
+    if let Some(mem) = read_mem_status() {
+        let matrices_bytes = 3 * size * size * std::mem::size_of::<f32>(); // a, b, c
+        // 物理RAMの空き(MemAvailable)に加え、Androidは仮想メモリ層
+        // (zram圧縮スワップ、実機確認: SwapTotal約2.3GB)を持つ——
+        // 実測(このmoto g53y 5G)では物理RAM約3.5GB+スワップ約2.3GB
+        // ≈合計5.8GBが実質的な確保余地。物理側だけを見て安全域を
+        // 判定すると、実際にはスワップに余裕があるケースを過度に
+        // 警告してしまう(逆に、スワップは書き込み速度がRAMより遅く、
+        // 使用中はアプリの体感速度低下・バッテリー消費増につながる
+        // ため、「使えるから使う」のではなく参考情報として両方を
+        // 提示するに留める)。
+        let physical_available_bytes = mem.available_kb * 1024;
+        let swap_free_bytes = mem.swap_free_kb.unwrap_or(0) * 1024;
+        let total_headroom_bytes = physical_available_bytes + swap_free_bytes;
+        let usage_ratio_physical = matrices_bytes as f64 / physical_available_bytes as f64;
+        println!(
+            "メモリ状況: 物理RAM空き約{:.1}MB + スワップ空き約{:.1}MB(仮想メモリ、\
+             実RAMより低速) = 合計余地約{:.1}MB。本ベンチの推定使用量約{:.1}MB\
+             (物理RAM空きの{:.1}%)",
+            physical_available_bytes as f64 / 1_048_576.0,
+            swap_free_bytes as f64 / 1_048_576.0,
+            total_headroom_bytes as f64 / 1_048_576.0,
+            matrices_bytes as f64 / 1_048_576.0,
+            usage_ratio_physical * 100.0,
+        );
+        if usage_ratio_physical > 0.5 {
+            eprintln!(
+                "警告: 推定使用量が物理RAM空きの50%を超えています。Android実機ではLow \
+                 Memory Killerに強制終了させられる可能性があります(CPU/GPUは同じ物理\
+                 メモリを共有するUMA構成のため、GPU用の確保分も他プロセスの空きメモリを\
+                 圧迫します)。スワップに余裕があっても、スワップは低速でありLMKの判断は\
+                 主に物理メモリ圧迫を見るため、物理RAM空きに収まるサイズを推奨します。"
+            );
+        }
+    }
+
     let a: Vec<f32> = (0..size * size).map(|i| (i % 7) as f32 * 0.1).collect();
     let b: Vec<f32> = (0..size * size).map(|i| (i % 5) as f32 * 0.1).collect();
 
@@ -218,6 +266,30 @@ fn cast_f32_to_u8(v: &[f32]) -> &[u8] {
 
 fn cast_f32_to_u8_mut(v: &mut [f32]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v)) }
+}
+
+struct MemStatus {
+    available_kb: u64,
+    swap_free_kb: Option<u64>,
+}
+
+/// `/proc/meminfo`から`MemAvailable`(物理RAM空き)と`SwapFree`
+/// (仮想メモリ/スワップ空き、Android機種によってはzram圧縮スワップ)を
+/// 読む。Linux/Android共通のインターフェースで、Windows等には存在
+/// しないため`None`を返す(呼び出し側はチェックをスキップするだけで、
+/// 確保自体は試みる)。
+fn read_mem_status() -> Option<MemStatus> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut available_kb = None;
+    let mut swap_free_kb = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            available_kb = rest.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+            swap_free_kb = rest.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().ok();
+        }
+    }
+    available_kb.map(|available_kb| MemStatus { available_kb, swap_free_kb })
 }
 
 /// 実行ファイルと同じディレクトリの`shaders/matmul.spv`を優先し
