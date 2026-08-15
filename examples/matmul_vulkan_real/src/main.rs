@@ -160,7 +160,21 @@ fn compare(label: &str, got: &[f32], expected: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// 2026-08-15追加(Android実機検証): 開発機のビルド時パス
+/// (`CARGO_MANIFEST_DIR`)は実行ファイルをAndroid実機等の別環境へ
+/// `adb push`した場合には存在しない。実行ファイルと同じディレクトリの
+/// `shaders/matmul.spv`が存在すればそちらを優先し(`adb push`で
+/// バイナリと一緒にシェーダを配置する運用を想定)、無ければ従来通り
+/// 開発機のビルド時パスへフォールバックする。
 fn shader_path() -> Result<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("shaders").join("matmul.spv");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     Ok(manifest_dir.join("shaders").join("matmul.spv"))
 }
