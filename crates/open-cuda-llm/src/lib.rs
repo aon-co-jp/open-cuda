@@ -623,6 +623,22 @@ impl KvCacheHead {
             None => Ok((self.k.clone(), self.v.clone())),
         }
     }
+
+    /// **2026-08-17新設(投機的デコード`GptModel::generate_speculative`
+    /// 向け)**: キャッシュ長を`new_n`(`<= self.n`)へ巻き戻す。ドラフト
+    /// モデルが提案した複数トークンをターゲットモデルで一括検証した後、
+    /// 実際に採用された分だけを残して残りを捨てるために使う。
+    /// **正直な開示・制約**: MLA低ランク圧縮(`k_latent`/`v_latent`が
+    /// 非空)のキャッシュには未対応——`generate_speculative`側で
+    /// MLA有効モデルを`ensure!`で拒否しているため、この関数が
+    /// 実際にMLA圧縮キャッシュへ呼ばれることは無い前提。
+    fn truncate(&mut self, new_n: usize, head_dim: usize) {
+        debug_assert!(new_n <= self.n, "open-cuda-llm: KvCacheHead::truncate: new_n={new_n} must be <= current n={}", self.n);
+        debug_assert!(self.k_latent.is_empty() && self.v_latent.is_empty(), "open-cuda-llm: KvCacheHead::truncate: MLA-compressed caches are not supported");
+        self.k.truncate(new_n * head_dim);
+        self.v.truncate(new_n * head_dim);
+        self.n = new_n;
+    }
 }
 
 /// GPT系デコーダ本体。`load_random`(現状唯一のコンストラクタ、学習済み
@@ -921,7 +937,7 @@ impl GptModel {
         for prompt in sample_prompts {
             anyhow::ensure!(!prompt.is_empty(), "open-cuda-llm: enable_mla_kv_compression_calibrated: calibration prompt must not be empty");
             let mut caches = self.new_caches();
-            self.forward_prefill_all_layers(device, prompt, &mut caches)?;
+            self.forward_prefill_all_layers(device, prompt, 0, &mut caches)?;
             for (layer_idx, layer_caches) in caches.into_iter().enumerate() {
                 for (head_idx, cache_head) in layer_caches.into_iter().enumerate() {
                     let bucket = &mut per_layer_head_rows[layer_idx][head_idx];
@@ -977,20 +993,25 @@ impl GptModel {
         self.lm_head.forward(device, &hidden, 1)
     }
 
-    /// **2026-08-04新設**: プロンプト全体(`prompt_ids`)を`DecoderLayer::
-    /// forward_prefill`でバッチ処理し、最終位置のロジットを返す
-    /// (プリフィル/デコード分離、上記`forward_prefill`のdocコメント参照)。
-    fn forward_prefill_all_layers(&self, device: &dyn GpuDevice, prompt_ids: &[u32], caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
+    /// `forward_prefill_all_layers`/`forward_prefill_all_layers_per_position`
+    /// 共通のembedding+レイヤー通過部分。`start_pos`は`token_ids[0]`が
+    /// 置かれる絶対位置(既存キャッシュに続けて追記する場合に使う、
+    /// 2026-08-17新設——投機的デコードの検証バッチが、プロンプト直後
+    /// ではなく既存キャッシュの続きから始まる位置埋め込みを正しく
+    /// 計算するために必要になった)。プロンプトの初回呼び出しは
+    /// `start_pos=0`を渡せば従来と完全に同じ挙動になる(後方互換)。
+    fn forward_prefill_hidden(&self, device: &dyn GpuDevice, token_ids: &[u32], start_pos: usize, caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
         let hidden_size = self.config.hidden_size;
-        let seq_len = prompt_ids.len();
+        let seq_len = token_ids.len();
 
         let mut hidden_batch = vec![0.0f32; seq_len * hidden_size];
-        for (row, &tok) in prompt_ids.iter().enumerate() {
-            anyhow::ensure!(row < self.config.max_seq_len, "open-cuda-llm: position {row} exceeds max_seq_len {}", self.config.max_seq_len);
+        for (row, &tok) in token_ids.iter().enumerate() {
+            let pos = start_pos + row;
+            anyhow::ensure!(pos < self.config.max_seq_len, "open-cuda-llm: position {pos} exceeds max_seq_len {}", self.config.max_seq_len);
             let tok = tok as usize;
             anyhow::ensure!(tok < self.config.vocab_size, "open-cuda-llm: token id {tok} out of vocab range");
             let word_row = &self.word_embeddings[tok * hidden_size..(tok + 1) * hidden_size];
-            let pos_row = &self.position_embeddings[row * hidden_size..(row + 1) * hidden_size];
+            let pos_row = &self.position_embeddings[pos * hidden_size..(pos + 1) * hidden_size];
             let dst = &mut hidden_batch[row * hidden_size..(row + 1) * hidden_size];
             for (d, (w, p)) in dst.iter_mut().zip(word_row.iter().zip(pos_row.iter())) {
                 *d = w + p;
@@ -1002,6 +1023,19 @@ impl GptModel {
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
             hidden_batch = layer.forward_prefill(device, &hidden_batch, seq_len, cache, hidden_size, self.config.num_heads, softmax_spirv, flash_spirv)?;
         }
+        Ok(hidden_batch)
+    }
+
+    /// **2026-08-04新設**: プロンプト全体(`token_ids`)を`DecoderLayer::
+    /// forward_prefill`でバッチ処理し、最終位置のロジットを返す
+    /// (プリフィル/デコード分離、上記`forward_prefill`のdocコメント参照)。
+    /// **2026-08-17変更**: `start_pos`引数を追加(`forward_prefill_hidden`
+    /// 参照)——既存呼び出し元(プロンプトの初回prefill)は`start_pos=0`を
+    /// 渡すことで挙動は完全に無変更。
+    fn forward_prefill_all_layers(&self, device: &dyn GpuDevice, token_ids: &[u32], start_pos: usize, caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let seq_len = token_ids.len();
+        let hidden_batch = self.forward_prefill_hidden(device, token_ids, start_pos, caches)?;
 
         // 最終位置のみLayerNorm+lm_headを適用すれば十分(`generate`が
         // 必要とするのは次トークン予測用のロジットのみのため、他の行を
@@ -1010,6 +1044,21 @@ impl GptModel {
         let mut last_hidden = hidden_batch[last_row_start..last_row_start + hidden_size].to_vec();
         self.final_ln.forward(&mut last_hidden, 1, hidden_size);
         self.lm_head.forward(device, &last_hidden, 1)
+    }
+
+    /// **2026-08-17新設(投機的デコード`generate_speculative`向け)**:
+    /// `forward_prefill_all_layers`と同じバッチprefillを行うが、最終位置
+    /// だけでなく**全位置**のロジットを返す(`seq_len * vocab_size`の
+    /// フラット配列、行`i`が位置`start_pos+i`の次トークン予測に対応)。
+    /// 投機的デコードの検証ステップでは、ドラフトモデルが提案した複数
+    /// トークンそれぞれについてターゲットモデルの貪欲選択を知る必要が
+    /// あるため、最終位置だけでは足りない。
+    fn forward_prefill_all_layers_per_position(&self, device: &dyn GpuDevice, token_ids: &[u32], start_pos: usize, caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let seq_len = token_ids.len();
+        let mut hidden_batch = self.forward_prefill_hidden(device, token_ids, start_pos, caches)?;
+        self.final_ln.forward(&mut hidden_batch, seq_len, hidden_size);
+        self.lm_head.forward(device, &hidden_batch, seq_len)
     }
 
     /// 貪欲デコード(argmax、サンプリング温度無し)で`max_new_tokens`個
@@ -1049,7 +1098,7 @@ impl GptModel {
         let device_ref = device.as_ref();
         let mut caches = self.new_caches();
 
-        let mut logits = self.forward_prefill_all_layers(device_ref, prompt_ids, &mut caches)?;
+        let mut logits = self.forward_prefill_all_layers(device_ref, prompt_ids, 0, &mut caches)?;
         let pos = prompt_ids.len();
 
         let mut seen: std::collections::HashSet<u32> = prompt_ids.iter().copied().collect();
@@ -1068,6 +1117,220 @@ impl GptModel {
             next = argmax(&logits);
         }
         Ok(generated)
+    }
+
+    /// **2026-08-17新設**: 全レイヤー・全ヘッドのKVキャッシュを`new_n`
+    /// トークン分へ巻き戻す(`KvCacheHead::truncate`参照)。
+    fn truncate_caches(&self, caches: &mut [Vec<KvCacheHead>], new_n: usize) {
+        let head_dim = self.config.hidden_size / self.config.num_heads;
+        for layer_caches in caches.iter_mut() {
+            for head_cache in layer_caches.iter_mut() {
+                head_cache.truncate(new_n, head_dim);
+            }
+        }
+    }
+
+    /// **2026-08-17新設**: DeepSeekの「DSpark」(ロスレス投機的デコード、
+    /// 2026-06-27公開・MITライセンス)・および学術的には
+    /// Leviathan et al. 2023 "Fast Inference from Transformers via
+    /// Speculative Decoding"に遡る手法を、貪欲デコード(このクレートが
+    /// 唯一対応するデコード方式)向けに実装したもの。ユーザー承認
+    /// (週次リサーチルーティンでのDSpark/llama.cpp Multi-Token
+    /// Prediction調査結果への2026-08-17 YES回答)を受けて実装した。
+    ///
+    /// ## 目的(`aruaru-llm`側の既知のボトルネックへの対応)
+    ///
+    /// `aruaru-llm`のCLAUDE.mdは、GT730のような低性能GPUでは「1トークン
+    /// デコードのGEMMが極めて軽く、Vulkanディスパッチの固定オーバー
+    /// ヘッドが支配的になる」ことを複数回実測してきた。本関数は、軽量な
+    /// `draft`モデル(例: `distilgpt2`)に複数トークンを先に提案させ、
+    /// 本命の`self`(ターゲット、例: `gpt2-medium`)モデルは**1回の
+    /// バッチprefillで複数トークンをまとめて検証**することで、ターゲット
+    /// モデル側のディスパッチ回数を「採用トークン数」ではなく「ラウンド数」
+    /// のオーダーへ削減する——ディスパッチ固定オーバーヘッドが支配的な
+    /// 環境ほど効果が大きいはずだが、この初回実装では実機ベンチマークは
+    /// 未実施(下記「正直な開示」参照、`aruaru-llm`側配線後に計測予定)。
+    ///
+    /// ## ロスレス性の根拠(貪欲デコード限定、誇張しない範囲での説明)
+    ///
+    /// ラウンドごとに、ドラフトモデルが提案した`x_0..x_{k-1}`のうち、
+    /// ターゲットモデルが同じ位置で貪欲に選んだであろうトークンと一致
+    /// する先頭`m`個(`0 <= m <= k`)をそのまま採用し、最初に食い違った
+    /// 位置(または全て一致した場合はその直後の位置)ではターゲット自身の
+    /// 貪欲選択を採用する。帰納的に、この手続きで生成される系列は
+    /// `self.generate()`(ターゲット単体の貪欲デコード)と1トークン単位で
+    /// ビット完全に一致する——ドラフトモデルの品質は出力の正しさには
+    /// 一切影響せず、採用率(高速化率)にのみ影響する。この性質自体は
+    /// テスト`generate_speculative_matches_plain_greedy_decode`で
+    /// 数値的に検証している。
+    ///
+    /// ## 正直な開示・制約
+    ///
+    /// - サンプリング(温度・top-k/top-p)は未対応(このクレート全体が
+    ///   貪欲デコードのみ対応のため、既存の`generate`と同じ制約)。
+    /// - `self`(ターゲット)・`draft`は同じ語彙(トークナイザ・
+    ///   `vocab_size`)を共有する前提——実運用では同じGPT-2ファミリー内の
+    ///   異なるサイズ(例: ターゲット`gpt2-medium`+ドラフト`distilgpt2`)を
+    ///   想定する。異なる場合はエラーを返す。
+    /// - MLA低ランクKVキャッシュ圧縮(`enable_mla_kv_compression*`)が
+    ///   有効なモデルは未対応(`KvCacheHead::truncate`が非圧縮キャッシュ
+    ///   のみ対応のため)——該当する場合はエラーを返す。
+    /// - 繰り返しペナルティ(`generate_with_repetition_penalty`)は未統合。
+    /// - **速度面の実測結果(2026-08-17、CPU実行、誇張しない)**:
+    ///   実重み(ターゲット`gpt2`124M・ドラフト`distilgpt2`82M、
+    ///   `draft_k=4`・`max_new_tokens=16`)で計測したところ、採用率
+    ///   80%(12/15)と高かったにもかかわらず、**素の`generate()`より
+    ///   実際には遅かった**(plain=4.63秒 vs speculative=7.65秒、テスト
+    ///   `real_gpt2_speculative_decoding_matches_plain_greedy_and_reports_
+    ///   acceptance`の`--nocapture`実測)。CPU素朴GEMM実装では
+    ///   ディスパッチ固定オーバーヘッドという「削減すべきコスト」自体が
+    ///   ほぼ存在しないため、(a)ドラフトモデルの計算コスト、(b)検証
+    ///   ラウンドごとにドラフト側のKVキャッシュを毎回truncate+再構築する
+    ///   本実装のコスト、が純増分になってしまい逆効果だった。**本命の
+    ///   対象は`aruaru-llm`が繰り返し記録してきたVulkanディスパッチ
+    ///   オーバーヘッド支配的な環境(`--features real-vulkan`)であり、
+    ///   その環境での速度検証は未実施**(次の増分、下記「次にすべき
+    ///   こと」参照)——CPU実行での本結果だけを見て「投機的デコードは
+    ///   有効」と主張することはしない。
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_speculative(
+        &self,
+        device: &std::sync::Arc<dyn GpuDevice>,
+        draft: &GptModel,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        draft_k: usize,
+    ) -> Result<(Vec<u32>, SpeculativeStats)> {
+        anyhow::ensure!(!prompt_ids.is_empty(), "open-cuda-llm: generate_speculative: prompt_ids must not be empty");
+        anyhow::ensure!(draft_k >= 1, "open-cuda-llm: generate_speculative: draft_k must be >= 1");
+        anyhow::ensure!(
+            self.config.vocab_size == draft.config.vocab_size,
+            "open-cuda-llm: generate_speculative: target vocab_size={} != draft vocab_size={}",
+            self.config.vocab_size,
+            draft.config.vocab_size
+        );
+        anyhow::ensure!(
+            self.layers.iter().all(|l| l.mla.is_none()) && draft.layers.iter().all(|l| l.mla.is_none()),
+            "open-cuda-llm: generate_speculative: MLA-compressed models are not supported yet (KvCacheHead::truncate only handles full-precision caches)"
+        );
+        if max_new_tokens == 0 {
+            return Ok((Vec::new(), SpeculativeStats::default()));
+        }
+
+        let device_ref = device.as_ref();
+        let vocab = self.config.vocab_size;
+
+        let mut target_caches = self.new_caches();
+        let mut draft_caches = draft.new_caches();
+
+        // プロンプトをそれぞれ独立にプリフィル(既存`generate`と同じ、
+        // 挙動を変えない範囲での起点)。
+        let target_prompt_logits = self.forward_prefill_all_layers(device_ref, prompt_ids, 0, &mut target_caches)?;
+        let draft_prompt_logits = draft.forward_prefill_all_layers(device_ref, prompt_ids, 0, &mut draft_caches)?;
+
+        let mut pos = prompt_ids.len();
+        // t_0: プロンプト直後にターゲットモデルが貪欲に選ぶトークン
+        // (ラウンド0のドラフト提案x_0と比較する基準)。
+        let mut pending_target_pick = argmax(&target_prompt_logits);
+        // ドラフトモデルの最初の提案x_0。
+        let mut pending_draft_pick = argmax(&draft_prompt_logits);
+
+        let mut output = Vec::with_capacity(max_new_tokens);
+        let mut stats = SpeculativeStats::default();
+
+        while output.len() < max_new_tokens {
+            let remaining = max_new_tokens - output.len();
+            let k = draft_k.min(remaining).min(self.config.max_seq_len.saturating_sub(pos)).max(1);
+
+            // 1) ドラフトモデルでx_0..x_{k-1}を自己回帰的に提案する
+            //    (ドラフト自身のKVキャッシュへ逐次push、この成長分は
+            //    検証後に使い切り、下記4番で正確に作り直す)。
+            let mut draft_tokens = Vec::with_capacity(k);
+            let mut next_draft_input = pending_draft_pick;
+            for i in 0..k {
+                draft_tokens.push(next_draft_input);
+                if i + 1 < k {
+                    let logits = draft.forward_step(device_ref, next_draft_input, pos + i, &mut draft_caches)?;
+                    next_draft_input = argmax(&logits);
+                }
+            }
+
+            // 2) ターゲットモデルで一括検証(投機的デコードの高速化の核心
+            //    ——k個のトークンをk回ではなく1回のバッチprefillで処理)。
+            let verify_logits = self.forward_prefill_all_layers_per_position(device_ref, &draft_tokens, pos, &mut target_caches)?;
+
+            // target_predictions[i] = ターゲットが位置pos+iで貪欲に選ぶ
+            // トークン(i=0はプロンプト/前ラウンド由来のpending_target_pick、
+            // i=1..kはverify_logitsの各行から)。
+            let mut target_predictions = Vec::with_capacity(k + 1);
+            target_predictions.push(pending_target_pick);
+            for j in 0..k {
+                target_predictions.push(argmax(&verify_logits[j * vocab..(j + 1) * vocab]));
+            }
+
+            stats.proposed += k;
+            let mut m = 0usize;
+            while m < k && draft_tokens[m] == target_predictions[m] {
+                m += 1;
+            }
+            stats.accepted += m;
+            let correction = target_predictions[m];
+
+            // 3) 採用分をoutputへ反映(max_new_tokensの上限を超えない範囲)。
+            for &tok in &draft_tokens[0..m] {
+                if output.len() >= max_new_tokens {
+                    break;
+                }
+                output.push(tok);
+            }
+            if output.len() < max_new_tokens {
+                output.push(correction);
+            }
+
+            // 4) 次ラウンドに向けてターゲット・ドラフト双方のKVキャッシュを
+            //    「実際に採用された系列(採用分+補正トークン)」だけに
+            //    揃え直す(3番のmax_new_tokens上限による打ち切りとは独立に、
+            //    次ラウンドを回さないループ終了時はこの後処理ごと省略しても
+            //    正しさに影響しないため、ループ条件で自然に止まる)。
+            self.truncate_caches(&mut target_caches, pos + m);
+            let next_target_logits = self.forward_step(device_ref, correction, pos + m, &mut target_caches)?;
+            pending_target_pick = argmax(&next_target_logits);
+
+            draft.truncate_caches(&mut draft_caches, pos);
+            let mut dpos = pos;
+            let mut last_draft_logits = None;
+            for &tok in draft_tokens[0..m].iter().chain(std::iter::once(&correction)) {
+                last_draft_logits = Some(draft.forward_step(device_ref, tok, dpos, &mut draft_caches)?);
+                dpos += 1;
+            }
+            pending_draft_pick = argmax(&last_draft_logits.expect("committed list always has at least the correction token"));
+
+            pos += m + 1;
+        }
+
+        output.truncate(max_new_tokens);
+        Ok((output, stats))
+    }
+}
+
+/// [`GptModel::generate_speculative`]の1呼び出し全体を通じた、ドラフト
+/// モデルの提案採用状況(高速化率の目安)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpeculativeStats {
+    /// ドラフトモデルが提案した(検証対象になった)トークンの総数。
+    pub proposed: usize,
+    /// そのうちターゲットモデルの貪欲選択と一致し実際に採用された数。
+    pub accepted: usize,
+}
+
+impl SpeculativeStats {
+    /// 採用率(0.0〜1.0)。`proposed==0`なら`0.0`。
+    pub fn acceptance_rate(&self) -> f32 {
+        if self.proposed == 0 {
+            0.0
+        } else {
+            self.accepted as f32 / self.proposed as f32
+        }
     }
 }
 
@@ -1169,6 +1432,69 @@ mod tests {
         assert_eq!(generated.len(), 8);
         // decodeがpanicしないこと(語彙範囲外を混ぜても壊れない)も確認。
         let _ = ByteTokenizer::decode(&generated);
+    }
+
+    /// **2026-08-17新設**: `generate_speculative`の核心的な正しさの検証
+    /// ——ドラフトモデルにターゲットと同一のモデル(同一シード)を使うと、
+    /// ドラフトの提案は常にターゲットの貪欲選択と一致する(採用率100%)
+    /// はずであり、出力は`generate()`(ターゲット単体の貪欲デコード)と
+    /// 完全に一致するはず。
+    #[test]
+    fn generate_speculative_with_identical_draft_matches_plain_greedy_decode_with_full_acceptance() {
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let target = GptModel::load_random(config.clone(), 7);
+        let draft = GptModel::load_random(config, 7); // 同一シード=同一重み
+        let device = device();
+        let prompt = ByteTokenizer::encode("speculative decoding should be lossless");
+
+        let plain = target.generate(&device, &prompt, 12).unwrap();
+        let (speculative, stats) = target.generate_speculative(&device, &draft, &prompt, 12, 4).unwrap();
+
+        assert_eq!(speculative, plain);
+        assert_eq!(stats.proposed, stats.accepted, "identical draft/target should have 100% acceptance");
+    }
+
+    /// **2026-08-17新設**: ドラフトとターゲットが異なるモデル(異なる
+    /// シード=異なる重み)の場合、提案は一部しか一致しないはずだが、
+    /// それでも出力は`generate()`とビット完全に一致し続けなければ
+    /// ならない(ロスレス性の本質的な検証、DSpark/Leviathan et al.の
+    /// 手法が保証する性質)。
+    #[test]
+    fn generate_speculative_with_different_draft_still_matches_plain_greedy_decode() {
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let target = GptModel::load_random(config.clone(), 100);
+        let draft = GptModel::load_random(config, 999); // 異なるシード=異なる重み
+        let device = device();
+        let prompt = ByteTokenizer::encode("a different draft model still has to be lossless");
+
+        let plain = target.generate(&device, &prompt, 16).unwrap();
+        let (speculative, stats) = target.generate_speculative(&device, &draft, &prompt, 16, 3).unwrap();
+
+        assert_eq!(speculative, plain, "output must be byte-identical to plain greedy decode regardless of draft quality");
+        assert!(stats.proposed > 0, "expected at least one speculative round to have proposed tokens");
+    }
+
+    /// 語彙サイズが異なるモデル同士は拒否されることを確認。
+    #[test]
+    fn generate_speculative_rejects_mismatched_vocab_size() {
+        let device = device();
+        let target = GptModel::load_random(GptConfig::tiny(300), 1);
+        let draft = GptModel::load_random(GptConfig::tiny(200), 1);
+        let prompt = vec![1u32, 2, 3];
+        assert!(target.generate_speculative(&device, &draft, &prompt, 4, 2).is_err());
+    }
+
+    /// MLA圧縮を有効化したモデルはまだ未対応であることを確認
+    /// (`KvCacheHead::truncate`が非圧縮キャッシュのみ対応のため)。
+    #[test]
+    fn generate_speculative_rejects_mla_compressed_target_or_draft() {
+        let device = device();
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let mut target = GptModel::load_random(config.clone(), 1);
+        target.enable_mla_kv_compression(2, 1).unwrap();
+        let draft = GptModel::load_random(config, 1);
+        let prompt = ByteTokenizer::encode("hi");
+        assert!(target.generate_speculative(&device, &draft, &prompt, 4, 2).is_err());
     }
 
     /// **2026-08-07新設**: `enable_mla_kv_compression`をKVキャッシュ経路
@@ -1291,6 +1617,12 @@ mod tests {
 
     fn gpt2_model_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/gpt2")
+    }
+
+    /// `distilgpt2`(2026-08-17、`generate_speculative`のドラフトモデルとして
+    /// 使う実重み検証向けに新設)。
+    fn distilgpt2_model_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/distilgpt2")
     }
 
     /// 合成(ランダムだが正しい形状の)safetensorsファイルを作り、
@@ -1444,6 +1776,52 @@ mod tests {
         eprintln!("random-init weights greedy continuation: {random_text:?} (token ids: {random_out:?})");
 
         assert_ne!(real_out, random_out, "real GPT-2 weights should produce different greedy output than random init for the same prompt");
+    }
+
+    /// **2026-08-17新設**: `generate_speculative`を実重み(ターゲット
+    /// `gpt2`124M・ドラフト`distilgpt2`82M、同じGPT-2ファミリー・同じ
+    /// GPT-2 BPE語彙)で検証する。型チェック・合成フィクスチャだけで
+    /// 完了と報告しない方針の実践——ロスレス性(`generate()`とのビット
+    /// 完全一致)・採用率・大まかな所要時間差を実際に計測して記録する。
+    #[test]
+    fn real_gpt2_speculative_decoding_matches_plain_greedy_and_reports_acceptance() {
+        let target_dir = gpt2_model_dir();
+        let draft_dir = distilgpt2_model_dir();
+        if !target_dir.join("model.safetensors").exists() || !draft_dir.join("model.safetensors").exists() {
+            eprintln!(
+                "skipping: real gpt2/distilgpt2 weights not present at {target_dir:?} / {draft_dir:?} \
+                 (see CLAUDE.md HANDOFF for download instructions)"
+            );
+            return;
+        }
+
+        let target = GptModel::load(&target_dir).unwrap();
+        let draft = GptModel::load(&draft_dir).unwrap();
+        assert_eq!(target.config().vocab_size, draft.config().vocab_size, "gpt2 and distilgpt2 must share the same GPT-2 BPE vocabulary");
+
+        let tokenizer = GptTokenizer::load(&target_dir).unwrap();
+        let prompt_ids = tokenizer.encode("The quick brown fox").unwrap();
+        let device = device();
+        let max_new_tokens = 16;
+
+        let t0 = std::time::Instant::now();
+        let plain = target.generate(&device, &prompt_ids, max_new_tokens).unwrap();
+        let plain_elapsed = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let (speculative, stats) = target.generate_speculative(&device, &draft, &prompt_ids, max_new_tokens, 4).unwrap();
+        let speculative_elapsed = t1.elapsed();
+
+        assert_eq!(speculative, plain, "speculative decoding output must be byte-identical to plain greedy decode on real weights");
+
+        eprintln!(
+            "generate_speculative (real gpt2 target + distilgpt2 draft, draft_k=4, max_new_tokens={max_new_tokens}): \
+             plain={plain_elapsed:?}, speculative={speculative_elapsed:?}, \
+             acceptance={}/{} ({:.1}%)",
+            stats.accepted,
+            stats.proposed,
+            stats.acceptance_rate() * 100.0
+        );
     }
 
     /// **2026-08-10新設**: `aruaru-llm`側ユーザー報告「しつこく繰り返す
