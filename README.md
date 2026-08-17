@@ -1,5 +1,11 @@
 # open-cuda
 
+*English*: [README-English.md](README-English.md) ·
+*Other languages*: [Deutsch](README-German.md) · [Italiano](README-Italian.md) ·
+[Français](README-French.md) · [Русский](README-Russian.md) ·
+[Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
+[فارسی](README-Persian.md) · [العربية](README-Arabic.md)
+
 > 📌 **最近の更新(2026-08-10)**: `open-cuda-llm::GptModel`に
 > `generate_with_repetition_penalty`(CTRL方式の繰り返しペナルティ、
 > penalty>1.0で既に登場したトークンのlogitを弱める)を新設した。既存の
