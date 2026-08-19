@@ -343,6 +343,47 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-19 「常駐サービスが無いのは欠陥」というユーザー指摘への調査回答
+  (ユーザー指示: open-cuda/open-directxは常駐サービスを持たず使い捨て
+  バイナリのみの構成であり、DirectX互換システムとして常駐すべきでは
+  ないかとの懸念に対し、実際のMicrosoft DirectX/NVIDIA CUDAの
+  アーキテクチャをWebSearchで裏取りした上で結論を出す)**:
+  1. **調査結果(DirectX)**: 本物のMicrosoft DirectXは`d3d11.dll`等の
+     DLL群(「DirectX Runtime」)を各アプリが動的リンクして使う
+     **ランタイムライブラリ方式**であり、「DirectXサービス」という
+     独立の常駐バックグラウンドプロセスは存在しない。GPUベンダーの
+     カーネルモードドライバ/ユーザーモードドライバは常駐するが、これは
+     GPUベンダー(NVIDIA/AMD/Intel)が提供するものでDirectX自体の一部
+     ではない。
+  2. **調査結果(CUDA)**: NVIDIA CUDAも同様に、アプリが`cudart`等の
+     ランタイムライブラリをリンクして使う方式が基本。ただし
+     `nvidia-persistenced`(Linux向け、オプションのユーザー空間デーモン)
+     が存在し、GPUデバイス状態をジョブ間で維持することで初期化オーバー
+     ヘッド・起動レイテンシを削減する目的で使われる——「複数プロセス間の
+     調停役」ではなく「単一GPUの初期化状態を使い回すための性能最適化」が
+     その役割。
+  3. **結論**: 本家DirectX/CUDAとも「各プロセスにリンクされるランタイム
+     ライブラリ」が標準アーキテクチャであり、常駐バックグラウンドサービス
+     ではない。よって**現在のopen-cudaの設計(ライブラリ+使い捨て
+     example/デモ)は本家と一致しており「欠陥」ではない**——という
+     前回セッションの結論は、今回のWebSearchでの裏取りでも覆らなかった。
+     ただし`nvidia-persistenced`に相当する「GPUデバイス初期化状態を
+     プロセス間で使い回し、起動レイテンシを削減する」という限定的な
+     常駐ユースケースは実在するため、これは実利がある具体的なケースとして
+     記録しておく(過大な設計変更・本格的な常駐デーモン実装はスコープ外
+     のため今回は実装しない——GT730 1台構成のこのマシンでは複数プロセス
+     間でのGPU初期化状態共有の実利用シーンが無く、実装しても実機検証
+     できないため)。
+  4. **今回は実装せず、根拠のみ記録**。将来、`aruaru-llm`等で複数
+     プロセスが同時にopen-cudaのVulkanデバイスを初期化する実運用シーンが
+     生じた場合は、`nvidia-persistenced`型の「デバイス初期化状態の
+     プロセス間キャッシュ」を軽量な常駐コンポーネントとして検討する
+     価値がある。
+  - 出典: [nvidia-persistenced manpage](https://manpages.ubuntu.com/manpages/noble/man1/nvidia-persistenced.1.html)、
+    [NVIDIA Persistence Daemon docs](https://docs.nvidia.com/deploy/driver-persistence/persistence-daemon.html)、
+    DirectX Runtimeがランタイムライブラリ(DLL群)方式であることの一般的な
+    技術文書。
+
 - **2026-08-10(続き) 東芝SBM(シミュレーテッド分岐)の動作実証デモを新設
   (ユーザー指示「aruaru-llm/open-cuda/open-directxへのSBM適用先を日英で
   再調査し、無ければ動作実証デモを作って」への対応)**:
