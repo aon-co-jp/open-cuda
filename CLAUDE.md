@@ -2000,3 +2000,35 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     持つプロジェクトへ発展したが、両者間の直接連携(コンピュート
     シェーダ経路とDXIL/DXBC変換パイプラインの統合)はまだ設計段階、
     ユーザー優先順位に沿って次回検討する。
+
+- **2026-08-19 自動アップデート機能の展開可否を調査(実装見送り)**:
+  ユーザーより、`open-english`の`server/src/self_update.rs`(GitHub
+  Releases検知+`/healthz`ベース自動ロールバック付き自己更新)と同様の
+  仕組みを`aruaru-llm`の依存先である本リポジトリへも展開する依頼を
+  受け調査。
+  - workspace構成を確認: ライブラリクレート10個(`opencuda-core`/
+    `opencuda-cpu`/`opencuda-mock`/`opencuda-vulkan`/`opencuda-directx`/
+    `opencuda-ir`/`opencuda-blas`/`opencuda-multidev`/`open-cuda-bert`/
+    `open-cuda-llm`/`open-cuda-whisper`)に加え、`examples/`配下に
+    `fn main`を持つバイナリが12個(`vector_add`・`vector_add_vulkan`・
+    `vector_add_omniir`・`vector_add_vulkan_real`・`vulkan_info`・
+    `matmul`・`matmul_vulkan_real`・`matmul_bench`・
+    `raid6_xor_parity_vulkan_real`・`raid6_q_parity_vulkan_real`・
+    `softmax_vulkan_real`・`sbm_demo`)存在することを確認した。
+  - **自動アップデート実装の見送り理由**: 依頼文の想定通り、本リポジトリの
+    実態は「ライブラリクレート集+検証用example群」であり、常駐して
+    稼働し続けるサーバー/CLIサービスは1つも無い。12個のexample
+    バイナリはいずれも`cargo run -p <name> --release`で都度実行される
+    ベンチマーク・実機検証用の使い捨てプロセスであり、インストール後に
+    起動しっぱなしで稼働する対象ではない。`/healthz`のようなヘルス
+    チェック・自己更新関連コードもリポジトリ全体を`grep`した結果ゼロ件
+    だった。「新バージョン検知→自身を差し替え→ヘルスチェック失敗で
+    ロールバック」という自己更新の概念は、依存先である`aruaru-llm`側が
+    `Cargo.toml`の依存バージョン(現在`workspace.package.version =
+    "0.4.1"`)を上げて再ビルド・再デプロイする形が実態に即した
+    「アップデート」であり、本リポジトリ単体に自己更新機構を実装する
+    ことは見送った(依頼文中で懸念された通りの結論)。
+  - 次にすべきこと: もし将来`opencuda-*`系列から常駐デーモン・
+    ユーザー配布用CLIツール(例: GPU監視デーモン等)が切り出される
+    場合は、その時点で改めて`self_update.rs`相当の導入をユーザーと
+    相談する。現状は据え置き。
