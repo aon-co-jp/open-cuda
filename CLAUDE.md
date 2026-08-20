@@ -343,6 +343,54 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-20 FlexQ(arXiv:2508.04405)風のINT6量子化を実装、PuzzleMoE
+  (arXiv:2511.04805)は前提条件を実際に確認した上で実装見送り(ユーザー
+  指示、`aruaru-llm`側で発見したDeepSeek系新技術2件への対応、詳細な
+  判定経緯は`aruaru-llm/CLAUDE.md`の同日HANDOFF参照)**:
+  1. **PuzzleMoE(見送り)**: WebFetchで論文を確認。訓練不要
+     (training-free)の後処理という点は軽量だが、**既存のMoEアーキテクチャ
+     が前提**。このリポジトリのモデルクレート(`open-cuda-llm`の
+     `DecoderLayer`、`open-cuda-bert`)はいずれも単一の密なFFNのみで
+     複数エキスパート・ルーターを持たず、GPT-2/BERT系の学習済み重みも
+     MoE構成ではないため適用不能。GPT-2のFFN層をMoE化した上で再学習する
+     ルートは、このマシンのGPU(GT730、Kepler世代、Tensor Core無し)では
+     過去の実測(GEMM/AttentionがCPUより約8倍遅い)から非現実的と判断し、
+     コード変更は行わなかった。
+  2. **FlexQ(実装)**: `crates/opencuda-blas/src/lib.rs`に
+     `QuantizedInt6Tensor`/`quantize_int6`/`dequantize_int6`を新設
+     (既存の`quantize_int4`/`quantize_int8`と同じグループ単位対称量子化
+     の枠組みを再利用、対称レンジ[-31, 31]、共通カーネル
+     `launch_quantize_kernel`をそのまま再利用)。6bitは8の倍数でない
+     ため、INT4の「2値/バイト」方式は拡張できず、**4値をひとまとめに
+     して24bit=3byteへパック**する方式で対応した(4*6=24=3*8、バイト
+     境界にちょうど揃う)。要素数が4の倍数でない場合は末尾を0パディング
+     してから処理する。
+  3. **正直な開示・スコープ**: FlexQ論文が提案する活性化側の
+     W6A6/W6A8混在(レイヤー感度分析による切り替え)・専用GPUカーネル
+     (Binary Tensor Core等価物によるネイティブINT6 matmul)は未実装
+     (既存の`quantize_int4`/`quantize_int8`と同じく、量子化APIの提供
+     までがスコープ、matmulへの配線は次の増分)。
+  4. **検証結果**: 新規テスト4件——
+     `quantize_int6_roundtrip_error_is_bounded_by_half_scale`(往復誤差が
+     スケール半値以内)・
+     `quantize_int6_precision_is_between_int4_and_int8`(同一入力での
+     総誤差がINT4>INT6>INT8の順に単調減少することを確認、AWQ系テスト
+     `quantize_int8_is_more_precise_than_int4_on_same_input`と同じ検証
+     パターン)・`quantize_int6_all_zero_group_stays_zero`・
+     `quantize_int6_handles_length_not_multiple_of_four`(4値/3バイトの
+     パディング境界を明示的に検証)。`cargo test -p opencuda-blas
+     --release`**31件全green**(既存27件+新規4件、regression無し)。
+     `cargo clippy -p opencuda-blas --all-targets --release -- -D
+     warnings`警告0件。`cargo build --workspace --release`
+     リグレッション無し。
+  - 次にすべきこと: (1) `quantize_int6`をモデルクレート
+    (`open-cuda-llm`/`open-cuda-bert`)の実際の重みへ配線する統合は
+    未着手(既存の`quantize_int4`/`quantize_int8`も同様に未配線のまま、
+    今回もAPI層の提供に留めた)。(2) FlexQの活性化側量子化
+    (W6A6/W6A8混在)・専用GPUカーネルは必要になれば追加検討。(3)
+    PuzzleMoEは、MoE構成の学習済みチェックポイントの入手、またはGT730
+    より高性能なGPUの調達ができた場合にのみ再検討する。
+
 - **2026-08-19 「常駐サービスが無いのは欠陥」というユーザー指摘への調査回答
   (ユーザー指示: open-cuda/open-directxは常駐サービスを持たず使い捨て
   バイナリのみの構成であり、DirectX互換システムとして常駐すべきでは

@@ -944,6 +944,85 @@ pub fn dequantize_int8(t: &QuantizedInt8Tensor) -> Vec<f32> {
     (0..t.len).map(|i| t.data[i] as f32 * t.scales[i / t.group_size]).collect()
 }
 
+/// INT6量子化済みテンソル（グループ単位の対称量子化、FlexQ
+/// [Zhao et al., arXiv:2508.04405](https://arxiv.org/abs/2508.04405)風）。
+///
+/// FlexQは全レイヤー一律6bit重み量子化＋レイヤー感度に応じたW6A6/W6A8の
+/// 活性化混在を提案するが、本実装がスコープとするのは重み量子化部分
+/// (INT4/INT8と同じ`opencuda-blas`の量子化API層)のみ——活性化側の
+/// ビット幅切り替え・レイヤー感度分析・専用GPUカーネル(Binary Tensor
+/// Core等価物によるINT6 matmul)は本実装の範囲外(正直な開示)。
+///
+/// - `data`: 量子化値(6bit、[-31, 31])を4値/3バイトでパックしたもの
+///   (4*6=24=3*8、バイト境界をまたぐビット列)。各値は
+///   「符号付き値 + 32」(0..=63)として格納する。
+/// - `scales`: グループごとのスケール(`dequant = (packed_value - 32) as
+///   f32 * scale`)。
+/// - `group_size`: 1グループの要素数。
+/// - `len`: 元の要素数(4の倍数でない場合、最終グループはパディングされる)。
+#[derive(Debug, Clone)]
+pub struct QuantizedInt6Tensor {
+    pub data: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub group_size: usize,
+    pub len: usize,
+}
+
+/// INT6量子化(グループ単位の対称量子化、FlexQ風)。
+///
+/// スケールは`max_abs / 31`(対称レンジ[-31, 31]、INT4の±7・INT8の±127と
+/// 同じ「1ビットを符号+丸め余裕に譲る」慣例)。カーネル自体は既存の
+/// `launch_quantize_kernel`(1値/バイトの対称量子化カーネル、INT4/INT8と
+/// 共通)をそのまま再利用し、[-31, 31]へクランプする点のみが異なる。
+///
+/// パッキングは4値/3バイト(24bit)単位: 6bitのビット幅は8の倍数ではない
+/// ため、INT4の「2値/バイト」方式をそのまま拡張できない。4個の6bit値を
+/// 連結すると24bit=3byteでちょうどバイト境界に揃うため、4値ごとに3バイト
+/// を書き出すブロック単位でパックする(要素数が4の倍数でない場合は
+/// 末尾を0でパディングしてから4値ブロックとして処理する)。
+pub fn quantize_int6(device: &dyn GpuDevice, input: &[f32], group_size: usize) -> Result<QuantizedInt6Tensor> {
+    validate_quantize_args(input, group_size)?;
+    // 対称レンジ[-31, 31]（6bitは64値、符号+31段階の慣例に合わせる）。
+    let scales = group_scales(input, group_size, 31.0);
+    let q = launch_quantize_kernel(device, input, &scales, group_size, -31.0, 31.0)?;
+
+    // 4値ブロックごとに3バイトへパック。値は q + 32（0..=63、6bit）。
+    let num_blocks = input.len().div_ceil(4);
+    let mut data = vec![0u8; num_blocks * 3];
+    for block in 0..num_blocks {
+        let mut vals = [0u8; 4];
+        for (j, v) in vals.iter_mut().enumerate() {
+            let idx = block * 4 + j;
+            *v = if idx < q.len() { (q[idx] + 32) as u8 & 0x3F } else { 0 };
+        }
+        // 4x6bit -> 3byte: v0[5:0] v1[1:0] | v1[5:2] v2[3:0] | v2[5:4] v3[5:0]
+        let b0 = vals[0] | (vals[1] << 6);
+        let b1 = (vals[1] >> 2) | (vals[2] << 4);
+        let b2 = (vals[2] >> 4) | (vals[3] << 2);
+        data[block * 3] = b0;
+        data[block * 3 + 1] = b1;
+        data[block * 3 + 2] = b2;
+    }
+    Ok(QuantizedInt6Tensor { data, scales, group_size, len: input.len() })
+}
+
+/// [`quantize_int6`]の逆変換(ホスト側)。
+pub fn dequantize_int6(t: &QuantizedInt6Tensor) -> Vec<f32> {
+    (0..t.len)
+        .map(|i| {
+            let block = i / 4;
+            let j = i % 4;
+            let b0 = t.data[block * 3] as u32;
+            let b1 = t.data[block * 3 + 1] as u32;
+            let b2 = t.data[block * 3 + 2] as u32;
+            let packed = b0 | (b1 << 8) | (b2 << 16); // 24bit中に4x6bit
+            let v6 = (packed >> (j * 6)) & 0x3F;
+            let q = v6 as i32 - 32;
+            q as f32 * t.scales[i / t.group_size]
+        })
+        .collect()
+}
+
 /// AWQ（Activation-aware Weight Quantization、[Lin et al.](https://arxiv.org/abs/2306.00978)）
 /// 風のINT4量子化。既存の`quantize_int4`は全チャネルを均等に量子化するため、
 /// 重み自体は小さくても対応する活性化の振幅が大きい「重要チャネル」ほど、
@@ -1244,6 +1323,55 @@ mod tests {
         assert!((t.scales[1] - 0.001).abs() < 1e-7);
         let restored = dequantize_int4(&t);
         assert!((restored[2] - 0.007).abs() < 0.001 * 0.5 + 1e-7);
+    }
+
+    #[test]
+    fn quantize_int6_roundtrip_error_is_bounded_by_half_scale() {
+        let device = cpu_device();
+        let input: Vec<f32> = (0..100).map(|i| ((i as f32) - 50.0) * 1.3).collect();
+        let group_size = 25;
+        let t = quantize_int6(device.as_ref(), &input, group_size).unwrap();
+        let restored = dequantize_int6(&t);
+        for (i, (&x, &r)) in input.iter().zip(restored.iter()).enumerate() {
+            let scale = t.scales[i / group_size];
+            assert!((x - r).abs() <= scale * 0.5 + 1e-6, "idx {i}: x={x}, restored={r}");
+        }
+    }
+
+    #[test]
+    fn quantize_int6_precision_is_between_int4_and_int8() {
+        let device = cpu_device();
+        let input: Vec<f32> = (0..32).map(|i| (i as f32 * 0.911).sin() * 10.0).collect();
+        let t4 = quantize_int4(device.as_ref(), &input, 32).unwrap();
+        let t6 = quantize_int6(device.as_ref(), &input, 32).unwrap();
+        let t8 = quantize_int8(device.as_ref(), &input, 32).unwrap();
+        let err4: f32 = input.iter().zip(dequantize_int4(&t4)).map(|(x, r)| (x - r).abs()).sum();
+        let err6: f32 = input.iter().zip(dequantize_int6(&t6)).map(|(x, r)| (x - r).abs()).sum();
+        let err8: f32 = input.iter().zip(dequantize_int8(&t8)).map(|(x, r)| (x - r).abs()).sum();
+        assert!(err6 < err4, "int6 total err {err6} should be < int4 total err {err4}");
+        assert!(err8 < err6, "int8 total err {err8} should be < int6 total err {err6}");
+    }
+
+    #[test]
+    fn quantize_int6_all_zero_group_stays_zero() {
+        let device = cpu_device();
+        let input = vec![0.0f32; 8];
+        let t = quantize_int6(device.as_ref(), &input, 4).unwrap();
+        assert_eq!(t.scales, vec![0.0, 0.0]);
+        assert_eq!(dequantize_int6(&t), input);
+    }
+
+    #[test]
+    fn quantize_int6_handles_length_not_multiple_of_four() {
+        // ブロックパディング境界(4値/3バイト)の取りこぼしを検証する。
+        let device = cpu_device();
+        let input = vec![31.0, -31.0, 0.0, 15.0, 7.0];
+        let t = quantize_int6(device.as_ref(), &input, input.len()).unwrap();
+        assert_eq!(t.data.len(), 6); // 5要素 -> 2ブロック(8スロット分) -> 6バイト
+        let restored = dequantize_int6(&t);
+        for (x, r) in input.iter().zip(restored.iter()) {
+            assert!((x - r).abs() <= t.scales[0] * 0.5 + 1e-4, "x={x}, r={r}");
+        }
     }
 
     #[test]
@@ -1816,5 +1944,7 @@ mod tests {
         assert!(quantize_int4(device.as_ref(), &[1.0], 0).is_err());
         assert!(quantize_int8(device.as_ref(), &[], 4).is_err());
         assert!(quantize_int8(device.as_ref(), &[1.0], 0).is_err());
+        assert!(quantize_int6(device.as_ref(), &[], 4).is_err());
+        assert!(quantize_int6(device.as_ref(), &[1.0], 0).is_err());
     }
 }
