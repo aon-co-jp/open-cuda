@@ -86,3 +86,24 @@ Hersteller-Bibliotheken. Details siehe `OmniGPU-Design.md` §8.5.
   Dispatch-Overhead zum Amortisieren bietet. Der eigentliche
   Ziel-Fall — Geschwindigkeit auf echtem Vulkan — ist noch nicht
   gemessen.
+- **2026-08-19 — Auto-Update**: Untersuchung eines automatischen
+  Update-Mechanismus (nach dem Vorbild von `open-english`s
+  `self_update.rs`) — verworfen: dieses Repo besteht nur aus
+  Bibliotheks-Crates und Wegwerf-Beispielbinaries, kein residenter
+  Dienst. **Widerlegung eines Einwands**: das Fehlen eines residenten
+  Dienstes ist kein Mangel — das echte Microsoft DirectX/NVIDIA CUDA
+  arbeitet selbst als Laufzeitbibliotheken, die von jedem Prozess
+  gelinkt werden, nicht als Hintergrunddienste (`nvidia-persistenced`
+  ist eine begrenzte Ausnahme zur Zwischenspeicherung des
+  GPU-Initialisierungszustands, kein Schiedsrichter zwischen Prozessen).
+- **2026-08-20 — Korrektur**: die frühere Notiz über eine „in
+  Entwicklung befindliche Verbindung" zwischen `open-directx` und
+  `open-cuda` war ungenau. Tatsächlich handelt es sich um zwei
+  gleichnamige, unabhängige Projekte: (1) das interne
+  `opencuda-directx`-Crate dieses Repos, und (2) das eigenständige
+  Repository `aon-co-jp/open-directx`.
+- **2026-08-20 — FlexQ-ähnliche INT6-Quantisierung**: Hinzufügen von
+  `quantize_int6`/`dequantize_int6`/`QuantizedInt6Tensor` in
+  `opencuda-blas`, das 4 6-Bit-Werte in 3 Bytes packt. PuzzleMoE wurde
+  verworfen, da in den Modellen dieses Repos keine MoE-Architektur
+  existiert (nur ein einzelnes dichtes FFN).

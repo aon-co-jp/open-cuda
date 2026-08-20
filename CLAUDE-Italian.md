@@ -85,3 +85,23 @@ non verificati) / il livello stub delle librerie vendor. Dettagli in
   speculativo 7,65s), perché il GEMM naive su CPU ha poco overhead di
   dispatch da ammortizzare. Il caso target reale — velocità su Vulkan
   reale — resta non misurato.
+- **2026-08-19 — Aggiornamento automatico**: indagine sull'introduzione
+  di un meccanismo di auto-update (sul modello di `self_update.rs` di
+  `open-english`) — scartata: questo repo contiene solo crate di
+  libreria e binari di esempio usa-e-getta, nessun servizio residente.
+  **Confutazione di un'obiezione**: l'assenza di un servizio residente
+  non è un difetto — il vero DirectX/CUDA di Microsoft/NVIDIA funziona
+  esso stesso come librerie runtime linkate da ogni processo, non come
+  servizi in background (`nvidia-persistenced` è un'eccezione limitata
+  alla cache dello stato di inizializzazione della GPU, non un arbitro
+  tra processi).
+- **2026-08-20 — Correzione**: la nota precedente su un "collegamento
+  in fase di progettazione" tra `open-directx` e `open-cuda` era
+  imprecisa. In realtà si tratta di due progetti omonimi non correlati:
+  (1) il crate interno `opencuda-directx` di questo repo, e (2) il
+  repository indipendente `aon-co-jp/open-directx`.
+- **2026-08-20 — Quantizzazione INT6 in stile FlexQ**: aggiunti
+  `quantize_int6`/`dequantize_int6`/`QuantizedInt6Tensor` in
+  `opencuda-blas`, che impacchettano 4 valori a 6 bit in 3 byte.
+  PuzzleMoE è stato scartato perché nei modelli di questo repo non
+  esiste un'architettura MoE (solo un singolo FFN denso).
