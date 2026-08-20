@@ -88,3 +88,23 @@ fournisseurs. Détails dans `OmniGPU-Design.md` §8.5.
   4,63s vs spéculatif 7,65s), car le GEMM naïf sur CPU a peu de
   surcoût de dispatch à amortir. Le cas cible réel — la vitesse sur
   Vulkan réel — reste non mesuré.
+- **2026-08-19 — Mise à jour automatique** : enquête sur le déploiement
+  d'un mécanisme de mise à jour automatique (façon `self_update.rs`
+  d'`open-english`) — abandonné : ce dépôt ne contient que des crates
+  de bibliothèque et des binaires d'exemple jetables, aucun service
+  résident. **Réfutation d'une critique** : l'absence de service résident
+  n'est pas un défaut — le vrai DirectX/CUDA de Microsoft/NVIDIA
+  fonctionne lui-même comme bibliothèques d'exécution liées par chaque
+  processus, pas comme des services d'arrière-plan (`nvidia-persistenced`
+  est une exception limitée à la mise en cache de l'état d'initialisation
+  du GPU, pas un arbitre entre processus).
+- **2026-08-20 — Correction** : la note précédente affirmant une
+  « liaison en cours de conception » entre `open-directx` et `open-cuda`
+  était inexacte. En réalité il s'agit de deux projets homonymes sans
+  rapport : (1) le crate interne `opencuda-directx` de ce dépôt, et
+  (2) le dépôt indépendant `aon-co-jp/open-directx`.
+- **2026-08-20 — Quantification INT6 façon FlexQ** : ajout de
+  `quantize_int6`/`dequantize_int6`/`QuantizedInt6Tensor` dans
+  `opencuda-blas`, empaquetant 4 valeurs 6-bit dans 3 octets. PuzzleMoE
+  a été écarté car aucune architecture MoE n'existe dans les modèles
+  de ce dépôt (FFN dense unique).
