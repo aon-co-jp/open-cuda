@@ -2073,3 +2073,24 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
     ユーザー配布用CLIツール(例: GPU監視デーモン等)が切り出される
     場合は、その時点で改めて`self_update.rs`相当の導入をユーザーと
     相談する。現状は据え置き。
+
+- **2026-08-20 「2つのopen-directx」混同の解消(調査のみ)**:
+  以前のHANDOFF(直近エントリ)で「`open-directx`と`open-cuda`は
+  いずれも実体を持つプロジェクトへ発展したが、両者間の直接連携は
+  まだ設計段階」と記述していたが、これは不正確だったため訂正する。
+  実際には設計段階の連携が「ある」のではなく、**同名の無関係な別物が
+  2つ存在するだけ**だった:
+  1. 本リポジトリ内蔵の`opencuda-directx`クレート
+     (`crates/opencuda-directx`、workspace memberとして`Cargo.toml`に
+     `"crates/opencuda-directx"`で登録)。
+  2. GitHub上の独立リポジトリ`aon-co-jp/open-directx`
+     (`F:\runo\open-directx`)。ワークスペースメンバーは
+     `directx-shader-translate`/`directx-graphics-vulkan`/
+     `directx-graphics-window`で、クレート名・パスとも(1)と重複なし。
+     path依存・submodule等の技術的連携は無い(grep相互参照ゼロ件)。
+  `aruaru-llm`が使っているのは(1)のみ(`hw-detect-directx` optional
+  feature経由、既定では無効)で、(2)は一切使用していない。
+  詳細な調査記録は`aruaru-llm/CLAUDE.md`の2026-08-20エントリ参照。
+  次にすべきこと: 「両者間の直接連携」という表現は今後使わず、
+  必要なら「(1)内蔵opencuda-directxクレート」「(2)独立リポジトリ
+  open-directx」と明示的に区別して記述すること。
