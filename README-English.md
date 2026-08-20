@@ -6,6 +6,23 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> **Recent update (2026-08-20)**: Implemented FlexQ-style INT6
+> quantization (`quantize_int6`/`dequantize_int6`/`QuantizedInt6Tensor`
+> in `opencuda-blas`, packing 4 6-bit values into 3 bytes). PuzzleMoE
+> was declined after checking its prerequisites — it requires an
+> existing MoE architecture that this repo's dense GPT-2/BERT models
+> don't have. Also corrected an earlier inaccurate note claiming
+> `open-directx` and `open-cuda` had an "in-design link" — in reality
+> there are just two unrelated same-named things: the in-repo
+> `opencuda-directx` crate and the independent `aon-co-jp/open-directx`
+> repository. Separately, investigated and declined adding a
+> self-update mechanism (`open-english`'s `self_update.rs` pattern) —
+> this repo has no resident service (10 library crates + 12 throwaway
+> example binaries), and confirmed real Microsoft DirectX/NVIDIA CUDA
+> are themselves runtime-library architectures rather than resident
+> background services, so the current design is not a defect. See the
+> 2026-08-19/2026-08-20 HANDOFF entries in [CLAUDE.md](CLAUDE.md).
+
 > **Recent update (2026-08-10)**: Added `generate_with_repetition_penalty`
 > (CTRL-style repetition penalty — penalty>1.0 weakens the logits of tokens
 > already seen) to `open-cuda-llm::GptModel`. The existing `generate()` is

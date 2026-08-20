@@ -6,6 +6,26 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> **Mise à jour récente (2026-08-20)** : Implémentation de la
+> quantification INT6 façon FlexQ
+> (`quantize_int6`/`dequantize_int6`/`QuantizedInt6Tensor` dans
+> `opencuda-blas`, empaquetant 4 valeurs 6-bit dans 3 octets). PuzzleMoE
+> a été écarté après vérification de ses prérequis — il nécessite une
+> architecture MoE déjà existante, absente des modèles denses GPT-2/BERT
+> de ce dépôt. Correction également d'une note précédente inexacte
+> affirmant une « liaison en cours de conception » entre `open-directx`
+> et `open-cuda` — il s'agit en réalité de deux projets homonymes sans
+> rapport : le crate interne `opencuda-directx` et le dépôt indépendant
+> `aon-co-jp/open-directx`. Par ailleurs, l'ajout d'un mécanisme de mise
+> à jour automatique (façon `self_update.rs` d'`open-english`) a été
+> étudié puis abandonné — ce dépôt ne contient aucun service résident
+> (10 crates de bibliothèque + 12 binaires d'exemple jetables), et il a
+> été confirmé que le vrai DirectX/CUDA de Microsoft/NVIDIA fonctionnent
+> eux-mêmes comme des bibliothèques d'exécution plutôt que des services
+> d'arrière-plan résidents — le design actuel n'est donc pas un défaut.
+> Voir les entrées HANDOFF du 2026-08-19/2026-08-20 dans
+> [CLAUDE.md](CLAUDE.md).
+
 > **Mise à jour récente (2026-08-10)** : Ajout de
 > `generate_with_repetition_penalty` (pénalité de répétition façon CTRL
 > — penalty>1.0 affaiblit les logits des tokens déjà apparus) à
