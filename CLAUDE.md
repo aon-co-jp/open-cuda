@@ -343,6 +343,73 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
 
 ## HANDOFF
 
+- **2026-08-22 CPU推論経路をSIMD化(AVX2+FMA3)——実GPT-2 124Mの生成が
+  同一セッション内A/B比較で実測3.34倍高速化。AVX-512/VNNI経路も先行実装
+  (実機未検証)**:
+  ユーザー指示「AVX2/AVX-512の多段ディスパッチ、FMA3をAI推論の行列演算へ、
+  VNNIは将来のCPU買い替えに備えてコードパスだけ用意」への対応。
+  1. **なぜCPU側を速くするのが正しいか(既存の実測に基づく判断)**: この
+     リポジトリの過去HANDOFF(2026-08-15・2026-08-06)で、デスクトップの
+     GT730はGEMMでCPUより2.3〜4.5倍**遅く**、`aruaru-llm`の1トークン
+     デコードではVulkanディスパッチの固定オーバーヘッドが支配的で
+     CPUより遅い、と既に実測済みだった。つまり実運用の主経路はCPUであり、
+     そこをSIMD化するのが最も効く。
+  2. **新規`crates/opencuda-blas/src/simd.rs`**: 実行時CPU機能検出
+     (`CpuFeatures::detect()`)による多段ディスパッチ。
+     - `dot_f32`(AVX-512F → AVX2+FMA3 → スカラー)
+     - `axpy`(`acc += scale*src`、同上)
+     - `sgemm_cpu`(行ごとrayon並列。**非転置Bのときk方向のaxpy蓄積へ
+       組み替える**——素朴な`b[kk*n+col]`はストライドアクセスでSIMD
+       ロードできないため、出力行への連続アクセスへ変換するのが要点。
+       転置Bのときは行同士の内積)
+     - `dot_i8`(**AVX-512 VNNI / AVX-VNNI** → スカラー。int8量子化推論用。
+       整数演算なので全経路でビット完全一致)
+  3. **配線**: `launch_naive_gemm`の先頭で、`device.supports_spirv()==false`
+     (=CPUバックエンド)なら`simd::sgemm_cpu`へ分岐する。要素ごとに
+     `GpuDevice::launch_kernel`をディスパッチする従来のカーネルは
+     「実カーネル起動を通す」という設計意図のため削除せず残し、
+     **`OPENCUDA_DISABLE_CPU_SIMD_GEMM=1`で従来経路へ戻せる**ようにした
+     (下記A/B計測はこの環境変数で実際に行った)。
+  4. **ベンチマーク(実測、AMD Ryzen 9 3950X / 検出機能`avx2+fma3+sse2`)**:
+     - 内積単体(`cargo test -p opencuda-blas --release
+       simd::tests::manual_bench -- --ignored --nocapture`):
+       k=64 **4.10x** / k=256 **6.68x** / k=768 **6.54x** / k=4096 **6.09x**。
+     - **実GPT-2 124M重みでのエンドツーエンド生成**(既存の
+       `manual_bench_real_gpt2_generate_timing`、プロンプト15トークン・
+       20トークン生成、**同一セッション内で環境変数を切り替えたA/B**):
+       従来経路 **6.78秒** → SIMD経路 **2.03秒**(**3.34倍**)。
+     - 副次的な実測: `cargo test -p open-cuda-llm --release`の総実行時間が
+       **129.56秒 → 60.85秒**(実GPT-2重みを使うテスト群を含む)。
+  5. **TEST**: `cargo test -p opencuda-blas --release`**34件全green**
+     (既存31件+`simd`の新規3件)。`cargo test --workspace --release --
+     --test-threads=1`**全クレートregression無し**(`open-cuda-llm`24件
+     ——実GPT-2重みでのCPU/Vulkan生成一致テストを含む——も全green。
+     FMA3は中間丸めを行わないためスカラーと**ビット単位では一致しない**が、
+     既存の許容誤差付きテスト・生成トークン列一致テストはすべて通った)。
+  6. **将来のCPUへの備え(ユーザー指示、2026-08-22)**: 設計方針は
+     「**コードを書き足すのではなく、機能フラグが有効になるだけで自動的に
+     高速パスが使われる**」こと。AVX-512搭載機・VNNI搭載機へ載せ替えれば
+     `CpuFeatures::detect()`が`avx512f`/`avx512vnni`/`avxvnni`を`true`に
+     返し、既に書いてある64バイト幅・int8内積の経路がそのまま有効になる。
+  7. **正直な開示(未検証)**: この開発機はZen 2のため、
+     **AVX-512F経路・AVX-512 VNNI経路・AVX-VNNI経路はコンパイル確認のみで
+     実機での実行・ベンチマークは未実施**。また`dot_i8`(VNNI)は
+     `quantize_int8`等の既存量子化APIへは**まだ配線していない**
+     (量子化APIの出力形式との突き合わせが必要なため、次の増分)。
+     GPU経路には一切手を入れていない。
+  8. **将来の共通化**: CPU機能検出ロジックは新設の共有クレート
+     `F:\runo\open-cpu`(`aon-co-jp/open-cpu`)へ集約する方針が決まった
+     (2026-08-22ユーザー指示)。本セッションでは`open-cpu`が別セッションで
+     並行作成中のため依存切り替えは行っていないが、検出とカーネルを
+     `opencuda-blas/src/simd.rs`の1ファイルに閉じ込めてあるため差し替えは
+     容易。`open-raid-z`側(`zfs_accel_hlsl/src/simd.rs`、RAID6 GF(2^8)の
+     SIMD化)も同日同様の構成で実装済み。
+  - 次にすべきこと: (1) `dot_i8`(VNNI)を`quantize_int8`/`quantize_int4`の
+    出力へ実際に配線し、int8量子化推論のCPU経路を作る(VNNI非搭載機でも
+    スカラー経路で正しく動くため、実装・テスト自体はこの機でも可能)。
+    (2) AVX-512搭載機を入手した際に上記ベンチマークをそのまま再実行する。
+    (3) `open-cpu`完成後に検出ロジックを差し替える。
+
 - **2026-08-20 FlexQ(arXiv:2508.04405)風のINT6量子化を実装、PuzzleMoE
   (arXiv:2511.04805)は前提条件を実際に確認した上で実装見送り(ユーザー
   指示、`aruaru-llm`側で発見したDeepSeek系新技術2件への対応、詳細な

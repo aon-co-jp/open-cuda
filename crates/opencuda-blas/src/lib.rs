@@ -50,6 +50,8 @@
 //!   バイト共有処理はホスト側で行う。それぞれ`dequantize_*`の逆変換と、
 //!   往復誤差がscale/2以内に収まることを検証するテストを含む。
 
+pub mod simd;
+
 use opencuda_core::{CompiledKernel, GpuDevice, GpuVendor, KernelArg, LaunchConfig, ResolvedArg, Result, ThreadCtx};
 use rayon::prelude::*;
 
@@ -144,6 +146,14 @@ fn f32_from_bytes_mut(v: &mut [f32]) -> &mut [u8] {
 /// `b` は `n x k`（行優先）として渡され、`b[col*k+kk]` でアクセスする
 /// （QKᵀ の計算に使う）。false のときは通常の `k x n` として
 /// `b[kk*n+col]` でアクセスする（通常の GEMM / P·V に使う）。
+/// `OPENCUDA_DISABLE_CPU_SIMD_GEMM=1` でCPU SIMD GEMMを無効化できる
+/// (従来の要素ごとカーネルディスパッチ経路へ戻す、比較検証用)。
+fn cpu_simd_gemm_disabled() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("OPENCUDA_DISABLE_CPU_SIMD_GEMM").map(|v| v == "1").unwrap_or(false))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_naive_gemm(
     device: &dyn GpuDevice,
@@ -165,6 +175,18 @@ fn launch_naive_gemm(
     }
     if c.len() != m * n {
         anyhow::bail!("sgemm: c.len()={} != m*n={}", c.len(), m * n);
+    }
+
+    // 2026-08-22: CPU経路のSIMD高速化。
+    // 要素ごとに`GpuDevice::launch_kernel`をディスパッチする下の素朴な
+    // カーネルは「実カーネル起動を通す」という設計上の意図で残しつつ、
+    // CPUバックエンド(SPIR-V非対応=このデバイスはCPU実行)では、
+    // k方向のaxpy蓄積へ組み替えたSIMD GEMM(AVX-512F/AVX2+FMA3、実行時
+    // 検出+スカラーフォールバック)を使う。`OPENCUDA_DISABLE_CPU_SIMD_GEMM=1`
+    // を設定すると従来の要素ごとカーネル経路へ戻せる(数値比較・回帰調査用)。
+    if !device.supports_spirv() && !cpu_simd_gemm_disabled() {
+        crate::simd::sgemm_cpu(m, k, n, alpha, a, b, transpose_b, beta, c);
+        return Ok(());
     }
 
     let bytes_a = std::mem::size_of_val(a);
@@ -202,13 +224,19 @@ fn launch_naive_gemm(
             let a = a_ptr as *const f32;
             let b = b_ptr as *const f32;
             let c = c_ptr as *mut f32;
-            for kk in 0..k {
-                let b_val = if transpose_b {
-                    b.add(col * k + kk).read()
-                } else {
-                    b.add(kk * n + col).read()
-                };
-                acc += a.add(row * k + kk).read() * b_val;
+            if transpose_b {
+                // 2026-08-22: `transpose_b`のときAとBの両方が連続メモリの
+                // 行ベクトルになるため、内積をCPU SIMD(AVX-512F/AVX2+FMA3、
+                // 実行時検出+スカラーフォールバック)へ置き換える。
+                // 非転置(`b[kk*n+col]`)側はストライドアクセスで連続load
+                // できないため従来のスカラーループのまま。
+                let a_row = std::slice::from_raw_parts(a.add(row * k), k);
+                let b_row = std::slice::from_raw_parts(b.add(col * k), k);
+                acc = crate::simd::dot_f32(a_row, b_row);
+            } else {
+                for kk in 0..k {
+                    acc += a.add(row * k + kk).read() * b.add(kk * n + col).read();
+                }
             }
             let old_c = c.add(idx).read();
             c.add(idx).write(alpha * acc + beta * old_c);

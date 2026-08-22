@@ -6,6 +6,27 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> **Letztes Update (2026-08-20)**: FlexQ-artige INT6-Quantisierung
+> implementiert (`quantize_int6`/`dequantize_int6`/
+> `QuantizedInt6Tensor` in `opencuda-blas`, packt 4 6-Bit-Werte in
+> 3 Bytes). PuzzleMoE wurde nach Prüfung der Voraussetzungen
+> zurückgestellt — setzt eine bereits existierende MoE-Architektur
+> voraus, die den dichten GPT-2/BERT-Modellen dieses Repositories
+> fehlt. Außerdem wurde eine frühere ungenaue Notiz korrigiert, die
+> von einer „in Entwicklung befindlichen Verbindung" zwischen
+> `open-directx` und `open-cuda` sprach — tatsächlich handelt es sich
+> um zwei unabhängige, gleichnamige Projekte: das interne
+> `opencuda-directx`-Crate und das eigenständige Repository
+> `aon-co-jp/open-directx`. Zudem wurde die Machbarkeit eines
+> Auto-Update-Mechanismus (nach dem Vorbild von `open-english`s
+> `self_update.rs`) geprüft und abgelehnt — dieses Repository hat
+> keinen residenten Dienst (10 Bibliotheks-Crates + 12 wegwerfbare
+> Example-Binaries), und es wurde bestätigt, dass echtes Microsoft
+> DirectX/NVIDIA CUDA selbst als Laufzeitbibliotheken statt als
+> residente Hintergrunddienste konzipiert sind — das aktuelle Design
+> ist somit kein Mangel. Siehe die HANDOFF-Einträge vom
+> 2026-08-19/2026-08-20 in [CLAUDE.md](CLAUDE.md).
+
 > **Letztes Update (2026-08-10)**: `generate_with_repetition_penalty`
 > (Wiederholungsstrafe im CTRL-Stil — penalty>1.0 schwächt die Logits
 > bereits erschienener Tokens ab) wurde zu `open-cuda-llm::GptModel`
