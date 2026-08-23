@@ -13,6 +13,7 @@ anyhow.workspace = true
 tracing.workspace = true
 half.workspace = true
 rayon.workspace = true
+open-cpu.workspace = true
 
 [dev-dependencies]
 opencuda-cpu.workspace = true

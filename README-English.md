@@ -193,3 +193,41 @@ likewise be run with `cargo run -p <name>`. See `OmniGPU-Design.md`
 ## License
 
 Apache-2.0
+
+
+---
+
+## Update 2026-08-23 — CPU feature detection unified into `open-cpu`, two dispatch bugs fixed
+
+`opencuda-blas`'s `simd.rs` used to call `is_x86_feature_detected!`
+itself. Detection is now delegated to the shared
+[`open-cpu`](https://github.com/aon-co-jp/open-cpu) crate (path
+dependency). The `CpuFeatures` struct keeps its existing fields, so callers
+are unchanged.
+
+**Two real bugs were found and fixed during this work. Both are the same
+mistake: branching on a single feature flag where the code actually
+requires a combination of features.**
+
+1. **The AVX-512 path was reachable without opt-in.** `dot_f32` and `axpy`
+   entered the 512-bit path on `if f.avx512f` alone, meaning
+   **hardware-unverified code would run automatically on any AVX-512
+   machine**. A new `avx512_f32_path()` now requires AVX-512F+BW+VL *and*
+   `OPEN_CPU_ENABLE_AVX512=1`.
+2. **The int8 VNNI branch did not match its own `target_feature`
+   declaration.** `dot_i8_avx512vnni` is declared
+   `#[target_feature(enable = "avx512vnni,avx512bw,avx512f")]` but the
+   caller only checked `f.avx512vnni`. Both it and `dot_i8_avxvnni`
+   (`avxvnni,avx2`) now use full combination checks.
+
+Also added: an `avx512bw` field, plus `isa_profile()`, `has_avx2_fma()`,
+`has_vnni_path()` and `cpu_runtime_line()` for logging and APIs.
+
+**Verification**: `cargo test -p opencuda-blas --release` — **34 tests
+pass**, including scalar-equivalence tests. On the development machine
+(Ryzen 9 3950X, Zen 2) the profile is `avx2+fma3`. **AVX-512 and VNNI
+paths remain unverified on real hardware.**
+
+Weight repacking (llama.cpp-style online repack), GFNI and AMX were
+surveyed and judged excessive for this repository's scale; the full survey
+with source links is recorded in `open-cpu/CLAUDE.md` (2026-08-23 HANDOFF).

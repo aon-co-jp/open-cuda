@@ -41,6 +41,9 @@ rayon = "1.10"
 tracing = "0.1"
 half = "2"
 
+# aon-co-jp 共通の CPU 命令セット検出・ディスパッチ基盤
+open-cpu = { path = "../open-cpu" }
+
 # 内部crate
 opencuda-core = { path = "crates/opencuda-core" }
 opencuda-cpu = { path = "crates/opencuda-cpu" }
