@@ -18,3 +18,8 @@ open-cpu.workspace = true
 [dev-dependencies]
 opencuda-cpu.workspace = true
 opencuda-vulkan = { workspace = true, features = ["real-vulkan"] }
+# 2026-08-23追加: `sgemm_directx_generic`(D3D12 Compute経由のGEMM)を
+# 実ハードウェアで検証するためのdev-only依存。Windows以外では
+# `real-dx12`のwindowsクレート依存が`cfg(windows)`配下のためビルドに
+# 影響しない。
+opencuda-directx = { workspace = true, features = ["real-dx12"] }

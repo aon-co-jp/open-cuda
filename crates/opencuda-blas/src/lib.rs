@@ -89,6 +89,15 @@ pub fn select_gemm_path(device: &dyn GpuDevice) -> GemmPath {
     let vendor_path_is_stub = matches!(vendor_path, GemmPath::CuBlas | GemmPath::RocBlas | GemmPath::OneMkl);
     if vendor_path_is_stub && device.supports_spirv() {
         GemmPath::VulkanGeneric
+    } else if vendor_path_is_stub && device.supports_dxil() {
+        // 2026-08-23追加: SPIR-Vを実行できないがDXIL(DirectX 12 Compute)を
+        // 実行できるデバイス(`opencuda-directx::real::DirectXDevice`)向けの
+        // 汎用経路。Vulkanが使えない環境(Vulkanローダー/ドライバ未導入の
+        // Windows機など)でも、Intel/AMD統合GPUを含む大半のWindows GPUで
+        // 動くD3D12 Compute経由でGEMMを実行できるようにするための階層的
+        // フォールバックの中間段。SPIR-V経路が使えるならそちらを優先する
+        // (上の分岐、既存挙動を変えない)。
+        GemmPath::DirectXGeneric
     } else {
         vendor_path
     }
@@ -100,6 +109,10 @@ pub enum GemmPath {
     RocBlas,       // AMD      (Phase 2/3, 未実装)
     OneMkl,        // Intel    (Phase 4, 未実装)
     VulkanGeneric, // 汎用     (Phase 1 後半, 未実装)
+    /// D3D12 Compute(DXIL)汎用経路。`sgemm_directx_generic`として実装済み
+    /// (2026-08-23追加)。`opencuda-directx`の`real-dx12` featureで構築した
+    /// `DirectXDevice`上で`matmul.dxil`をディスパッチする。
+    DirectXGeneric,
     CpuNaive,      // CPU      (実装済み、examples/matmul を移植)
 }
 
@@ -318,8 +331,128 @@ pub fn sgemm(
             }
             Ok(())
         }
+        GemmPath::DirectXGeneric => anyhow::bail!(
+            "sgemm: GemmPath::DirectXGeneric selected (device.supports_dxil()==true) but this \
+             entry point only accepts SPIR-V bytes; call `sgemm_directx_generic` with the \
+             compiled matmul.dxil bytes instead (see opencuda-directx/shaders/matmul.dxil)"
+        ),
         other => anyhow::bail!("sgemm: {other:?} backend not yet implemented (Phase 3)"),
     }
+}
+
+/// 行列を1度だけデバイスへ転送し、その`DevicePtr`を返す(2026-08-23新設)。
+///
+/// [`sgemm_directx_resident_b`]と組で使う——LLM推論の重み行列`B`は
+/// 呼び出しごとに変化しないので、毎回H2D転送するのは純粋な無駄
+/// (GPT-2の`lm_head`なら768×50257×4 = 約154MBを1トークンごとに
+/// 転送してしまう)。戻り値の`DevicePtr`は呼び出し側が責任を持って
+/// `device.free()`すること。
+pub fn upload_resident_matrix(device: &dyn GpuDevice, data: &[f32]) -> Result<opencuda_core::DevicePtr> {
+    let ptr = device.alloc(std::mem::size_of_val(data))?;
+    if let Err(e) = device.memcpy_h2d(ptr, f32_to_bytes(data)) {
+        let _ = device.free(ptr);
+        return Err(e);
+    }
+    Ok(ptr)
+}
+
+/// [`sgemm_directx_generic`]の「`B`はすでにデバイス常駐」版(2026-08-23新設)。
+///
+/// `b_ptr`は[`upload_resident_matrix`]で`k*n`要素分を転送済みの
+/// デバイスポインタであること(サイズの整合性はデバイス側の
+/// バッファ長チェックに委ねる)。`A`と結果`C`のみ毎回転送する。
+pub fn sgemm_directx_resident_b(
+    device: &dyn GpuDevice,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b_ptr: opencuda_core::DevicePtr,
+    dxil: &[u8],
+) -> Result<Vec<f32>> {
+    if a.len() != m * k {
+        anyhow::bail!("sgemm_directx_resident_b: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    let da = ScopedAlloc::new(device, std::mem::size_of_val(a))?;
+    let dc = ScopedAlloc::new(device, m * n * std::mem::size_of::<f32>())?;
+    device.memcpy_h2d(da.ptr(), f32_to_bytes(a))?;
+
+    let kernel = CompiledKernel::dxil("matmul", "main", dxil);
+    let cfg = LaunchConfig::grid2d(m as u32, n as u32, 8, 8);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(da.ptr()),
+            KernelArg::Ptr(b_ptr),
+            KernelArg::Ptr(dc.ptr()),
+            KernelArg::Usize(m),
+            KernelArg::Usize(k),
+            KernelArg::Usize(n),
+        ],
+    )?;
+    device.synchronize()?;
+
+    let mut c = vec![0.0f32; m * n];
+    device.memcpy_d2h(f32_from_bytes_mut(&mut c), dc.ptr())?;
+    Ok(c)
+}
+
+/// `GemmPath::DirectXGeneric` の実装: D3D12 Compute(DXIL)上で naive matmul
+/// を実行する(`C = A・B`、alpha/beta スケーリングは無し —
+/// [`sgemm_vulkan_generic`] と同じ契約・同じ理由)。
+///
+/// **2026-08-23新設**。`dxil` には
+/// `crates/opencuda-directx/shaders/matmul.dxil`(`fxc`/`dxc`で事前
+/// コンパイル済み、こちらは`.spv`と違いリポジトリへコミット済み)と同一
+/// 契約のバイト列を渡す。引数は `a / b / c / m / k / n` の6個、
+/// スレッドグループは `numthreads(8,8,1)`(`matmul.hlsl`参照)。
+///
+/// `device` には `opencuda-directx::real::DirectXDevice`(`real-dx12`
+/// feature 有効時)のような、DXILカーネルの `"matmul"` エントリを実行
+/// できる `GpuDevice` 実装を渡すこと。CPUバックエンドやVulkanデバイスに
+/// 渡すとエラーになる(黙って誤った結果を返さない)。
+pub fn sgemm_directx_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize, a: &[f32], b: &[f32], dxil: &[u8]) -> Result<Vec<f32>> {
+    if a.len() != m * k {
+        anyhow::bail!("sgemm_directx_generic: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    if b.len() != k * n {
+        anyhow::bail!("sgemm_directx_generic: b.len()={} != k*n={}", b.len(), k * n);
+    }
+    if !device.supports_dxil() {
+        anyhow::bail!("sgemm_directx_generic: device '{}' does not support DXIL kernels", device.info().name);
+    }
+
+    let da = ScopedAlloc::new(device, std::mem::size_of_val(a))?;
+    let db = ScopedAlloc::new(device, std::mem::size_of_val(b))?;
+    let dc = ScopedAlloc::new(device, m * n * std::mem::size_of::<f32>())?;
+
+    device.memcpy_h2d(da.ptr(), f32_to_bytes(a))?;
+    device.memcpy_h2d(db.ptr(), f32_to_bytes(b))?;
+
+    let kernel = CompiledKernel::dxil("matmul", "main", dxil);
+    // matmul.hlsl は numthreads(8,8,1)、dtid.x=列(n)/dtid.y=行(m)。
+    // `LaunchConfig::grid2d(rows, cols, bx, by)` は groups_x=cols/bx,
+    // groups_y=rows/by を作るので、rows=m(行)・cols=n(列)を渡す
+    // (`opencuda-directx`の実機matmulテストと同じ契約)。
+    let cfg = LaunchConfig::grid2d(m as u32, n as u32, 8, 8);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(da.ptr()),
+            KernelArg::Ptr(db.ptr()),
+            KernelArg::Ptr(dc.ptr()),
+            KernelArg::Usize(m),
+            KernelArg::Usize(k),
+            KernelArg::Usize(n),
+        ],
+    )?;
+    device.synchronize()?;
+
+    let mut c = vec![0.0f32; m * n];
+    device.memcpy_d2h(f32_from_bytes_mut(&mut c), dc.ptr())?;
+    Ok(c)
 }
 
 /// `GemmPath::VulkanGeneric` の実装: Vulkan Compute 上で naive matmul を

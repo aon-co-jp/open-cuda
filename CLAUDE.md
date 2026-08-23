@@ -63,6 +63,71 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-08-23、階層的アクセラレーション: D3D12 Compute経由のGEMMオフロードを実装 / Hierarchical acceleration: DXIL GEMM offload)
+
+ユーザーの目的「NVIDIA GPU非搭載の安価なPCでもAI推論をなるべく速く」への対応として、
+`CUDA → Vulkan → DirectX 12 → CPU SIMD`という階層的フォールバックの
+**DirectX段**を実装した。
+
+### 実装内容
+
+- `opencuda-blas`:
+  - `GemmPath::DirectXGeneric`を追加。`select_gemm_path`は
+    「ベンダー専用経路がスタブ、かつ`supports_spirv()==false`、かつ
+    `supports_dxil()==true`」のときにこの経路を選ぶ(Vulkanが使える
+    なら従来どおりVulkanを優先。既存挙動は不変)。
+  - `sgemm_directx_generic(device, m,k,n, a,b, dxil)`を新設
+    (`sgemm_vulkan_generic`と同じ契約のD3D12版)。
+  - `upload_resident_matrix` / `sgemm_directx_resident_b`を新設。
+    重み行列`B`をVRAMへ**常駐**させ、毎回のH2D転送を省く
+    (`lm_head`なら768×50257×4 ≒ 154MBを1トークンごとに転送していた)。
+- `open-cuda-llm`: `GptModel::set_matmul_dxil_offload(device, dxil)`を新設。
+  全`Linear`(QKV融合 / attn_out / intermediate / output / lm_head)の
+  重みをD3D12デバイスへアップロードし、密GEMMだけをそこへオフロードする。
+  `ResidentWeights`(RAII)が`GptModel`のdropで全バッファを解放する。
+
+### 実測(この開発機: NVIDIA GeForce GT 730 + Ryzen 9 3950X〈avx2+fma3〉)
+
+`cargo test --release -p opencuda-blas --test sgemm_directx_bench -- --nocapture`
+の実出力(GPT-2形状のGEMM、単位ms):
+
+| m | k | n | DirectX(毎回転送) | DirectX(重み常駐) | CPU(AVX2) |
+|---|---|---|---|---|---|
+| 1 | 768 | 2304 | 33.0 | 4.7 | 1.6 |
+| 1 | 768 | 768 | 25.6 | 4.1 | 0.14 |
+| 1 | 768 | 3072 | 49.8 | 5.2 | 0.48 |
+| 1 | 3072 | 768 | 46.2 | 12.1 | 0.56 |
+| 1 | 768 | 50257 | 468.7 | 51.0 | 8.4 |
+| 64 | 768 | 3072 | 73.0 | 36.7 | 2.7 |
+
+**正直な結論: この開発機では DirectX 経路は CPU(AVX2)より遅い**
+(重み常駐化で6〜10倍改善したが、それでもCPU比3〜30倍遅い)。原因は
+(a)`matmul.hlsl`がタイリング無しのnaive実装、(b)GT 730が非力
+(過去HANDOFF 2026-08-15でもGEMMはCPUの1/2〜1/4の速度と実測済み)、
+(c)デコード時は`m=1`で8×8スレッドグループの7/8が遊ぶ。
+**「速くなった」とは主張しない。** より強い統合GPU+弱いCPUの組み合わせ
+(過去HANDOFFのAdreno 619実測ではGPUが最大5.99倍速かった)では有利に
+なり得るが、それは**この機では未検証**。既定では無効のままにしてある。
+
+### 検証(実機、型チェックのみで完了と報告しない方針の徹底)
+
+- 新規`crates/opencuda-blas/tests/sgemm_directx_real.rs`(2件):
+  実D3D12デバイス上の`sgemm_directx_generic`がCPU参照実装と1e-3以内で
+  一致すること、`select_gemm_path`がDirectXデバイスに対して
+  `DirectXGeneric`を返すことを実機で確認。
+- 新規`generate_end_to_end_matches_cpu_on_real_d3d12_after_set_matmul_dxil_offload`
+  (`open-cuda-llm`): DXILオフロードを配線した`generate()`の出力が、
+  純CPU実行と**トークン列完全一致**することを実D3D12上で確認。
+- `cargo test --release -p opencuda-blas -p open-cuda-llm -- --test-threads=1`
+  全green(blas 34件、llm 24件+実機テスト群)。
+
+- 次にすべきこと: (1) `matmul.hlsl`をタイル化(共有メモリ)して
+  naive実装から改善する。(2) `m=1`(デコード)専用のGEMV形カーネルを
+  用意し、8×8スレッドグループの無駄をなくす。(3) Attention/LayerNorm/
+  GELUもDXIL化してモデル全体をGPU常駐にする(現状は密GEMMのみ)。
+  (4) Intel/AMD統合GPU搭載機での再実測——この機のGT 730は
+  「安いPCの統合GPU」の代表として適切ではない。
+
 ## HANDOFF追記(2026-08-23、open-cpu への CPU 機能検出の一元化 + 実バグ 2 件修正)
 
 `opencuda-blas` の `simd.rs` が独自に `is_x86_feature_detected!` を

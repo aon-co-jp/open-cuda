@@ -27,3 +27,6 @@ nalgebra = "0.33"
 [dev-dependencies]
 opencuda-cpu.workspace = true
 opencuda-vulkan = { workspace = true, features = ["real-vulkan"] }
+# 2026-08-23追加: `set_matmul_dxil_offload`(D3D12 Computeへの密GEMM
+# オフロード)を実ハードウェアで検証するためのdev-only依存。
+opencuda-directx = { workspace = true, features = ["real-dx12"] }
