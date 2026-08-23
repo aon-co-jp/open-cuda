@@ -152,7 +152,7 @@ fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
         out_dim
     );
     let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
-    Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None })
+    Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None })
 }
 
 // **2026-08-04変更**: GPT-2はQ/K/Vを1本の`c_attn`(`[hidden, 3*hidden]`)へ
@@ -216,17 +216,81 @@ struct Linear {
     /// `Arc`を共有させる。未設定(`None`)ならCPU実行(`GemmPath::
     /// CpuNaive`)のまま——既存の挙動を一切変えない後方互換なデフォルト。
     spirv_matmul: Option<std::sync::Arc<Vec<u8>>>,
+    /// **2026-08-23新設**: D3D12 Compute(DXIL)への密GEMMオフロード。
+    ///
+    /// `spirv_matmul`とは設計が異なり、**呼び出し側が`forward`へ渡す
+    /// `device`とは別のデバイス**(`opencuda-directx::real::DirectXDevice`)
+    /// をこの`Linear`自身が保持する。理由: `DirectXDevice`は
+    /// `KernelSource::Dxil`しか実行できず、`launch_naive_gemm`の
+    /// Rustクロージャカーネル(Attention・LayerNorm等が使う)を実行
+    /// できない。したがってモデル全体をDirectXデバイス上で走らせる
+    /// ことはできず、「密GEMMだけGPUへ、それ以外はCPU(open-cpu SIMD)で」
+    /// というハイブリッド構成にしてある。
+    dxil_offload: Option<DxilMatmulOffload>,
+}
+
+/// [`GptModel::set_matmul_dxil_offload`]で配線される、密GEMM専用の
+/// D3D12 Computeオフロード先(2026-08-23新設)。
+#[derive(Clone)]
+pub struct DxilMatmulOffload {
+    device: std::sync::Arc<dyn GpuDevice>,
+    dxil: std::sync::Arc<Vec<u8>>,
+    /// この`Linear`の重み行列(`weight_t`, in_dim×out_dim)をデバイスへ
+    /// 常駐させたポインタ。重みは推論中不変なので、毎回H2D転送するのは
+    /// 純粋な無駄(`lm_head`なら768×50257×4 ≒ 154MBを1トークンごとに
+    /// 転送してしまう)。実測でこの常駐化により6〜10倍速くなった
+    /// (`opencuda-blas/tests/sgemm_directx_bench.rs`参照)。
+    ///
+    /// 所有権は[`ResidentWeights`]が持ち、`GptModel`のdrop時にまとめて
+    /// 解放される。
+    b_ptr: opencuda_core::DevicePtr,
+}
+
+/// DXILオフロードでデバイス常駐させた重みの解放を担うRAIIハンドル
+/// (2026-08-23新設)。`GptModel`が保持し、dropされた時点で全ポインタを
+/// `device.free()`する。
+pub struct ResidentWeights {
+    device: std::sync::Arc<dyn GpuDevice>,
+    ptrs: Vec<opencuda_core::DevicePtr>,
+}
+
+impl Drop for ResidentWeights {
+    fn drop(&mut self) {
+        for p in self.ptrs.drain(..) {
+            if let Err(e) = self.device.free(p) {
+                tracing::warn!("open-cuda-llm: failed to free resident DXIL weight buffer: {e}");
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DxilMatmulOffload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DxilMatmulOffload").field("device", &self.device.info().name).field("dxil_len", &self.dxil.len()).finish()
+    }
 }
 
 impl Linear {
     fn random(rng: &mut SplitMix64, in_dim: usize, out_dim: usize) -> Self {
         let scale = 1.0 / (in_dim as f32).sqrt();
-        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None }
+        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None, dxil_offload: None }
     }
 
     fn forward(&self, device: &dyn GpuDevice, x: &[f32], seq_len: usize) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), seq_len * self.in_dim);
         let mut out = vec![0.0f32; seq_len * self.out_dim];
+        // DXILオフロードが配線済みなら、密GEMMだけをD3D12 Computeで実行する
+        // (失敗した場合は黙って誤結果を返さず、そのままエラーを返す)。
+        if let Some(off) = &self.dxil_offload {
+            let result = opencuda_blas::sgemm_directx_resident_b(&*off.device, seq_len, self.in_dim, self.out_dim, x, off.b_ptr, &off.dxil)?;
+            out.copy_from_slice(&result);
+            for row in 0..seq_len {
+                for c in 0..self.out_dim {
+                    out[row * self.out_dim + c] += self.bias[c];
+                }
+            }
+            return Ok(out);
+        }
         let spirv = self.spirv_matmul.as_deref().map(|v| v.as_slice());
         opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, spirv)?;
         for row in 0..seq_len {
@@ -669,6 +733,9 @@ pub struct GptModel {
     /// 1回へ削減される)。`None`のまま(既定)なら従来通り
     /// `softmax_spirv`配線の有無に応じた経路のまま(後方互換)。
     flash_attn_spirv: Option<(std::sync::Arc<Vec<u8>>, usize)>,
+    /// DXILオフロード(2026-08-23新設)でデバイス常駐させた重みの所有者。
+    /// がdropされるとここから全バッファが解放される。
+    dxil_resident_weights: Option<ResidentWeights>,
 }
 
 impl GptModel {
@@ -688,7 +755,7 @@ impl GptModel {
             .collect();
         let final_ln = LayerNorm::identity(hidden, config.layer_norm_eps);
         let lm_head = Linear::random(&mut rng, hidden, config.vocab_size);
-        Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None }
+        Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None, dxil_resident_weights: None }
     }
 
     /// `dir`配下の`config.json`・`model.safetensors`(Hugging Face GPT-2形式、
@@ -771,9 +838,10 @@ impl GptModel {
             in_dim: hidden,
             out_dim: config.vocab_size,
             spirv_matmul: None,
+            dxil_offload: None,
         };
 
-        Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None })
+        Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None, dxil_resident_weights: None })
     }
 
     /// コンパイル済み`matmul.spv`(`opencuda_blas::sgemm_vulkan_generic`が
@@ -803,6 +871,74 @@ impl GptModel {
             layer.output.spirv_matmul = Some(spirv.clone());
         }
         self.lm_head.spirv_matmul = Some(spirv);
+    }
+
+    /// **2026-08-23新設**: 密GEMM(各レイヤーのQKV融合/attn_out/
+    /// intermediate/output + `lm_head`)を、渡された**DXIL実行可能な
+    /// デバイス**(`opencuda-directx::real::DirectXDevice`)へオフロード
+    /// するよう配線する。`dxil`には`opencuda-directx/shaders/matmul.dxil`
+    /// と同一契約(引数6個 a/b/c/m/k/n、`numthreads(8,8,1)`)の
+    /// 事前コンパイル済みバイト列を渡すこと。
+    ///
+    /// **正直な開示**(誇張しないための明記):
+    /// - オフロードされるのは上記の密GEMMのみ。Attention
+    ///   (QKᵀ・softmax・P·V)・LayerNorm・GELU・埋め込み参照は
+    ///   引き続き`generate`へ渡した`device`(通常は`CpuDevice`、
+    ///   `opencuda-blas`経由で`open-cpu`のSIMDディスパッチが効く)で
+    ///   実行される。DirectXDevice は`KernelSource::Dxil`しか実行できず、
+    ///   これらが使うRustクロージャカーネルを実行できないため。
+    /// - `matmul.hlsl`はタイリング等の最適化をしていないnaive実装であり、
+    ///   小さい行列ではPCIe転送・ディスパッチのオーバーヘッドがCPUを
+    ///   上回る可能性がある。速度が上がるかどうかは実測すること。
+    /// - `set_matmul_spirv`と併用した場合、`forward`ではDXILオフロードが
+    ///   優先される(両方を配線する構成は想定していない)。
+    /// - 全`Linear`の重みをデバイスVRAMへ常駐させる(GPT-2 124Mでおよそ
+    ///   0.5GB)。VRAMが足りない等でアップロードに失敗した場合は、
+    ///   途中まで確保したバッファを解放した上で`Err`を返し、モデルは
+    ///   **一切変更しない**(部分配線という中途半端な状態を作らない)。
+    ///
+    /// **実測(2026-08-23、開発機 NVIDIA GeForce GT 730 + AVX2 CPU)**:
+    /// この経路はCPU(AVX2)より**遅かった**(GPT-2形状のGEMMで3〜30倍
+    /// 遅い、`opencuda-blas/tests/sgemm_directx_bench.rs`参照)。
+    /// naiveなmatmulシェーダーと非力なGPUの組み合わせが原因。より強力な
+    /// 統合GPU/弱いCPUの組み合わせでは有利になり得るが、**この開発機では
+    /// 高速化は確認できていない**。必ず実測してから有効化すること。
+    pub fn set_matmul_dxil_offload(&mut self, device: std::sync::Arc<dyn GpuDevice>, dxil: Vec<u8>) -> Result<()> {
+        let dxil = std::sync::Arc::new(dxil);
+        let mut resident = ResidentWeights { device: device.clone(), ptrs: Vec::new() };
+
+        // まず全重みをアップロードし、対応する`DevicePtr`を集める
+        // (ここで失敗しても`resident`のdropが確保済み分を解放する)。
+        let mut ptrs: Vec<opencuda_core::DevicePtr> = Vec::new();
+        {
+            let mut upload = |w: &[f32]| -> Result<()> {
+                let p = opencuda_blas::upload_resident_matrix(&*device, w)?;
+                resident.ptrs.push(p);
+                ptrs.push(p);
+                Ok(())
+            };
+            for layer in &self.layers {
+                upload(&layer.qkv.weight_t)?;
+                upload(&layer.attn_out.weight_t)?;
+                upload(&layer.intermediate.weight_t)?;
+                upload(&layer.output.weight_t)?;
+            }
+            upload(&self.lm_head.weight_t)?;
+        }
+
+        // すべて成功してから配線する。
+        let mut it = ptrs.into_iter();
+        let mk = |ptr: opencuda_core::DevicePtr| DxilMatmulOffload { device: device.clone(), dxil: dxil.clone(), b_ptr: ptr };
+        for layer in &mut self.layers {
+            layer.qkv.dxil_offload = Some(mk(it.next().expect("qkv ptr")));
+            layer.attn_out.dxil_offload = Some(mk(it.next().expect("attn_out ptr")));
+            layer.intermediate.dxil_offload = Some(mk(it.next().expect("intermediate ptr")));
+            layer.output.dxil_offload = Some(mk(it.next().expect("output ptr")));
+        }
+        self.lm_head.dxil_offload = Some(mk(it.next().expect("lm_head ptr")));
+
+        self.dxil_resident_weights = Some(resident);
+        Ok(())
     }
 
     /// コンパイル済み`softmax.spv`(`opencuda_blas::softmax_vulkan_generic`
@@ -2143,6 +2279,46 @@ mod tests {
         let vulkan_out = vulkan_model.generate(&vulkan_device, &prompt, 6).unwrap();
 
         assert_eq!(cpu_out, vulkan_out, "CPU and Vulkan generation should produce byte-identical token sequences for the same seed/prompt");
+    }
+
+    /// **2026-08-23新設**: `set_matmul_dxil_offload`(密GEMMのD3D12
+    /// Computeオフロード)を配線したモデルの`generate()`が、実D3D12
+    /// ハードウェア上で最後まで完走し、純CPU実行と生成トークン列が
+    /// 完全一致することを確認する(上のVulkan版に対応するDirectX版)。
+    ///
+    /// D3D12デバイスを作れない環境(非Windows・ドライバ無し)では
+    /// 失敗ではなくスキップする(既存のVulkan実機テストと同じ方針)。
+    #[test]
+    #[cfg(windows)]
+    fn generate_end_to_end_matches_cpu_on_real_d3d12_after_set_matmul_dxil_offload() {
+        const MATMUL_DXIL: &[u8] = include_bytes!("../../opencuda-directx/shaders/matmul.dxil");
+
+        let dx_device = match opencuda_directx::real::DirectXDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping generate_end_to_end (dxil) test: no real D3D12 device available: {e}");
+                return;
+            }
+        };
+        let dx_device: std::sync::Arc<dyn GpuDevice> = dx_device;
+        let cpu_device: std::sync::Arc<dyn GpuDevice> = opencuda_cpu::CpuDevice::new(0);
+
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        let prompt = ByteTokenizer::encode("hi");
+
+        let cpu_model = GptModel::load_random(config.clone(), 42);
+        let cpu_out = cpu_model.generate(&cpu_device, &prompt, 6).unwrap();
+
+        let mut dx_model = GptModel::load_random(config, 42);
+        dx_model.set_matmul_dxil_offload(dx_device, MATMUL_DXIL.to_vec()).expect("wire dxil offload");
+        // 密GEMMだけがD3D12へ行き、Attention/LayerNorm/GELUはCPUデバイス
+        // 上で走るハイブリッド構成。`generate`へ渡すのはCPUデバイス。
+        let dx_out = dx_model.generate(&cpu_device, &prompt, 6).unwrap();
+
+        assert_eq!(
+            cpu_out, dx_out,
+            "CPU-only and DXIL-offloaded generation should produce identical token sequences for the same seed/prompt"
+        );
     }
 
     /// **2026-08-06新設**: `set_matmul_spirv`に加えて`set_softmax_spirv`も
