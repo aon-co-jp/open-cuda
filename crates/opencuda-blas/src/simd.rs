@@ -21,6 +21,11 @@
 //!   自動的に有効化されるよう、あらかじめ書いてある。
 
 /// 実行時に検出したCPU機能。
+///
+/// 【2026-08-23 変更】検出そのものは共通基盤 [`open_cpu`] へ移譲した。
+/// このリポジトリ独自の `is_x86_feature_detected!` 呼び出しは廃止し、
+/// `open-cpu` の `detect()`(`OnceLock` キャッシュ)を唯一の情報源とする。
+/// 構造体のフィールドは従来どおりなので、既存の呼び出し側はそのまま動く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CpuFeatures {
     pub sse2: bool,
@@ -32,23 +37,22 @@ pub struct CpuFeatures {
     pub avx512vnni: bool,
     /// AVX-VNNI(256bit幅のVNNI、Alder Lake以降)。Zen 2は非搭載。
     pub avxvnni: bool,
+    /// AVX-512BW(バイト/ワード演算)。VNNI経路の事前条件。
+    pub avx512bw: bool,
 }
 
 impl CpuFeatures {
     pub fn detect() -> Self {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            return Self {
-                sse2: std::is_x86_feature_detected!("sse2"),
-                avx2: std::is_x86_feature_detected!("avx2"),
-                fma: std::is_x86_feature_detected!("fma"),
-                avx512f: std::is_x86_feature_detected!("avx512f"),
-                avx512vnni: std::is_x86_feature_detected!("avx512vnni"),
-                avxvnni: std::is_x86_feature_detected!("avxvnni"),
-            };
+        let c = open_cpu::detect();
+        Self {
+            sse2: c.sse2,
+            avx2: c.avx2,
+            fma: c.fma,
+            avx512f: c.avx512f,
+            avx512vnni: c.avx512vnni,
+            avxvnni: c.avx_vnni,
+            avx512bw: c.avx512bw,
         }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        Self::default()
     }
 
     /// ログ・ベンチマーク表示用の短い説明。
@@ -56,6 +60,9 @@ impl CpuFeatures {
         let mut v = Vec::new();
         if self.avx512f {
             v.push("avx512f");
+        }
+        if self.avx512bw {
+            v.push("avx512bw");
         }
         if self.avx512vnni {
             v.push("avx512vnni");
@@ -77,6 +84,40 @@ impl CpuFeatures {
         }
         v.join("+")
     }
+
+    /// `open-cpu` が判定した「命令セットの組み合わせプロファイル」。
+    ///
+    /// 単一命令ではなく組み合わせ(例: AVX-512F+BW+VL、AVX2+FMA3)で
+    /// 段階が決まる。AVX-512 段階は `OPEN_CPU_ENABLE_AVX512=1` でのみ選ばれる。
+    pub fn isa_profile(&self) -> open_cpu::IsaProfile {
+        open_cpu::detect().isa_profile()
+    }
+
+    /// AVX2 と FMA3 が **両方** 揃っているか(f32 GEMM の高速経路の条件)。
+    pub fn has_avx2_fma(&self) -> bool {
+        open_cpu::detect().supports_all(&[open_cpu::Feature::Avx2, open_cpu::Feature::Fma])
+    }
+
+    /// int8 VNNI 経路の条件(AVX-512F+BW+VNNI、または AVX-VNNI+AVX2)。
+    ///
+    /// **この開発機(Zen 2)ではどちらも成立しないため実行未検証**。
+    pub fn has_vnni_path(&self) -> bool {
+        let c = open_cpu::detect();
+        c.supports_all(&[
+            open_cpu::Feature::Avx512f,
+            open_cpu::Feature::Avx512bw,
+            open_cpu::Feature::Avx512vnni,
+        ]) || c.supports_all(&[open_cpu::Feature::AvxVnni, open_cpu::Feature::Avx2])
+    }
+}
+
+/// f32 の AVX-512 経路を使ってよいか。
+///
+/// AVX-512F と(512bit ロード/ストアの前提となる)BW/VL が揃っており、かつ
+/// `OPEN_CPU_ENABLE_AVX512=1` が設定されている場合のみ true。
+/// **この開発機(Zen 2)では常に false**(実機未検証のため既定で無効)。
+pub fn avx512_f32_path() -> bool {
+    open_cpu::detect().at_least(open_cpu::IsaProfile::Avx512) && open_cpu::avx512_opt_in()
 }
 
 /// 初回のみCPU機能を検出してキャッシュする。
@@ -84,6 +125,18 @@ pub fn cpu_features() -> &'static CpuFeatures {
     use std::sync::OnceLock;
     static F: OnceLock<CpuFeatures> = OnceLock::new();
     F.get_or_init(CpuFeatures::detect)
+}
+
+/// CPU 経路のランタイム状況を 1 行で表す(ログ・API 表示用)。
+pub fn cpu_runtime_line() -> String {
+    let f = cpu_features();
+    format!(
+        "cpu simd: {} | isa profile: {} | avx2+fma3: {} | vnni: {}",
+        f.describe(),
+        f.isa_profile(),
+        f.has_avx2_fma(),
+        f.has_vnni_path()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -210,11 +263,13 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         let f = cpu_features();
-        if f.avx512f && n >= 16 {
+        // AVX-512 経路は実機未検証のため OPEN_CPU_ENABLE_AVX512=1 でのみ選択する。
+        if avx512_f32_path() && n >= 16 {
             let (s, done) = unsafe { x86::dot_f32_avx512(&a[..n], &b[..n]) };
             return s + dot_f32_scalar(&a[done..n], &b[done..n]);
         }
-        if f.avx2 && f.fma && n >= 8 {
+        // AVX2 と FMA3 が「両方」揃っている場合のみ vfmadd 経路へ入る。
+        if f.has_avx2_fma() && n >= 8 {
             let (s, done) = unsafe { x86::dot_f32_avx2_fma(&a[..n], &b[..n]) };
             return s + dot_f32_scalar(&a[done..n], &b[done..n]);
         }
@@ -277,9 +332,9 @@ pub fn axpy(acc: &mut [f32], src: &[f32], scale: f32) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         let f = cpu_features();
-        done = if f.avx512f {
+        done = if avx512_f32_path() {
             unsafe { x86_axpy::axpy_avx512(&mut acc[..n], &src[..n], scale) }
-        } else if f.avx2 && f.fma {
+        } else if f.has_avx2_fma() {
             unsafe { x86_axpy::axpy_avx2_fma(&mut acc[..n], &src[..n], scale) }
         } else {
             0
@@ -345,11 +400,13 @@ pub fn dot_i8(a: &[u8], b: &[i8]) -> i32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         let f = cpu_features();
-        if f.avx512vnni && n >= 64 {
+        // VNNI は単独フラグでなく AVX-512F+BW+VNNI の組み合わせで判定する
+        // (target_feature に列挙した機能と一致させるため)。実機未検証。
+        if f.avx512vnni && f.avx512bw && f.avx512f && open_cpu::avx512_opt_in() && n >= 64 {
             let (s, done) = unsafe { x86::dot_i8_avx512vnni(&a[..n], &b[..n]) };
             return s + dot_i8_scalar(&a[done..n], &b[done..n]);
         }
-        if f.avxvnni && n >= 32 {
+        if f.avxvnni && f.avx2 && n >= 32 {
             let (s, done) = unsafe { x86::dot_i8_avxvnni(&a[..n], &b[..n]) };
             return s + dot_i8_scalar(&a[done..n], &b[done..n]);
         }

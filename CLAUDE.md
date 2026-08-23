@@ -63,6 +63,44 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-08-23、open-cpu への CPU 機能検出の一元化 + 実バグ 2 件修正)
+
+`opencuda-blas` の `simd.rs` が独自に `is_x86_feature_detected!` を
+呼んで CPU 機能を検出していたのを、エコシステム共通基盤
+[`open-cpu`](https://github.com/aon-co-jp/open-cpu) へ移譲した
+(`Cargo.toml` に path 依存を追加)。`CpuFeatures` 構造体のフィールドは
+従来どおりなので既存の呼び出し側は無変更。
+
+**この作業中に見つけた実バグを 2 件修正した(いずれも「単独の機能
+フラグで分岐していたが、実際に必要なのは複数機能の組み合わせ」という
+同種の誤り):**
+
+1. **AVX-512 経路が opt-in 無しで選択される状態だった。**
+   `dot_f32` / `axpy` が `if f.avx512f` だけで 512bit 経路へ入るため、
+   AVX-512 搭載機で実行すると **実機未検証のコードが自動的に走って
+   しまう**。open-cpu の方針(未検証パスは既定で選ばせない)に合わせ、
+   `avx512_f32_path()` を新設して `AVX-512F+BW+VL` が揃い、かつ
+   環境変数 `OPEN_CPU_ENABLE_AVX512=1` がある場合のみ選ぶようにした。
+2. **int8 VNNI の分岐条件が `target_feature` の宣言と一致していなかった。**
+   `dot_i8_avx512vnni` は `#[target_feature(enable = "avx512vnni,avx512bw,avx512f")]`
+   と 3 機能を要求しているのに、呼び出し側は `if f.avx512vnni` だけを
+   見ていた。`avx512bw`/`avx512f` も確認する組み合わせ判定へ修正。
+   `dot_i8_avxvnni`(`avxvnni,avx2`)も同様に修正。
+
+あわせて `CpuFeatures` に `avx512bw` フィールドと、組み合わせ判定用の
+`isa_profile()` / `has_avx2_fma()` / `has_vnni_path()`、ログ用の
+`cpu_runtime_line()` を追加した。
+
+**検証**: `cargo test -p opencuda-blas --release` **34 テスト通過**
+(スカラー参照実装との一致テストを含む)。開発機は Ryzen 9 3950X
+(Zen 2)で `isa_profile = avx2+fma3`。**AVX-512 / VNNI 経路は
+引き続き実機未検証**(CPU が非搭載)。
+
+- 次にすべきこと: GEMM の重み再配置(llama.cpp の online repack 相当)は
+  本リポジトリの規模に対して過剰と判断し見送った。GFNI/AMX も同様。
+  詳細な技術動向調査の結果は `open-cpu/CLAUDE.md` の 2026-08-23 HANDOFF に
+  参照元リンク付きで記録してある。
+
 ## HANDOFF追記(2026-08-15、sftp-git開発セッションからの横断作業)
 
 - **Android実機(moto g53y 5G、Adreno 619)でVulkan実行を実機検証
