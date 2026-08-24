@@ -50,6 +50,7 @@
 //!   バイト共有処理はホスト側で行う。それぞれ`dequantize_*`の逆変換と、
 //!   往復誤差がscale/2以内に収まることを検証するテストを含む。
 
+pub mod autotune;
 pub mod simd;
 
 use opencuda_core::{CompiledKernel, GpuDevice, GpuVendor, KernelArg, LaunchConfig, ResolvedArg, Result, ThreadCtx};
