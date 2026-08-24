@@ -364,6 +364,11 @@ pub fn sgemm_cpu(
     c: &mut [f32],
 ) {
     use rayon::prelude::*;
+    // 2026-08-24: `m`が未使用という警告が出ていた(行数は`c`の長さから
+    // 導出しているため)。次元の食い違いを黙って計算し続けないよう、
+    // ここで明示的に検査する(呼び出し側の`sgemm`は既に検査済みだが、
+    // この関数を直接呼ぶ経路〈autotune等〉もあるため)。
+    assert_eq!(c.len(), m * n, "sgemm_cpu: c.len()={} != m*n={}", c.len(), m * n);
     c.par_chunks_mut(n).enumerate().for_each(|(row, c_row)| {
         let a_row = &a[row * k..row * k + k];
         if transpose_b {

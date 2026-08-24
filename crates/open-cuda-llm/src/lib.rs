@@ -941,6 +941,42 @@ impl GptModel {
         Ok(())
     }
 
+    /// **2026-08-24新設**: [`GptModel::set_matmul_dxil_offload`]の
+    /// 「速いときだけ有効にする」版。
+    ///
+    /// このモデルの実際のGEMM形状(`hidden`→`3*hidden` / `hidden` /
+    /// `intermediate`、`intermediate`→`hidden`、`hidden`→`vocab`)で
+    /// D3D12経路とCPU(SIMD)経路を**その場で実測**し
+    /// (`opencuda_blas::autotune::decide_dxil_offload`)、GPUの方が
+    /// 速かった場合にのみ配線する。遅ければモデルは一切変更せず
+    /// (CPU経路のまま)、判定結果だけを返す。
+    ///
+    /// これは2026-08-23のHANDOFFで判明した実問題への対処:
+    /// 開発機(GT 730)ではD3D12経路がCPUより3〜30倍遅かったが、
+    /// 過去HANDOFFのAdreno 619実機では逆にGPUが最大5.99倍速かった——
+    /// どちらになるかはマシン依存なので、静的に決め打ちせず実測で決める。
+    ///
+    /// 環境変数`OPEN_CUDA_GEMM_OFFLOAD=gpu|cpu`で判定を上書きできる。
+    /// 計測はVRAMの一時確保(最大形状で`k*n*4`バイト、GPT-2なら約154MB)を
+    /// 伴い、確保に失敗した場合は`Err`を返す(モデルは無変更)。
+    pub fn set_matmul_dxil_offload_if_faster(
+        &mut self,
+        device: std::sync::Arc<dyn GpuDevice>,
+        dxil: Vec<u8>,
+    ) -> Result<opencuda_blas::autotune::OffloadDecision> {
+        let h = self.config.hidden_size;
+        let i = self.config.intermediate_size;
+        let v = self.config.vocab_size;
+        // デコード時(m=1)の代表形状。生成時間の大半は1トークンずつの
+        // デコードが占めるため、そちらの形状で判定する。
+        let shapes = [(1, h, 3 * h), (1, h, h), (1, h, i), (1, i, h), (1, h, v)];
+        let decision = opencuda_blas::autotune::decide_dxil_offload(&*device, &dxil, &shapes, 3)?;
+        if decision.use_gpu {
+            self.set_matmul_dxil_offload(device, dxil)?;
+        }
+        Ok(decision)
+    }
+
     /// コンパイル済み`softmax.spv`(`opencuda_blas::softmax_vulkan_generic`
     /// が期待するのと同じシェーダバイト列)を配線する(2026-08-06新設)。
     /// [`set_matmul_spirv`](Self::set_matmul_spirv)と併用することで、
