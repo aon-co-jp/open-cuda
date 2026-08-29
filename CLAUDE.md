@@ -10,6 +10,11 @@
 > (REST撤廃・APIキー自動管理)の適用対象が構造的に存在しない**。
 > 対応不要と判断した経緯の詳細はaruaru-db/CLAUDE.mdの2026-08-29
 > HANDOFF「open-cuda/open-directxとの連携性・必要性の再確認」参照。
+> **【2026-08-29追記・ユーザー補足】この「対象外」判断は現時点(HTTP面を
+> 持たない現状)に基づくものであり恒久的な除外ではない**——今後
+> open-directxのDirectX互換実装・開発が進み、open-cuda・aruaru-llm・
+> aruaru-db・open-web-server・RPoem等との連携が深まっていく場合は、
+> その時点で改めてこのSET連携方針の適用範囲を再評価すること。
 >
 > **📌 保留タスク(2026-08-06、次回セッションで着手予定)/ Pending task (added 2026-08-06, to be started next session)**:
 > ユーザー指示により、**東芝の疑似量子コンピューター技術(Simulated
