@@ -1,17 +1,31 @@
 # open-cuda
 
-> 🎯 **aruaru-db × RPoem SET policy (2026-08-29)**: `aruaru-db`'s
-> `CLAUDE.md` explains it only delivers "no REST API needed, compatible
-> with WunderGraph Cosmo's paid Enterprise tier" when paired with
-> RPoem. **This repository was re-checked and confirmed to have no
-> REST API / API-key mentions anywhere in its `CLAUDE.md`** — it is a
-> GPU compute library with no HTTP server surface, so this SET policy
-> does not apply here. See aruaru-db/CLAUDE.md's 2026-08-29 HANDOFF for
-> the investigation. **This "not applicable" finding reflects the
-> current state only, not a permanent exemption** — if open-directx's
-> DirectX-compatibility implementation matures and deepens its ties to
-> open-cuda, aruaru-llm, aruaru-db, open-web-server, and RPoem, this
-> scoping should be re-evaluated at that point.
+> ## 🎯🕒 aruaru-db × RPoem SET policy + "current-state-only" caveat
+> (2026-08-29, cross-repo review, pinned to the very top per user
+> instruction)
+>
+> **Canonical source: aruaru-db/CLAUDE.md's opening "most important"
+> note.** aruaru-db only delivers "no REST API needed, compatible with
+> WunderGraph Cosmo's paid Enterprise tier" when paired (SET) with
+> RPoem — and warns against building REST replacements aimlessly.
+>
+> **This repository is out of scope for now**: re-checked and
+> confirmed to have no REST API / API-key mentions anywhere in its
+> `CLAUDE.md` — it is a GPU compute library with no HTTP server
+> surface, so this SET policy currently has no applicable target here.
+> See aruaru-db/CLAUDE.md's 2026-08-29 HANDOFF for the investigation.
+>
+> **⚠️ But this "out of scope" is a provisional call for right now, not
+> a permanent conclusion (user's own caveat, 2026-08-29)**: as
+> open-directx's DirectX-compatibility implementation and development
+> progress, the expectation is that **more scenarios will emerge where
+> issuing commands directly at the OS level, or having the app run via
+> hardware accelerators (open-directx/open-cpu), becomes the bigger
+> win**. If that happens, ties to open-cuda, aruaru-llm, aruaru-db,
+> open-web-server, and RPoem will genuinely deepen, and this SET
+> policy's scope (REST-free, Cosmo-Enterprise-compatible) should be
+> re-evaluated at that point. Re-ask "is this still out of scope?"
+> each time development advances.
 
 *English*: [README-English.md](README-English.md) ·
 *Other languages*: [Deutsch](README-German.md) · [Italiano](README-Italian.md) ·

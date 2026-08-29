@@ -1,21 +1,31 @@
 # 設計思想＆開発方針＆開発環境ルール(open-cuda)
 
-> ## 🎯 aruaru-db×RPoem SET連携方針(2026-08-29、全リポジトリ横断調査)
-> 正本はaruaru-db/CLAUDE.md冒頭「🎯最重要・最優先で常に念頭に置く
-> こと」(REST APIの代替をただ闇雲に作らない、aruaru-dbはRPoemとの
-> SETで初めてWunderGraph Cosmo有料版互換の価値が成立する、という戒め)。
-> **本リポジトリ(open-cuda)は`CLAUDE.md`にREST API・APIキーへの言及が
-> 一件も無いことを実際に`grep`で確認済み——GPU計算ライブラリであり
-> HTTPサーバー面・APIキー認証面を一切持たないため、このSET連携方針
-> (REST撤廃・APIキー自動管理)の適用対象が構造的に存在しない**。
-> 対応不要と判断した経緯の詳細はaruaru-db/CLAUDE.mdの2026-08-29
-> HANDOFF「open-cuda/open-directxとの連携性・必要性の再確認」参照。
-> **【2026-08-29追記・ユーザー補足】この「対象外」判断は現時点(HTTP面を
-> 持たない現状)に基づくものであり恒久的な除外ではない**——今後
-> open-directxのDirectX互換実装・開発が進み、open-cuda・aruaru-llm・
-> aruaru-db・open-web-server・RPoem等との連携が深まっていく場合は、
-> その時点で改めてこのSET連携方針の適用範囲を再評価すること。
+> ## 🎯🕒 aruaru-db×RPoem SET連携方針+「現時点限定」の暫定判断(2026-08-29、
+> 全リポジトリ横断調査、ユーザー指示によりファイル最上部へ固定)
 >
+> **正本はaruaru-db/CLAUDE.md冒頭「🎯最重要・最優先で常に念頭に置く
+> こと」**: REST APIの代替をただ闇雲に作らない、aruaru-dbはRPoemとの
+> SETで初めて「REST API不要・WunderGraph Cosmo有料版(Enterprise)
+> 互換」という価値が成立する、という戒めがそこに記されている。
+>
+> **本リポジトリ(open-cuda)は現時点では対象外**: `CLAUDE.md`に
+> REST API・APIキーへの言及が一件も無いことを実際に`grep`で確認済み
+> ——GPU計算ライブラリでありHTTPサーバー面・APIキー認証面を一切
+> 持たないため、今のところこのSET連携方針(REST撤廃・APIキー自動
+> 管理)の適用対象が構造的に存在しない。詳細はaruaru-db/CLAUDE.mdの
+> 2026-08-29 HANDOFF「open-cuda/open-directxとの連携性・必要性の
+> 再確認」参照。
+>
+> **⚠️ ただしこの「対象外」は恒久的な結論ではなく、今この瞬間だけの
+> 暫定判断であることを忘れないこと(ユーザー指摘、2026-08-29)**:
+> 今後open-directxのDirectX互換実装・開発が進み、**OSレベルから
+> アプリへ直接命令する、あるいはアプリがハードウェアアクセラレーター
+> (open-directx/open-cpu)経由で動作した方がメリットが大きくなる場面
+> が増えていく**という予測がある。そうなればopen-cuda・aruaru-llm・
+> aruaru-db・open-web-server・RPoemとの連携が実際に深まり、この
+> SET連携方針(REST API不要・Cosmo有料版互換)の適用範囲そのものを
+> 再評価すべき時が来る可能性が高い。開発が進むたびに「今もまだ
+> 対象外のままか」を問い直すこと。
 > **📌 保留タスク(2026-08-06、次回セッションで着手予定)/ Pending task (added 2026-08-06, to be started next session)**:
 > ユーザー指示により、**東芝の疑似量子コンピューター技術(Simulated
 > Bifurcation Machine)**と**DeepSeekの技術**(インターネットニュースだけ
