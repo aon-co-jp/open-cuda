@@ -1,9 +1,13 @@
 # open-cuda お引越しガイド
 
-> 🎯 **移植時の前提(2026-08-29)**: aruaru-dbはRPoemとのSETで「REST
+> 🎯🕒 **移植時の前提(2026-08-29)**: aruaru-dbはRPoemとのSETで「REST
 > API不要・Cosmo有料版互換」の価値が成立する(正本: aruaru-db/
-> CLAUDE.md冒頭)が、**open-cudaはGPU計算ライブラリでHTTP面が無く
-> この方針の対象外**(実際に`grep`で確認済み)。
+> CLAUDE.md冒頭)が、**open-cudaは現時点ではGPU計算ライブラリでHTTP面が
+> 無くこの方針の対象外**(実際に`grep`で確認済み)。**ただしこれは今
+> この瞬間だけの暫定判断**——open-directxのDirectX互換実装が進み、
+> OSレベル命令やハードウェアアクセラレーター(open-directx/open-cpu)
+> 経由の動作がメリットを持つ場面が増えれば、この対象外判断を再評価
+> すること。
 
 > **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
 > 「設計思想＆開発方針＆開発環境ルール」へ改名しました
