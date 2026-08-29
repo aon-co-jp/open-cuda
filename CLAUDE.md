@@ -1,5 +1,16 @@
 # 設計思想＆開発方針＆開発環境ルール(open-cuda)
 
+> ## 🎯 aruaru-db×RPoem SET連携方針(2026-08-29、全リポジトリ横断調査)
+> 正本はaruaru-db/CLAUDE.md冒頭「🎯最重要・最優先で常に念頭に置く
+> こと」(REST APIの代替をただ闇雲に作らない、aruaru-dbはRPoemとの
+> SETで初めてWunderGraph Cosmo有料版互換の価値が成立する、という戒め)。
+> **本リポジトリ(open-cuda)は`CLAUDE.md`にREST API・APIキーへの言及が
+> 一件も無いことを実際に`grep`で確認済み——GPU計算ライブラリであり
+> HTTPサーバー面・APIキー認証面を一切持たないため、このSET連携方針
+> (REST撤廃・APIキー自動管理)の適用対象が構造的に存在しない**。
+> 対応不要と判断した経緯の詳細はaruaru-db/CLAUDE.mdの2026-08-29
+> HANDOFF「open-cuda/open-directxとの連携性・必要性の再確認」参照。
+>
 > **📌 保留タスク(2026-08-06、次回セッションで着手予定)/ Pending task (added 2026-08-06, to be started next session)**:
 > ユーザー指示により、**東芝の疑似量子コンピューター技術(Simulated
 > Bifurcation Machine)**と**DeepSeekの技術**(インターネットニュースだけ

@@ -1,5 +1,14 @@
 # open-cuda
 
+> 🎯 **aruaru-db × RPoem SET policy (2026-08-29)**: `aruaru-db`'s
+> `CLAUDE.md` explains it only delivers "no REST API needed, compatible
+> with WunderGraph Cosmo's paid Enterprise tier" when paired with
+> RPoem. **This repository was re-checked and confirmed to have no
+> REST API / API-key mentions anywhere in its `CLAUDE.md`** — it is a
+> GPU compute library with no HTTP server surface, so this SET policy
+> does not apply here. See aruaru-db/CLAUDE.md's 2026-08-29 HANDOFF for
+> the investigation.
+
 *English*: [README-English.md](README-English.md) ·
 *Other languages*: [Deutsch](README-German.md) · [Italiano](README-Italian.md) ·
 [Français](README-French.md) · [Русский](README-Russian.md) ·
