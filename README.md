@@ -6,6 +6,19 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-01)**: `open-cuda-llm::GptModel`へ
+> Model Folding(層冗長性検出・実際の除去・線形アダプタ置換)を実装
+> した。`analyze_layer_redundancy`/`prune_redundant_layers`
+> (ShortGPT/Gromov et al.方式)・`find_best_layer_block_to_remove`/
+> `remove_layer_block`(連続ブロック探索)・
+> `fold_block_with_linear_adapter`(SHIFT-LLM/SlimLLM着想の
+> closed-form線形置換、勾配降下法は使わない)の3段階。**正直な開示**:
+> ユーザーから依頼のあった「DeepSeekの折りたたみ理論」という技術は
+> 日英調査の結果実在しないと判明しており、これは無関係の代替手法
+> (実測結果込み)である。詳細は[CLAUDE.md](CLAUDE.md)の2026-09-01
+> HANDOFF追記を参照(利用側の`aruaru-llm`から他アカウントで再開する
+> 場合は必ず`aruaru-llm/CLAUDE.md`も併せて確認すること)。
+>
 > 📌 **最近の更新(2026-08-10)**: `open-cuda-llm::GptModel`に
 > `generate_with_repetition_penalty`(CTRL方式の繰り返しペナルティ、
 > penalty>1.0で既に登場したトークンのlogitを弱める)を新設した。既存の
