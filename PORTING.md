@@ -17,6 +17,24 @@
 
 他プロジェクトへ`open-cuda`の設計パターンを移植する際の要点をまとめる。
 
+## 0. `open-cuda-llm::GptModel`のModel Folding機能(2026-09-01新設)
+
+`analyze_layer_redundancy`/`prune_redundant_layers`/
+`find_best_layer_block_to_remove`/`remove_layer_block`/
+`fold_block_with_linear_adapter`(`crates/open-cuda-llm/src/lib.rs`)
+は、GPT-2互換の自己回帰デコーダを持つ他プロジェクトへもそのまま移植
+できる設計(`GptModel`固有の内部構造〈`DecoderLayer`/`Linear`/
+`LayerNorm`〉に依存するが、外部APIとしては`device: &Arc<dyn
+GpuDevice>`+`sample_prompts: &[Vec<u32>]`のみを要求する)。移植先で
+同じ機能が必要になった場合、この一式をそのままコピーすれば動作する
+はず(利用側のHTTP配線は`aruaru-llm/src/generation.rs`・
+`src/main.rs`が参考実装)。**「DeepSeekの折りたたみ理論」という技術は
+実在しない**という調査結果と、実装した代替手法の詳細・実測結果は
+`CLAUDE.md`の2026-09-01 HANDOFF追記に集約してある——移植先で同じ
+依頼(「Model Foldingを実装して」「DeepSeekの折りたたみを実装して」)
+を受けた場合、同じ調査をゼロからやり直す前に必ずこの記録を参照する
+こと。
+
 ## 1. `GpuDevice`トレイト(バックエンド非依存の設計)
 
 CUDA Runtime API相当の最小契約(`alloc`/`free`/`memcpy_h2d`/

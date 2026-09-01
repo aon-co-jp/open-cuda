@@ -89,6 +89,74 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-01、`open-cuda-llm`にModel Folding〈層冗長性検出・除去・線形アダプタ置換〉を実装——他アカウントでの再開用メモ、必ず読むこと)
+
+`aruaru-llm`側からの依頼(ユーザー指示「DeepSeekの折りたたみ理論
+(Model Folding)を実装してほしい」)への対応として、`crates/
+open-cuda-llm/src/lib.rs`の`GptModel`へ3段階の機能を追加した
+(HTTP配線・利用者向けドキュメントは`aruaru-llm`側、詳細な経緯・実測
+結果は`aruaru-llm/CLAUDE.md`の同日HANDOFFを正本とし、ここでは
+このリポジトリ固有の実装詳細のみ記す)。
+
+**最重要の事実確認**: 日英2言語でGoogle/GitHub調査した結果、
+**「DeepSeekの折りたたみ理論」という技術は実在しないと判明した**
+(DeepSeekの実際の効率化技術はMLA・FP8混合精度・DeepSeekMoEであり、
+いずれも「折りたたみ」ではない)。混同の元と考えられるのは無関係の
+ICLR 2025論文「Model Folding」(arXiv:2502.10216、ニューロン単位
+k-meansクラスタリングを要する高度な手法)——`GptModel`の重みには
+公開アクセサが無く忠実な再現は困難と判断し、以下3つの代替手法を
+実装した。
+
+1. **`analyze_layer_redundancy`/`prune_redundant_layers`**
+   (ShortGPT arXiv:2403.03853/Gromov et al. arXiv:2403.17887方式、
+   独立閾値): 各層の入力/出力コサイン類似度からBlock Influenceを
+   算出し、閾値未満の層を除去する。既存の`forward_prefill`
+   インフラをそのまま再利用(新規GPU固有コードは追加していない、
+   `device: &Arc<dyn GpuDevice>`引数経由で呼び出し側が渡した
+   CPU/Vulkan/DirectXいずれでも動作)。
+2. **`find_best_layer_block_to_remove`/`remove_layer_block`**
+   (Gromov et al.論文の本来のアルゴリズムに忠実化): 削除したい
+   層数を固定し、その本数の連続ブロックを総当たり比較して除去
+   影響が最小の1つを選ぶ。上記1の「独立した層を寄せ集める」弱点
+   (実測で6層中5層の一括削除が破綻を招いた)を解消する設計。
+3. **`fold_block_with_linear_adapter`+`DecoderLayer::
+   linear_adapter`**(SHIFT-LLM arXiv:2608.25068/SlimLLM
+   arXiv:2505.22689着想のclosed-form線形置換、**正直な開示: これらは
+   非常に新しい論文であり本実装は再現実装ではなく独自の簡略版**):
+   除去ブロックを跡形もなく消すのではなく、最小二乗法(閉形式の
+   リッジ回帰、`nalgebra`使用、勾配降下法は使わない)でフィットした
+   1層の線形アダプタへ置換する。Attentionサブ層は`Linear::zeroed`で
+   出力を常にゼロに潰し(残差のみ通過)、FFNサブ層は`Linear::
+   identity`(恒等写像)+GELU+`output`(唯一のフィット対象)という
+   構成——既存の`DecoderLayer`構造体を100%再利用し、新しいレイヤー型は
+   追加していない。
+
+**実測結果(distilgpt2、6層、極端な予算=6層中5層除去)**: 方式1・2は
+完全な劣化ループ("Theodoreodoreodoreodore...")に陥ったが、方式3は
+劣化ループを回避し実在の英単語を使った出力("I slowly, it the
+rainforest in a few one way with at right outside to play.")を
+生成した。**正確に言うと**: 方式3は実測できる本物の改善だが完全な
+修正ではない——出力は依然として文法的に一貫した文章にはならない。
+
+**検証**: `cargo test -p open-cuda-llm --release -- --test-threads=1`
+で**32件全green**(新規6件+既存26件、実GPU経路のregressionテスト含む、
+`--test-threads=1`が必要な理由〈重量級テストの資源競合〉は既存の
+2026-08-08 HANDOFF参照)。実重み(distilgpt2/gpt2)を使う`--ignored`
+テスト3件(`manual_compare_independent_threshold_vs_block_search_
+on_real_gpt2_weights`・`manual_compare_plain_removal_vs_linear_
+adapter_at_extreme_budget_on_real_gpt2_weights`等)も実行し、上記の
+実測結果を確認済み。
+
+**未着手・次回検討候補**: (1) 線形アダプタの`ridge_lambda`(既定
+`1e-2`固定)を呼び出し側から調整可能にする、(2) Attentionサブ層を
+ゼロに潰す設計はQKV射影・softmax計算自体は実行してしまう(出力だけ
+捨てる)ため計算コストが完全には削減されない——専用の「Attentionを
+スキップする軽量パス」を追加する余地がある、(3) 較正データは英語の
+一般文のみで日本語・他言語での検証は未実施、(4) この3手法をVulkan/
+DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで検証)。
+
+コミット: `890f8b1`(方式1)・`74263e1`(方式2)・`3a887ad`(方式3)。
+
 ## HANDOFF追記(2026-08-23、階層的アクセラレーション: D3D12 Compute経由のGEMMオフロードを実装 / Hierarchical acceleration: DXIL GEMM offload)
 
 ユーザーの目的「NVIDIA GPU非搭載の安価なPCでもAI推論をなるべく速く」への対応として、
