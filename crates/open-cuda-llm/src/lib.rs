@@ -889,6 +889,9 @@ pub struct AdapterFoldReport {
     /// `hidden_size`より大幅に少ない場合、フィット結果の信頼性は低い
     /// (呼び出し側が判断できるよう常に開示する)。
     pub fit_sample_rows: usize,
+    /// **2026-09-01新設**: 実際に使われたリッジ正則化係数(呼び出し側が
+    /// `Some`で上書きしなかった場合は既定値`1e-2`がそのまま入る)。
+    pub ridge_lambda_used: f32,
     pub disclosure: &'static str,
 }
 
@@ -1631,10 +1634,21 @@ impl GptModel {
     ///   較正データと分布が大きく異なる入力では近似精度が下がりうる。
     /// - 勾配降下法によるfine-tuning(healing)は一切行っていない
     ///   ——閉形式のリッジ回帰のみ。
-    pub fn fold_block_with_linear_adapter(&mut self, device: &std::sync::Arc<dyn GpuDevice>, sample_prompts: &[Vec<u32>], candidate: &BlockRemovalCandidate) -> Result<AdapterFoldReport> {
+    ///
+    /// **2026-09-01追記**: `ridge_lambda`は`None`なら既定値`1e-2`
+    /// (経験的に安定するとして選んだ値)を使う。呼び出し側が調整
+    /// したい場合は`Some(value)`で明示的に上書きできる(HTTP API
+    /// から`fold-layers`の`ridge_lambda`パラメータ経由で渡される、
+    /// `aruaru-llm`側`generation::fold_active_model_with_linear_adapter`
+    /// 参照)。`value`は正の有限数であること(0や負値・NaN・infは
+    /// 数値的に不安定な解や特異行列エラーを招くため拒否する)。
+    pub fn fold_block_with_linear_adapter(&mut self, device: &std::sync::Arc<dyn GpuDevice>, sample_prompts: &[Vec<u32>], candidate: &BlockRemovalCandidate, ridge_lambda: Option<f32>) -> Result<AdapterFoldReport> {
         anyhow::ensure!(!sample_prompts.is_empty(), "open-cuda-llm: fold_block_with_linear_adapter: sample_prompts must not be empty");
         anyhow::ensure!(candidate.start + candidate.len <= self.layers.len(), "open-cuda-llm: fold_block_with_linear_adapter: candidate range [{}, {}) exceeds current layer_count()={}", candidate.start, candidate.start + candidate.len, self.layers.len());
         anyhow::ensure!(self.layers.iter().all(|l| l.mla.is_none()), "open-cuda-llm: fold_block_with_linear_adapter: MLA-compressed layers are not supported");
+        if let Some(lambda) = ridge_lambda {
+            anyhow::ensure!(lambda.is_finite() && lambda > 0.0, "open-cuda-llm: fold_block_with_linear_adapter: ridge_lambda must be a finite positive number, got {lambda}");
+        }
 
         let hidden_size = self.config.hidden_size;
         let eps = self.config.layer_norm_eps;
@@ -1668,8 +1682,10 @@ impl GptModel {
 
         // リッジ係数は経験的な既定値(較正サンプルが少ない=劣決定系に
         // なりやすいこの用途では、ある程度強めの正則化が数値的に安定)。
-        const RIDGE_LAMBDA: f32 = 1e-2;
-        let (output_weight_t, output_bias) = fit_linear_adapter_output_layer(hidden_size, eps, &before_rows, &after_rows, num_rows, RIDGE_LAMBDA)?;
+        // 2026-09-01: 呼び出し側が`ridge_lambda`で明示的に上書き可能に変更。
+        const DEFAULT_RIDGE_LAMBDA: f32 = 1e-2;
+        let ridge_lambda = ridge_lambda.unwrap_or(DEFAULT_RIDGE_LAMBDA);
+        let (output_weight_t, output_bias) = fit_linear_adapter_output_layer(hidden_size, eps, &before_rows, &after_rows, num_rows, ridge_lambda)?;
         let adapter = DecoderLayer::linear_adapter(hidden_size, eps, output_weight_t, output_bias);
 
         let original_layer_count = self.layers.len();
@@ -1682,6 +1698,7 @@ impl GptModel {
             block_start: candidate.start,
             block_len: candidate.len,
             fit_sample_rows: num_rows,
+            ridge_lambda_used: ridge_lambda,
             disclosure: "除去したブロックの代わりに、最小二乗法(閉形式のリッジ回帰、勾配降下法は使わない)でフィットした\
                 1つの軽量な線形アダプタ層を挿入しました(SHIFT-LLM/SlimLLM等のclosed-form線形置換手法に着想、\
                 arXiv:2608.25068/arXiv:2505.22689——これらは非常に新しい論文であり、本実装は再現実装ではなく着想の\
@@ -3217,7 +3234,7 @@ mod tests {
         let prompts: Vec<Vec<u32>> = ["the weather today is sunny and warm outside", "stock markets rose sharply again this quarter", "she walked slowly through the old quiet library", "computers process information using binary logic"].iter().map(|s| ByteTokenizer::encode(s)).collect();
 
         let candidate = model.find_best_layer_block_to_remove(&device, &prompts, 3).unwrap();
-        let report = model.fold_block_with_linear_adapter(&device, &prompts, &candidate).unwrap();
+        let report = model.fold_block_with_linear_adapter(&device, &prompts, &candidate, None).unwrap();
 
         assert_eq!(report.original_layer_count, 8);
         assert_eq!(report.layer_count_after, 6, "an N=3 block should become 1 adapter layer, so layer count drops by N-1=2, not by N=3");
@@ -3230,6 +3247,45 @@ mod tests {
         assert_eq!(generated.len(), 4);
     }
 
+    /// **2026-09-01新設**: `ridge_lambda`を明示的に上書きできること、
+    /// 結果の`ridge_lambda_used`に実際に使われた値が反映されること、
+    /// 既定値(`None`)を渡した場合と異なる値になることを確認する。
+    #[test]
+    fn fold_block_with_linear_adapter_honors_explicit_ridge_lambda() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 8;
+        let mut model_default = GptModel::load_random(config.clone(), 33);
+        let mut model_custom = GptModel::load_random(config, 33);
+        let device = device();
+        let prompts: Vec<Vec<u32>> = ["the weather today is sunny and warm outside", "stock markets rose sharply again this quarter"].iter().map(|s| ByteTokenizer::encode(s)).collect();
+
+        let candidate_default = model_default.find_best_layer_block_to_remove(&device, &prompts, 3).unwrap();
+        let report_default = model_default.fold_block_with_linear_adapter(&device, &prompts, &candidate_default, None).unwrap();
+        assert_eq!(report_default.ridge_lambda_used, 1e-2, "None must fall back to the documented default 1e-2");
+
+        let candidate_custom = model_custom.find_best_layer_block_to_remove(&device, &prompts, 3).unwrap();
+        let report_custom = model_custom.fold_block_with_linear_adapter(&device, &prompts, &candidate_custom, Some(5.0)).unwrap();
+        assert_eq!(report_custom.ridge_lambda_used, 5.0, "an explicit Some(value) must be used as-is and reported back");
+    }
+
+    /// **2026-09-01新設**: 非正の値・NaN・infの`ridge_lambda`は、数値的に
+    /// 不安定な解や特異行列エラーを招く前に、正直な`ensure!`エラーで
+    /// 即座に拒否されること(サイレントに変な解を返さない)。
+    #[test]
+    fn fold_block_with_linear_adapter_rejects_invalid_ridge_lambda() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 4;
+        let device = device();
+        let prompts: Vec<Vec<u32>> = vec![ByteTokenizer::encode("a short calibration sentence")];
+
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut model = GptModel::load_random(config.clone(), 55);
+            let candidate = model.find_best_layer_block_to_remove(&device, &prompts, 2).unwrap();
+            let err = model.fold_block_with_linear_adapter(&device, &prompts, &candidate, Some(bad)).unwrap_err();
+            assert!(err.to_string().contains("ridge_lambda must be a finite positive number"), "unexpected error for ridge_lambda={bad}: {err}");
+        }
+    }
+
     /// `candidate`が現在の層数を超える範囲を指す場合は、黙って壊れた
     /// スプライスを行わず正直にエラーを返すこと。
     #[test]
@@ -3240,7 +3296,7 @@ mod tests {
         let device = device();
         let prompts = vec![ByteTokenizer::encode("a short sample sentence")];
         let bogus = BlockRemovalCandidate { start: 1, len: 5, block_similarity: 0.9, sample_count: 1 };
-        let err = model.fold_block_with_linear_adapter(&device, &prompts, &bogus).unwrap_err();
+        let err = model.fold_block_with_linear_adapter(&device, &prompts, &bogus, None).unwrap_err();
         assert!(err.to_string().contains("exceeds current layer_count"));
     }
 
@@ -3348,7 +3404,7 @@ mod tests {
             eprintln!("  plain removal ({} layers left): {:?}", removed_model.layer_count(), tokenizer.decode(&removed_output).unwrap());
 
             let mut adapter_model = GptModel::load(&dir).unwrap();
-            let report = adapter_model.fold_block_with_linear_adapter(&device, &prompts, &candidate).unwrap();
+            let report = adapter_model.fold_block_with_linear_adapter(&device, &prompts, &candidate, None).unwrap();
             let adapter_output = adapter_model.generate_with_repetition_penalty(&device, &sample_prompt, 20, REPETITION_PENALTY).unwrap();
             eprintln!("  linear adapter ({} layers left, fit_sample_rows={}): {:?}", report.layer_count_after, report.fit_sample_rows, tokenizer.decode(&adapter_output).unwrap());
         }
@@ -3361,6 +3417,140 @@ mod bench_manual {
     use opencuda_cpu::CpuDevice;
     use std::sync::Arc;
     use std::time::Instant;
+
+    /// **2026-09-01新設(Model Folding 3手法のGPU実行経路実測)**: ユーザー
+    /// 指示「Model Folding(層冗長性検出+除去+線形アダプタ)をVulkan/
+    /// DirectXの実GPU実行経路で計測せよ、現状CPU実行のみで実測されている」
+    /// への対応。既存の`generate()`用GPU配線パターン(`set_matmul_spirv`/
+    /// `set_matmul_dxil_offload`)をそのまま`analyze_layer_redundancy`/
+    /// `find_best_layer_block_to_remove`/`fold_block_with_linear_adapter`
+    /// (いずれも内部で`forward_prefill`を呼ぶだけで、この3手法専用の
+    /// 新規GPUコードは書いていない——`device: &Arc<dyn GpuDevice>`引数を
+    /// そのまま素通しする既存設計のおかげでそのまま流用できる)へ適用し、
+    /// CPU/Vulkan/DirectXの3経路で実際に所要時間を計測する。
+    ///
+    /// **正直な開示(実行環境依存、誇張しないこと)**: 実Vulkan/DirectX
+    /// デバイスが構築できない環境(GPU非搭載・ドライバ無し・
+    /// `matmul.spv`/`matmul.dxil`未コンパイル)では、該当経路をスキップ
+    /// して`eprintln!`で明示する(既存の`generate_end_to_end_matches_cpu_
+    /// on_real_*`系テストと同じ設計方針)。過去のHANDOFF(2026-08-04〜
+    /// 2026-08-23)で繰り返し実測されている通り、GT 730のような非力な
+    /// discrete GPUではVulkan/DirectXディスパッチの固定オーバーヘッドが
+    /// CPU実行より支配的になり**遅くなる**ことが多い——本テストは
+    /// 「動くこと」の実証と「実測値の記録」が目的であり、GPU経路が
+    /// 必ず速くなることを主張しない。`--ignored`指定時のみ実行
+    /// (実重み・実GPUが必要なため)。
+    #[test]
+    #[ignore]
+    fn manual_bench_fold_layers_cpu_vs_vulkan_vs_directx_on_real_gpt2_weights() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/gpt2");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: no real GPT-2 weights");
+            return;
+        }
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let prompts: Vec<Vec<u32>> = [
+            "The weather today is quite pleasant and sunny.",
+            "In economics, supply and demand determine prices in a market.",
+            "She walked into the kitchen and started making breakfast.",
+            "Computers process information using binary logic circuits.",
+        ]
+        .iter()
+        .map(|s| tokenizer.encode(s).unwrap())
+        .collect();
+
+        let cpu_device: Arc<dyn GpuDevice> = CpuDevice::new(0);
+
+        // --- CPU経路(既存の実測基準、常に実行) ---
+        {
+            let model = GptModel::load(&dir).unwrap();
+            let t0 = Instant::now();
+            let redundancy = model.analyze_layer_redundancy(&cpu_device, &prompts).unwrap();
+            let t_analyze = t0.elapsed();
+            let t1 = Instant::now();
+            let candidate = model.find_best_layer_block_to_remove(&cpu_device, &prompts, 2).unwrap();
+            let t_block_search = t1.elapsed();
+            let mut adapter_model = GptModel::load(&dir).unwrap();
+            let t2 = Instant::now();
+            let _report = adapter_model.fold_block_with_linear_adapter(&cpu_device, &prompts, &candidate, None).unwrap();
+            let t_linear_adapter = t2.elapsed();
+            eprintln!(
+                "[CPU]      analyze_layer_redundancy={t_analyze:?} (layers={}), find_best_layer_block_to_remove={t_block_search:?} (block_similarity={:.4}), fold_block_with_linear_adapter={t_linear_adapter:?}",
+                redundancy.len(),
+                candidate.block_similarity
+            );
+        }
+
+        // --- Vulkan経路(実デバイス+コンパイル済みmatmul.spvが必要) ---
+        let matmul_spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/matmul_vulkan_real/shaders/matmul.spv");
+        match (opencuda_vulkan::VulkanDevice::new(0), std::fs::read(&matmul_spirv_path)) {
+            (Ok(vk), Ok(spirv)) => {
+                let vk_device: Arc<dyn GpuDevice> = vk;
+                let mut model = GptModel::load(&dir).unwrap();
+                model.set_matmul_spirv(spirv.clone());
+                let t0 = Instant::now();
+                let redundancy = model.analyze_layer_redundancy(&vk_device, &prompts).unwrap();
+                let t_analyze = t0.elapsed();
+                let t1 = Instant::now();
+                let candidate = model.find_best_layer_block_to_remove(&vk_device, &prompts, 2).unwrap();
+                let t_block_search = t1.elapsed();
+                let mut adapter_model = GptModel::load(&dir).unwrap();
+                adapter_model.set_matmul_spirv(spirv);
+                let t2 = Instant::now();
+                let _report = adapter_model.fold_block_with_linear_adapter(&vk_device, &prompts, &candidate, None).unwrap();
+                let t_linear_adapter = t2.elapsed();
+                eprintln!(
+                    "[Vulkan]   analyze_layer_redundancy={t_analyze:?} (layers={}), find_best_layer_block_to_remove={t_block_search:?} (block_similarity={:.4}), fold_block_with_linear_adapter={t_linear_adapter:?}",
+                    redundancy.len(),
+                    candidate.block_similarity
+                );
+            }
+            (Err(e), _) => eprintln!("skipping Vulkan path: no real Vulkan device available: {e}"),
+            (_, Err(e)) => eprintln!("skipping Vulkan path: matmul.spv not compiled at {matmul_spirv_path:?}: {e} (run tools/compile-vulkan-shaders.* first)"),
+        }
+
+        // --- DirectX経路(Windows専用、実D3D12デバイス+matmul.dxilが必要) ---
+        #[cfg(windows)]
+        {
+            const MATMUL_DXIL: &[u8] = include_bytes!("../../opencuda-directx/shaders/matmul.dxil");
+            match opencuda_directx::real::DirectXDevice::new(0) {
+                Ok(dx) => {
+                    let dx_arc: Arc<dyn GpuDevice> = dx;
+                    let mut model = GptModel::load(&dir).unwrap();
+                    model.set_matmul_dxil_offload(dx_arc, MATMUL_DXIL.to_vec()).expect("wire dxil offload");
+                    // set_matmul_dxil_offloadは各Linearへ専用のD3D12
+                    // デバイス参照を個別に持たせる設計(既存の
+                    // generate_end_to_end_matches_cpu_on_real_d3d12_after_
+                    // set_matmul_dxil_offloadテストと同じパターン)——
+                    // Attention/LayerNorm/GELU自体はCPUデバイス上で計算する
+                    // ハイブリッド構成のため、呼び出し時の`device`引数は
+                    // 従来通りCPUデバイスを渡す。
+                    let t0 = Instant::now();
+                    let redundancy = model.analyze_layer_redundancy(&cpu_device, &prompts).unwrap();
+                    let t_analyze = t0.elapsed();
+                    let t1 = Instant::now();
+                    let candidate = model.find_best_layer_block_to_remove(&cpu_device, &prompts, 2).unwrap();
+                    let t_block_search = t1.elapsed();
+
+                    let mut adapter_model = GptModel::load(&dir).unwrap();
+                    let dx2 = opencuda_directx::real::DirectXDevice::new(0).unwrap();
+                    let dx2_arc: Arc<dyn GpuDevice> = dx2;
+                    adapter_model.set_matmul_dxil_offload(dx2_arc, MATMUL_DXIL.to_vec()).expect("wire dxil offload (adapter model)");
+                    let t2 = Instant::now();
+                    let _report = adapter_model.fold_block_with_linear_adapter(&cpu_device, &prompts, &candidate, None).unwrap();
+                    let t_linear_adapter = t2.elapsed();
+                    eprintln!(
+                        "[DirectX]  analyze_layer_redundancy={t_analyze:?} (layers={}), find_best_layer_block_to_remove={t_block_search:?} (block_similarity={:.4}), fold_block_with_linear_adapter={t_linear_adapter:?}",
+                        redundancy.len(),
+                        candidate.block_similarity
+                    );
+                }
+                Err(e) => eprintln!("skipping DirectX path: no real D3D12 device available: {e}"),
+            }
+        }
+        #[cfg(not(windows))]
+        eprintln!("skipping DirectX path: not a Windows build");
+    }
 
     /// 手動実行専用(既定のcargo testでは実行しない、`--ignored`指定時のみ)。
     /// 実GPT-2 124M重みでプロンプト長ごとのgenerate()所要時間を計測し、
