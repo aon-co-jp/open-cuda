@@ -276,6 +276,35 @@ impl Linear {
         Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None, dxil_offload: None }
     }
 
+    /// **2026-09-01新設**: 明示的な重み・バイアスから構築する
+    /// (`fit_linear_adapter_output_layer`が最小二乗法で求めた係数を
+    /// 実際の`Linear`として組み立てるために必要)。
+    fn from_weights(weight_t: Vec<f32>, bias: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
+        debug_assert_eq!(weight_t.len(), in_dim * out_dim);
+        debug_assert_eq!(bias.len(), out_dim);
+        Self { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None }
+    }
+
+    /// **2026-09-01新設**: 全出力を常にゼロにする`Linear`(=このLinearの
+    /// 出力は入力に依存せず常にゼロベクトル)。線形アダプタ層で
+    /// Attentionサブ層の寄与を完全に無効化する(残差だけを通す)ために
+    /// 使う。
+    fn zeroed(in_dim: usize, out_dim: usize) -> Self {
+        Self::from_weights(vec![0.0; in_dim * out_dim], vec![0.0; out_dim], in_dim, out_dim)
+    }
+
+    /// **2026-09-01新設**: 恒等写像(`out = in`、`in_dim == out_dim`が
+    /// 前提)を計算する`Linear`。線形アダプタ層の`intermediate`
+    /// サブ層に使い、`ln_2`(アフィン変換なし、標準化のみ)の出力を
+    /// そのままGELUへ渡す(実質的な特徴量抽出はGELU自体が担う)。
+    fn identity(dim: usize) -> Self {
+        let mut weight_t = vec![0.0f32; dim * dim];
+        for i in 0..dim {
+            weight_t[i * dim + i] = 1.0;
+        }
+        Self::from_weights(weight_t, vec![0.0; dim], dim, dim)
+    }
+
     fn forward(&self, device: &dyn GpuDevice, x: &[f32], seq_len: usize) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), seq_len * self.in_dim);
         let mut out = vec![0.0f32; seq_len * self.out_dim];
@@ -373,6 +402,41 @@ impl DecoderLayer {
             ln_2: LayerNorm::identity(hidden, eps),
             intermediate: Linear::random(rng, hidden, intermediate),
             output: Linear::random(rng, intermediate, hidden),
+            mla: None,
+        }
+    }
+
+    /// **2026-09-01新設: 線形アダプタ層**。連続ブロック除去
+    /// (`find_best_layer_block_to_remove`/`remove_layer_block`)後の
+    /// 「除去した分は跡形もなく消える」設計に代わる新しい選択肢——
+    /// 除去したブロックが実際に何を計算していたかを、最小二乗法で
+    /// フィットした1層だけで近似する(SHIFT-LLM/SlimLLM等の closed-form
+    /// 線形置換アプローチに着想を得た独自実装、arXiv:2608.25068/
+    /// arXiv:2505.22689——**正直な開示**: これらはごく最近の論文であり、
+    /// 本実装はその再現実装ではなく着想のみを借りた独自の簡略版)。
+    ///
+    /// 構造:
+    /// - `ln_1`: アフィン変換なしのLayerNorm(既存の`identity`と同じ)
+    /// - `qkv`/`attn_out`: **常にゼロを出力する`Linear`**——Attention
+    ///   サブ層の計算(QKV射影・softmax・重み付き和)自体は実行される
+    ///   (正直な開示: 計算コスト自体はゼロにならない)が、その出力は
+    ///   ゼロに潰されるため、残差(`hidden`)だけがそのまま通過する。
+    /// - `ln_2`: アフィン変換なしのLayerNorm(標準化のみ)
+    /// - `intermediate`: 恒等写像の`Linear`(`intermediate_size ==
+    ///   hidden_size`固定)——実質的な非線形特徴抽出は次のGELU自体が担う
+    /// - `output`: **最小二乗法でフィットした`Linear`**(唯一の学習
+    ///   パラメータ)——`GELU(LayerNorm(hidden_before))`を入力特徴量、
+    ///   `hidden_after_original - hidden_before`(除去ブロックの残差
+    ///   寄与)を目的変数として、勾配降下法を一切使わない閉形式の
+    ///   リッジ回帰で求める。
+    fn linear_adapter(hidden_size: usize, eps: f32, output_weight_t: Vec<f32>, output_bias: Vec<f32>) -> Self {
+        Self {
+            ln_1: LayerNorm::identity(hidden_size, eps),
+            qkv: Linear::zeroed(hidden_size, 3 * hidden_size),
+            attn_out: Linear::zeroed(hidden_size, hidden_size),
+            ln_2: LayerNorm::identity(hidden_size, eps),
+            intermediate: Linear::identity(hidden_size),
+            output: Linear::from_weights(output_weight_t, output_bias, hidden_size, hidden_size),
             mla: None,
         }
     }
@@ -621,6 +685,68 @@ fn pca_top_directions(rows_flat: &[f32], num_rows: usize, dim: usize, d_c: usize
     (down_proj, up_proj)
 }
 
+/// **2026-09-01新設**: [`DecoderLayer::linear_adapter`]の`output`
+/// サブ層を、閉形式のリッジ回帰でフィットする。
+///
+/// `hidden_before_flat`/`hidden_after_flat`は`num_rows x hidden_size`の
+/// 行優先配列(各行=1トークン位置の隠れ状態、除去対象ブロックの直前/
+/// 直後で収集したもの)。まず`DecoderLayer::linear_adapter`が実際の
+/// 推論時に計算するのと**全く同じ手順**(`LayerNorm::identity`で標準化
+/// →`gelu_inplace`)で特徴量を再現し、目的変数は残差
+/// (`hidden_after - hidden_before`、Attentionサブ層がゼロ・FFNサブ層の
+/// 加算前の`hidden2`が`hidden_before`と一致するという設計上の前提に
+/// 基づく)とする。
+///
+/// リッジ正則化(`ridge_lambda`)により、`num_rows < hidden_size`
+/// (較正サンプルが次元数より少ない、劣決定系)の場合でも数値的に安定した
+/// 解が得られる——完全な最小二乗解ではなく、正則化により大きすぎる
+/// 重みへペナルティを課した近似解になる(過学習・数値的不安定性を
+/// 避けるための標準的なテクニック)。
+fn fit_linear_adapter_output_layer(hidden_size: usize, eps: f32, hidden_before_flat: &[f32], hidden_after_flat: &[f32], num_rows: usize, ridge_lambda: f32) -> Result<(Vec<f32>, Vec<f32>)> {
+    debug_assert_eq!(hidden_before_flat.len(), num_rows * hidden_size);
+    debug_assert_eq!(hidden_after_flat.len(), num_rows * hidden_size);
+    anyhow::ensure!(num_rows > 0, "open-cuda-llm: fit_linear_adapter_output_layer: num_rows must be > 0");
+
+    let ln = LayerNorm::identity(hidden_size, eps);
+    let mut features = hidden_before_flat.to_vec();
+    ln.forward(&mut features, num_rows, hidden_size);
+    gelu_inplace(&mut features);
+
+    let mut targets = vec![0.0f32; num_rows * hidden_size];
+    for i in 0..targets.len() {
+        targets[i] = hidden_after_flat[i] - hidden_before_flat[i];
+    }
+
+    // X = [features | 1] (num_rows x (hidden_size+1)), Y = targets (num_rows x hidden_size)。
+    // (X^T X + λI) W = X^T Y を解く(閉形式リッジ回帰、勾配降下法は使わない)。
+    let d = hidden_size;
+    let mut x_aug = nalgebra::DMatrix::<f32>::zeros(num_rows, d + 1);
+    for r in 0..num_rows {
+        for c in 0..d {
+            x_aug[(r, c)] = features[r * d + c];
+        }
+        x_aug[(r, d)] = 1.0;
+    }
+    let y = nalgebra::DMatrix::from_row_slice(num_rows, d, &targets);
+    let xt = x_aug.transpose();
+    let mut xtx = &xt * &x_aug; // (d+1) x (d+1)
+    for i in 0..=d {
+        xtx[(i, i)] += ridge_lambda;
+    }
+    let xty = &xt * &y; // (d+1) x d
+
+    let w_aug = xtx.lu().solve(&xty).ok_or_else(|| anyhow::anyhow!("open-cuda-llm: fit_linear_adapter_output_layer: ridge regression normal equations are singular even after regularization (try a larger ridge_lambda)"))?;
+
+    let mut output_weight_t = vec![0f32; d * d];
+    for r in 0..d {
+        for c in 0..d {
+            output_weight_t[r * d + c] = w_aug[(r, c)];
+        }
+    }
+    let output_bias: Vec<f32> = (0..d).map(|c| w_aug[(d, c)]).collect();
+    Ok((output_weight_t, output_bias))
+}
+
 struct MlaHeadProjection {
     /// `head_dim x d_c`。
     down_proj: Vec<f32>,
@@ -750,6 +876,20 @@ pub struct BlockRemovalCandidate {
     /// 「除去してもほぼ変わらない」)。
     pub block_similarity: f32,
     pub sample_count: usize,
+}
+
+/// **2026-09-01新設**: [`GptModel::fold_block_with_linear_adapter`]の結果。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdapterFoldReport {
+    pub original_layer_count: usize,
+    pub layer_count_after: usize,
+    pub block_start: usize,
+    pub block_len: usize,
+    /// 線形アダプタのフィットに使った実際のサンプル行数(トークン位置数)。
+    /// `hidden_size`より大幅に少ない場合、フィット結果の信頼性は低い
+    /// (呼び出し側が判断できるよう常に開示する)。
+    pub fit_sample_rows: usize,
+    pub disclosure: &'static str,
 }
 
 /// **2026-09-01新設**: [`GptModel::prune_redundant_layers`]の結果。
@@ -1462,6 +1602,97 @@ impl GptModel {
                 independently thresholding scattered layers when removing more than one layer). No fine-tuning \
                 (healing) is applied — this is data-free removal, so post-removal generation quality is not \
                 guaranteed.",
+        })
+    }
+
+    /// **2026-09-01新設: 線形アダプタによる折りたたみ**。
+    ///
+    /// ユーザーからの追加指示「極端な予算(例: 6層中5層除去)での明確な
+    /// 品質劣化を、open-directx/open-cuda/aruaru-llm/open-cpuを駆使して
+    /// もう一度改善してほしい」への対応。[`remove_layer_block`]
+    /// (ブロックを跡形もなく削除)とは異なり、こちらは除去した
+    /// ブロックの代わりに**最小二乗法でフィットした1つの軽量な
+    /// 線形アダプタ層**([`DecoderLayer::linear_adapter`]参照)を
+    /// 挿入する——SHIFT-LLM/SlimLLM等の closed-form 線形置換手法
+    /// (arXiv:2608.25068/arXiv:2505.22689)に着想を得た独自実装。
+    ///
+    /// `candidate`は`find_best_layer_block_to_remove`が選んだブロックを
+    /// そのまま渡すこと(除去そのものではなく置換対象の指定として使う)。
+    /// 層数は`candidate.len`本ぶん減るのではなく、`candidate.len - 1`本
+    /// 減る(N層→1層のアダプタへ置換されるため)。
+    ///
+    /// # 正直な開示
+    /// - Attentionサブ層の計算コスト自体はアダプタ層でも発生する(出力を
+    ///   ゼロに潰しているだけで、QKV射影・softmax計算は実行される)——
+    ///   「除去した分の計算コストが完全にゼロになる」わけではない。
+    ///   ただし1ブロックにつき1層分の計算で済むため、複数層を
+    ///   まとめて置き換える場合は正味の計算量削減にはなる。
+    /// - 較正データ(`sample_prompts`)への最小二乗フィットであり、
+    ///   較正データと分布が大きく異なる入力では近似精度が下がりうる。
+    /// - 勾配降下法によるfine-tuning(healing)は一切行っていない
+    ///   ——閉形式のリッジ回帰のみ。
+    pub fn fold_block_with_linear_adapter(&mut self, device: &std::sync::Arc<dyn GpuDevice>, sample_prompts: &[Vec<u32>], candidate: &BlockRemovalCandidate) -> Result<AdapterFoldReport> {
+        anyhow::ensure!(!sample_prompts.is_empty(), "open-cuda-llm: fold_block_with_linear_adapter: sample_prompts must not be empty");
+        anyhow::ensure!(candidate.start + candidate.len <= self.layers.len(), "open-cuda-llm: fold_block_with_linear_adapter: candidate range [{}, {}) exceeds current layer_count()={}", candidate.start, candidate.start + candidate.len, self.layers.len());
+        anyhow::ensure!(self.layers.iter().all(|l| l.mla.is_none()), "open-cuda-llm: fold_block_with_linear_adapter: MLA-compressed layers are not supported");
+
+        let hidden_size = self.config.hidden_size;
+        let eps = self.config.layer_norm_eps;
+        let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
+        let flash_spirv = self.flash_attn_spirv.as_ref().map(|(bytes, bs)| (bytes.as_slice(), *bs));
+
+        let mut before_rows: Vec<f32> = Vec::new();
+        let mut after_rows: Vec<f32> = Vec::new();
+        let mut num_rows = 0usize;
+
+        for prompt in sample_prompts {
+            anyhow::ensure!(!prompt.is_empty(), "open-cuda-llm: fold_block_with_linear_adapter: sample prompt must not be empty");
+            let seq_len = prompt.len();
+            let mut caches = self.new_caches();
+            let mut hidden = self.embed_tokens(prompt, 0)?;
+            let mut block_input: Option<Vec<f32>> = None;
+            for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
+                if layer_idx == candidate.start {
+                    block_input = Some(hidden.clone());
+                }
+                hidden = layer.forward_prefill(device.as_ref(), &hidden, seq_len, cache, hidden_size, self.config.num_heads, softmax_spirv, flash_spirv)?;
+                if layer_idx == candidate.start + candidate.len - 1 {
+                    let before = block_input.take().expect("block_input must have been set at layer_idx == candidate.start");
+                    before_rows.extend_from_slice(&before);
+                    after_rows.extend_from_slice(&hidden);
+                    num_rows += seq_len;
+                }
+            }
+        }
+        anyhow::ensure!(num_rows > 0, "open-cuda-llm: fold_block_with_linear_adapter: no calibration rows were collected");
+
+        // リッジ係数は経験的な既定値(較正サンプルが少ない=劣決定系に
+        // なりやすいこの用途では、ある程度強めの正則化が数値的に安定)。
+        const RIDGE_LAMBDA: f32 = 1e-2;
+        let (output_weight_t, output_bias) = fit_linear_adapter_output_layer(hidden_size, eps, &before_rows, &after_rows, num_rows, RIDGE_LAMBDA)?;
+        let adapter = DecoderLayer::linear_adapter(hidden_size, eps, output_weight_t, output_bias);
+
+        let original_layer_count = self.layers.len();
+        self.layers.splice(candidate.start..candidate.start + candidate.len, std::iter::once(adapter));
+        self.config.num_layers = self.layers.len();
+
+        Ok(AdapterFoldReport {
+            original_layer_count,
+            layer_count_after: self.layers.len(),
+            block_start: candidate.start,
+            block_len: candidate.len,
+            fit_sample_rows: num_rows,
+            disclosure: "除去したブロックの代わりに、最小二乗法(閉形式のリッジ回帰、勾配降下法は使わない)でフィットした\
+                1つの軽量な線形アダプタ層を挿入しました(SHIFT-LLM/SlimLLM等のclosed-form線形置換手法に着想、\
+                arXiv:2608.25068/arXiv:2505.22689——これらは非常に新しい論文であり、本実装は再現実装ではなく着想の\
+                みを借りた独自の簡略版です)。何もしない単純な層除去より品質を保ちやすいことを期待した設計ですが、\
+                較正データへのフィットに過ぎず、除去後の生成品質を保証するものではありません。 / \
+                Instead of deleting the removed block outright, we inserted a single lightweight linear adapter \
+                layer fit via closed-form ridge regression (no gradient descent) — inspired by SHIFT-LLM/SlimLLM-style \
+                closed-form linear replacement techniques (arXiv:2608.25068 / arXiv:2505.22689; these are very \
+                recent papers and this is our own simplified implementation inspired by the idea, not a faithful \
+                reproduction). Designed to preserve quality better than plain deletion, but it is only a fit to the \
+                calibration data and does not guarantee post-fold generation quality.",
         })
     }
 
@@ -2972,6 +3203,47 @@ mod tests {
         assert!(model.find_best_layer_block_to_remove(&device, &prompts, 5).is_err()); // > layer_count()
     }
 
+    /// **2026-09-01新設**: `fold_block_with_linear_adapter`の基本動作
+    /// (ランダム初期化の小型モデルで、実重み不要のまま検証)。
+    /// N層のブロックが**1層のアダプタへ置換**されること(=層数は
+    /// `N-1`だけ減る、`remove_layer_block`の「N層丸ごと削除」とは
+    /// 減り方が異なる)、折りたたみ後もgenerate()が動作することを確認。
+    #[test]
+    fn fold_block_with_linear_adapter_replaces_a_block_with_a_single_layer() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE); // hidden_size=32
+        config.num_layers = 8;
+        let mut model = GptModel::load_random(config, 33);
+        let device = device();
+        let prompts: Vec<Vec<u32>> = ["the weather today is sunny and warm outside", "stock markets rose sharply again this quarter", "she walked slowly through the old quiet library", "computers process information using binary logic"].iter().map(|s| ByteTokenizer::encode(s)).collect();
+
+        let candidate = model.find_best_layer_block_to_remove(&device, &prompts, 3).unwrap();
+        let report = model.fold_block_with_linear_adapter(&device, &prompts, &candidate).unwrap();
+
+        assert_eq!(report.original_layer_count, 8);
+        assert_eq!(report.layer_count_after, 6, "an N=3 block should become 1 adapter layer, so layer count drops by N-1=2, not by N=3");
+        assert_eq!(model.layer_count(), 6);
+        assert_eq!(model.config().num_layers, 6, "config.num_layers must stay in sync with the actual layer count");
+        assert!(report.fit_sample_rows > 0);
+
+        let prompt = ByteTokenizer::encode("after linear adapter folding");
+        let generated = model.generate(&device, &prompt, 4).unwrap();
+        assert_eq!(generated.len(), 4);
+    }
+
+    /// `candidate`が現在の層数を超える範囲を指す場合は、黙って壊れた
+    /// スプライスを行わず正直にエラーを返すこと。
+    #[test]
+    fn fold_block_with_linear_adapter_rejects_out_of_range_candidate() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 2;
+        let mut model = GptModel::load_random(config, 44);
+        let device = device();
+        let prompts = vec![ByteTokenizer::encode("a short sample sentence")];
+        let bogus = BlockRemovalCandidate { start: 1, len: 5, block_similarity: 0.9, sample_count: 1 };
+        let err = model.fold_block_with_linear_adapter(&device, &prompts, &bogus).unwrap_err();
+        assert!(err.to_string().contains("exceeds current layer_count"));
+    }
+
     /// **本命の実測検証**: 実GPT-2 124M重みで、旧方式(独立閾値で6層中5層を
     /// 一度に削除、CLAUDE.mdに記録した実測では明確な破綻を招いた)と
     /// 新方式(連続ブロック探索で同じ5層削除を行うが、最良のブロックを
@@ -2995,8 +3267,15 @@ mod tests {
             .collect();
         let sample_prompt = tokenizer.encode("The weather today is quite pleasant and sunny.").unwrap();
 
+        // 繰り返しペナルティ無しの素の貪欲デコードは、distilgpt2では
+        // 折りたたみ無しでも新行の反復のような劣化に陥りやすい
+        // (aruaru-llm側`default_repetition_penalty()`が既定`1.3`を
+        // 使っているのと同じ理由)。素の`generate()`ではなく
+        // `generate_with_repetition_penalty(..., 1.3)`を使い、
+        // 実運用に近い条件で比較する。
+        const REPETITION_PENALTY: f32 = 1.3;
         let uncompressed = GptModel::load(&dir).unwrap();
-        let baseline_output = uncompressed.generate(&device, &sample_prompt, 20).unwrap();
+        let baseline_output = uncompressed.generate_with_repetition_penalty(&device, &sample_prompt, 20, REPETITION_PENALTY).unwrap();
         eprintln!("baseline (6 layers, no removal): {:?}", tokenizer.decode(&baseline_output).unwrap());
 
         // 予算(削除する層数)を1・2・5と変えて、それぞれブロック探索の
@@ -3012,6 +3291,66 @@ mod tests {
                 "remove {n_remove} layer(s): candidate=(start={}, len={}, block_similarity={:.4}) -> output={text:?}",
                 candidate.start, candidate.len, candidate.block_similarity
             );
+        }
+    }
+
+    /// **本命の実測検証(2026-09-01追加)**: 極端な予算(6層中5層除去)で、
+    /// 「跡形もなく削除」(`remove_layer_block`)と「線形アダプタで置換」
+    /// (`fold_block_with_linear_adapter`)を実GPT-2重みで直接比較する。
+    /// `--ignored`指定時のみ実行(実重みが必要なため)。
+    #[test]
+    #[ignore]
+    fn manual_compare_plain_removal_vs_linear_adapter_at_extreme_budget_on_real_gpt2_weights() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/distilgpt2");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: no real GPT-2 weights");
+            return;
+        }
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let device: std::sync::Arc<dyn GpuDevice> = opencuda_cpu::CpuDevice::new(0);
+        // 較正データを前回(3文)より増やす——線形アダプタのフィットは
+        // hidden_size(distilgpt2で768)本の未知数を持つため、サンプル行数
+        // (文数×トークン長)が多いほどリッジ回帰の推定が安定する。
+        let calibration_texts = [
+            "The weather today is quite pleasant and sunny.",
+            "In economics, supply and demand determine prices in a market.",
+            "She walked into the kitchen and started making breakfast.",
+            "The history of ancient Rome spans over a thousand years.",
+            "Computers process information using binary logic circuits.",
+            "The mountain trail was steep but offered a beautiful view.",
+            "Scientists discovered a new species of frog in the rainforest.",
+            "He picked up his guitar and began to play a soft melody.",
+        ];
+        let prompts: Vec<Vec<u32>> = calibration_texts.iter().map(|s| tokenizer.encode(s).unwrap()).collect();
+        let sample_prompt = tokenizer.encode("The weather today is quite pleasant and sunny.").unwrap();
+
+        // 繰り返しペナルティ無しの素の貪欲デコードは、distilgpt2では
+        // 折りたたみ無しでも新行の反復のような劣化に陥りやすい
+        // (aruaru-llm側`default_repetition_penalty()`が既定`1.3`を
+        // 使っているのと同じ理由)。素の`generate()`ではなく
+        // `generate_with_repetition_penalty(..., 1.3)`を使い、
+        // 実運用に近い条件で比較する。
+        const REPETITION_PENALTY: f32 = 1.3;
+        let uncompressed = GptModel::load(&dir).unwrap();
+        let baseline_output = uncompressed.generate_with_repetition_penalty(&device, &sample_prompt, 20, REPETITION_PENALTY).unwrap();
+        eprintln!("baseline (6 layers, no removal): {:?}", tokenizer.decode(&baseline_output).unwrap());
+
+        for &n_remove in &[2usize, 5] {
+            let candidate = {
+                let m = GptModel::load(&dir).unwrap();
+                m.find_best_layer_block_to_remove(&device, &prompts, n_remove).unwrap()
+            };
+            eprintln!("--- n_remove={n_remove}: candidate=(start={}, len={}, block_similarity={:.4}) ---", candidate.start, candidate.len, candidate.block_similarity);
+
+            let mut removed_model = GptModel::load(&dir).unwrap();
+            removed_model.remove_layer_block(&candidate).unwrap();
+            let removed_output = removed_model.generate_with_repetition_penalty(&device, &sample_prompt, 20, REPETITION_PENALTY).unwrap();
+            eprintln!("  plain removal ({} layers left): {:?}", removed_model.layer_count(), tokenizer.decode(&removed_output).unwrap());
+
+            let mut adapter_model = GptModel::load(&dir).unwrap();
+            let report = adapter_model.fold_block_with_linear_adapter(&device, &prompts, &candidate).unwrap();
+            let adapter_output = adapter_model.generate_with_repetition_penalty(&device, &sample_prompt, 20, REPETITION_PENALTY).unwrap();
+            eprintln!("  linear adapter ({} layers left, fit_sample_rows={}): {:?}", report.layer_count_after, report.fit_sample_rows, tokenizer.decode(&adapter_output).unwrap());
         }
     }
 }
