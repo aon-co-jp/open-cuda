@@ -262,13 +262,25 @@ QKV射影・softmax・P·V・KVキャッシュpushの演算自体は毎回実行
 ——同一乱数モデルを折りたたみ、片方は`skip_attention=true`〈既定〉、
 もう片方は折りたたみ後にアダプタ層の`skip_attention`を明示的に`false`へ
 戻し、`generate()`の出力が**バイト単位で完全一致**することを確認)。
-`--ignored`ベンチ`manual_bench_attention_skip_vs_computed_zeroed_attention`
-(合成乱数重み、12層中8層を1アダプタへ折りたたみ、CPU実行の`generate()`
-所要時間をskip有無で比較)も追加(実測は次回、開発機で`--ignored`実行)。
+`cargo clippy -p open-cuda-llm --release --all-targets -- -D warnings`
+**警告0件**(この過程で判明した既存の`explicit_counter_loop`
+〈`generate_speculative`内、2026-08-17のコミット由来、今回の変更とは無関係〉
+1件も併せて修正、speculative系5テストの非回帰を確認)。
+
+**CPU実測(NVIDIA GT 730の開発機、`--ignored`ベンチ2件を実行)**:
+- `manual_bench_attention_skip_vs_computed_zeroed_attention`(合成乱数重み、
+  hidden=256・12層中8層を1アダプタへ折りたたみ、24トークン生成):
+  **skip 731ms/gen vs no-skip 899ms/gen(約19%高速化)**。
+- `manual_bench_attention_skip_on_real_gpt2_weights`(実GPT-2 124M、
+  12層中6層を1アダプタへ折りたたみ、20トークン生成):
+  生成トークン列が**skip有無でバイト単位完全一致**することを実重みで
+  確認した上で、**skip 1.175s/gen vs no-skip 1.289s/gen(約9%高速化)**。
+  実GPT-2ではFFN・lm_headの比重が大きいためAttention削減の効果は
+  相対的に小さいが、折りたたむ層数に比例して効く。
 
 **残課題**: (1) より高性能な統合GPU(Adreno等)でのDirectX/Vulkan経路
-再実測は引き続き未検証(直前エントリから変更なし)。(2) skip版の
-実速度向上幅(合成モデルでのCPU実測、`--ignored`ベンチ)は次回取得。
+再実測は引き続き未検証(直前エントリから変更なし)。(2) 実GPU経路
+(Vulkan/DirectX)でのskip有無の速度比較は未実施(上記はCPU実測のみ)。
 
 ## HANDOFF追記(2026-08-23、階層的アクセラレーション: D3D12 Compute経由のGEMMオフロードを実装 / Hierarchical acceleration: DXIL GEMM offload)
 

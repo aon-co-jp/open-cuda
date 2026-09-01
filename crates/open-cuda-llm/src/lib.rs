@@ -2125,11 +2125,9 @@ impl GptModel {
             pending_target_pick = argmax(&next_target_logits);
 
             draft.truncate_caches(&mut draft_caches, pos);
-            let mut dpos = pos;
             let mut last_draft_logits = None;
-            for &tok in draft_tokens[0..m].iter().chain(std::iter::once(&correction)) {
+            for (dpos, &tok) in (pos..).zip(draft_tokens[0..m].iter().chain(std::iter::once(&correction))) {
                 last_draft_logits = Some(draft.forward_step(device_ref, tok, dpos, &mut draft_caches)?);
-                dpos += 1;
             }
             pending_draft_pick = argmax(&last_draft_logits.expect("committed list always has at least the correction token"));
 
@@ -3728,6 +3726,72 @@ mod bench_manual {
         let compute_elapsed = t1.elapsed() / ITERS;
         eprintln!(
             "attention-skip fast path: {skip_elapsed:?}/gen  vs  computed-zeroed-attention: {compute_elapsed:?}/gen  (folded 8-of-12 layers into 1 adapter)"
+        );
+    }
+
+    /// **2026-09-01新設**: 実GPT-2 124M重みでの、Attentionスキップ軽量パス
+    /// のCPU実測。gpt2(12層)の連続6層を1つの線形アダプタへ折りたたみ、
+    /// `generate()`の所要時間を`skip_attention=true`(既定)と`false`
+    /// (Attentionを実際に計算しゼロ出力を捨てる旧経路相当)で比較する。
+    /// あわせて両者の生成トークン列が**バイト単位で完全一致**すること
+    /// (=挙動を変えない最適化であること)も実重みで確認する。
+    /// `--ignored`時のみ実行(実重みが必要なため)。
+    #[test]
+    #[ignore]
+    fn manual_bench_attention_skip_on_real_gpt2_weights() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/gpt2");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: no real GPT-2 weights");
+            return;
+        }
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let device: Arc<dyn GpuDevice> = CpuDevice::new(0);
+        let prompts: Vec<Vec<u32>> = [
+            "The weather today is quite pleasant and sunny.",
+            "In economics, supply and demand determine prices in a market.",
+            "She walked into the kitchen and started making breakfast.",
+        ]
+        .iter()
+        .map(|s| tokenizer.encode(s).unwrap())
+        .collect();
+        let prompt = tokenizer.encode("The quick brown fox jumps over the lazy dog and keeps going").unwrap();
+
+        let candidate = {
+            let m = GptModel::load(&dir).unwrap();
+            m.find_best_layer_block_to_remove(&device, &prompts, 6).unwrap()
+        };
+        eprintln!("candidate: start={}, len={}, block_similarity={:.4}", candidate.start, candidate.len, candidate.block_similarity);
+
+        let mut model_skip = GptModel::load(&dir).unwrap();
+        model_skip.fold_block_with_linear_adapter(&device, &prompts, &candidate, None).unwrap();
+
+        let mut model_compute = GptModel::load(&dir).unwrap();
+        model_compute.fold_block_with_linear_adapter(&device, &prompts, &candidate, None).unwrap();
+        model_compute.layers[candidate.start].skip_attention = false;
+
+        // 挙動を変えない最適化であることを実重みで確認
+        let out_skip_check = model_skip.generate(&device, &prompt, 16).unwrap();
+        let out_compute_check = model_compute.generate(&device, &prompt, 16).unwrap();
+        assert_eq!(out_skip_check, out_compute_check, "attention-skip must be byte-identical to computed-zeroed-attention on real GPT-2 weights");
+        eprintln!("byte-identical output confirmed: {:?}", tokenizer.decode(&out_skip_check).unwrap());
+
+        let _ = model_skip.generate(&device, &prompt, 4).unwrap();
+        let _ = model_compute.generate(&device, &prompt, 4).unwrap();
+
+        const ITERS: u32 = 3;
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let _ = model_skip.generate(&device, &prompt, 20).unwrap();
+        }
+        let skip_elapsed = t0.elapsed() / ITERS;
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            let _ = model_compute.generate(&device, &prompt, 20).unwrap();
+        }
+        let compute_elapsed = t1.elapsed() / ITERS;
+        eprintln!(
+            "[real GPT-2 124M, folded {}-of-12 layers] attention-skip: {skip_elapsed:?}/gen  vs  computed-zeroed-attention: {compute_elapsed:?}/gen",
+            candidate.len
         );
     }
 }
