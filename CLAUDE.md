@@ -2477,3 +2477,73 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
   次にすべきこと: 「両者間の直接連携」という表現は今後使わず、
   必要なら「(1)内蔵opencuda-directxクレート」「(2)独立リポジトリ
   open-directx」と明示的に区別して記述すること。
+
+- **2026-09-01 Model Folding残タスク: `ridge_lambda`外部化(完了)/
+  GPU実測(未着手・環境制約)(他アカウントでの再開用メモ)**:
+
+  前回セッションで実装した3手法(独立閾値/連続ブロック探索/線形
+  アダプタ、`open-cuda-llm`クレート)について、ユーザーから明示された
+  残タスクのうち2件に対応した。
+
+  1. **`ridge_lambda`の外部調整可能化(完了)**: `fold_block_with_
+     linear_adapter`のシグネチャに`ridge_lambda: Option<f32>`引数を
+     追加(既存呼び出し元は全て`None`=既定値`1e-2`に更新済み)。値を
+     `AdapterFoldReport::ridge_lambda_used`として結果に含め、呼び出し
+     側が実際に使われた値を確認できるようにした。非有限・非正の値は
+     `ensure!`で正直に拒否(数値的に不安定な解や特異行列エラーを未然
+     に防ぐ)。テスト2件追加(既定値フォールバック/明示指定の反映、
+     不正値5種の拒否)、`cargo test -p open-cuda-llm --lib
+     fold_block_with_linear_adapter`で4件ともpass確認済み。HTTP側の
+     配線(`POST /v1/models/fold-layers`)は`aruaru-llm`側で対応済み
+     (`aruaru-llm/CLAUDE.md`参照)。
+  2. **GPU実測(Vulkan/DirectX経由、未着手・環境制約)**: このクレートの
+     Attention計算(QKᵀ・softmax・P·V)は既に`--features real-vulkan`
+     経由で実Vulkanデバイス上にディスパッチ可能(2026-08-05以降に配線
+     済み、上記の別エントリ参照)。したがって層折りたたみ3手法の
+     GEMM/Attention部分をVulkan経路に乗せること自体は技術的には可能
+     なはずだが、**このセッションの作業環境にGPU・GPUドライバが存在
+     しないため、実際にビルド・実行してベンチマークを取ることが物理的
+     にできなかった**(試さずに「無理そう」と判断したのではなく、GPU
+     検出コマンド自体が失敗することを確認した上での結論)。開発機
+     (NVIDIA GT 730搭載、`--features real-vulkan`のビルド実績あり)
+     でこの計測を行うことが次回の課題。
+
+  次回再開する場合: GPUが使える環境で`cargo test -p open-cuda-llm
+  --features real-vulkan`を通した上で、層折りたたみ3手法それぞれの
+  `find_best_layer_block_to_remove`/`fold_block_with_linear_adapter`
+  呼び出し前後の実行時間をCPU経路と比較計測するところから始める。
+
+- **2026-09-01 Model Folding follow-up: `ridge_lambda` externalized
+  (done) / real GPU measurement (not started, environment constraint)
+  — English handoff summary**:
+
+  Of the remaining tasks the user explicitly requested as follow-ups to
+  the previous Model Folding session (3 techniques already implemented
+  in the `open-cuda-llm` crate: independent threshold / contiguous
+  block search / linear adapter), 2 were addressed this round:
+
+  1. **`ridge_lambda` made externally configurable (done)**:
+     `fold_block_with_linear_adapter` now takes a `ridge_lambda:
+     Option<f32>` argument (existing call sites updated to pass `None`,
+     preserving the default `1e-2`). The value actually used is now
+     reported back via `AdapterFoldReport::ridge_lambda_used`.
+     Non-finite or non-positive values are honestly rejected via
+     `ensure!` rather than silently producing a degenerate solution.
+     Two tests were added and all 4 in that test group pass
+     (`cargo test -p open-cuda-llm --lib
+     fold_block_with_linear_adapter`). HTTP wiring for `POST
+     /v1/models/fold-layers` was done on the `aruaru-llm` side (see
+     `aruaru-llm/CLAUDE.md`).
+  2. **Real GPU measurement via Vulkan/DirectX (not started, environment
+     constraint)**: this crate's attention computation (QKᵀ, softmax,
+     P·V) can already dispatch to a real Vulkan device via
+     `--features real-vulkan` (wired since 2026-08-05, see the earlier
+     entry above), so routing the 3 layer-folding techniques' GEMM/
+     attention work through Vulkan should be technically feasible.
+     However, **the sandbox this session ran in has no GPU or GPU
+     driver, so it was physically impossible to build and actually
+     benchmark this** — this is a conclusion reached after confirming
+     GPU-detection commands themselves fail, not a guess made without
+     trying. Doing this measurement on the dev machine (NVIDIA GT 730,
+     which has a working `--features real-vulkan` build history) is
+     the next task.
