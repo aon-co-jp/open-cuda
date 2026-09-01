@@ -705,6 +705,50 @@ impl KvCacheHead {
     }
 }
 
+/// 2つの等長ベクトルのコサイン類似度。いずれかのノルムが0(全ゼロ
+/// ベクトル)の場合は比較不能なので`None`を返す(0除算を避ける、
+/// 呼び出し側〈`analyze_layer_redundancy`〉はその位置をサンプルとして
+/// 数えないだけで、処理全体は継続する)。
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += (x as f64) * (y as f64);
+        norm_a += (x as f64) * (x as f64);
+        norm_b += (y as f64) * (y as f64);
+    }
+    if norm_a <= 0.0 || norm_b <= 0.0 {
+        return None;
+    }
+    Some((dot / (norm_a.sqrt() * norm_b.sqrt())) as f32)
+}
+
+/// **2026-09-01新設**: [`GptModel::analyze_layer_redundancy`]が1層ぶん
+/// 返すレポート。`block_influence`はShortGPT論文
+/// ([arXiv:2403.03853](https://arxiv.org/abs/2403.03853))のBlock
+/// Influence指標(`1 - 入力/出力のコサイン類似度`の平均)——低いほど
+/// その層は恒等写像に近く冗長。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LayerRedundancyReport {
+    pub layer_index: usize,
+    pub block_influence: f32,
+    /// この平均の元になった実際のサンプル数(トークン位置×サンプル文数)。
+    /// 極端に小さい場合、この推定は信頼性が低い(呼び出し側が判断できる
+    /// よう常に開示する)。
+    pub sample_count: usize,
+}
+
+/// **2026-09-01新設**: [`GptModel::prune_redundant_layers`]の結果。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LayerPruneReport {
+    pub original_layer_count: usize,
+    pub pruned_layer_count: usize,
+    pub removed_layer_indices: Vec<usize>,
+    pub disclosure: &'static str,
+}
+
 /// GPT系デコーダ本体。`load_random`(現状唯一のコンストラクタ、学習済み
 /// 重みローダーは未実装)で生成し、`generate`で貪欲デコードする。
 pub struct GptModel {
@@ -1139,6 +1183,141 @@ impl GptModel {
         Ok(())
     }
 
+    /// 現在のレイヤー数。折りたたみ(`prune_redundant_layers`)後は
+    /// 実際に減った値を返す。
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// **2026-09-01新設: レイヤー冗長性分析**(ShortGPT論文、
+    /// [arXiv:2403.03853](https://arxiv.org/abs/2403.03853)の
+    /// Block Influence指標、および同じ考え方のGromov et al.
+    /// [arXiv:2403.17887](https://arxiv.org/abs/2403.17887))。
+    ///
+    /// # これは何か(正直な経緯)
+    /// ユーザーから「DeepSeekの折りたたみ理論(Model Folding)を実装
+    /// してほしい」との依頼を受け、日英2言語でGoogle/GitHub調査を
+    /// 行った結果、**「DeepSeekのfolding理論」という技術は実在しない**
+    /// ことが判明した(DeepSeekの実際の効率化技術はMLA・FP8混合精度・
+    /// DeepSeekMoE等であり、いずれも「折りたたみ」ではない)。混同の
+    /// 元と考えられるのは、無関係の**ICLR 2025論文「Model Folding」**
+    /// (Wang, Šikić, Thiele, Saukh、
+    /// [arXiv:2502.10216](https://arxiv.org/abs/2502.10216))——こちらは
+    /// レイヤーをまたいだニューロン単位のk-meansクラスタリング+
+    /// データフリーな分散補正という、本来ならず活性化統計プロファイリング
+    /// (calibrationデータでの推論実行)を要する高度な手法。この
+    /// クレートの`Linear`重みは公開アクセサを持たず(意図的な
+    /// カプセル化)、ニューロン単位のクラスタリングを外部から実装
+    /// するには大規模なAPI拡張が必要だったため、**論文のアルゴリズムを
+    /// 忠実に再現するのではなく**、より単純で実装・検証が現実的な
+    /// **層単位の冗長性検出+実際の層除去**(ShortGPT/Gromov et al.方式)
+    /// を実装した——こちらも査読済み論文に基づく実在の圧縮手法であり、
+    /// 「本物のModel Folding論文の簡易的代替」として位置づけている。
+    ///
+    /// # アルゴリズム
+    /// 各デコーダ層について、その層への入力隠れ状態と出力隠れ状態の
+    /// コサイン類似度を`sample_prompts`全体・全トークン位置で平均し、
+    /// `Block Influence = 1 - 平均コサイン類似度`を計算する。BIが低い
+    /// (入力≈出力)ほど、その層はほぼ恒等写像に近く**冗長**——除去しても
+    /// モデル全体の出力への影響が小さいと推定できる。この読み取り専用の
+    /// 分析だけでは、モデルの重みは一切変更しない。
+    ///
+    /// `sample_prompts`にはトピックを分散させた複数の文を渡すことを
+    /// 推奨する(1文だけでは冗長性の推定が偏る)。
+    pub fn analyze_layer_redundancy(&self, device: &std::sync::Arc<dyn GpuDevice>, sample_prompts: &[Vec<u32>]) -> Result<Vec<LayerRedundancyReport>> {
+        anyhow::ensure!(!sample_prompts.is_empty(), "open-cuda-llm: analyze_layer_redundancy: sample_prompts must not be empty");
+        let hidden_size = self.config.hidden_size;
+        let n = self.layers.len();
+        let mut sim_sums = vec![0.0f64; n];
+        let mut sim_counts = vec![0usize; n];
+        let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
+        let flash_spirv = self.flash_attn_spirv.as_ref().map(|(bytes, bs)| (bytes.as_slice(), *bs));
+
+        for prompt in sample_prompts {
+            anyhow::ensure!(!prompt.is_empty(), "open-cuda-llm: analyze_layer_redundancy: sample prompt must not be empty");
+            let seq_len = prompt.len();
+            let mut caches = self.new_caches();
+            let mut hidden_batch = self.embed_tokens(prompt, 0)?;
+            for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
+                let input_snapshot = hidden_batch.clone();
+                hidden_batch = layer.forward_prefill(device.as_ref(), &hidden_batch, seq_len, cache, hidden_size, self.config.num_heads, softmax_spirv, flash_spirv)?;
+                for row in 0..seq_len {
+                    let a = &input_snapshot[row * hidden_size..(row + 1) * hidden_size];
+                    let b = &hidden_batch[row * hidden_size..(row + 1) * hidden_size];
+                    if let Some(sim) = cosine_similarity(a, b) {
+                        sim_sums[layer_idx] += sim as f64;
+                        sim_counts[layer_idx] += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((0..n)
+            .map(|i| {
+                let avg_sim = if sim_counts[i] > 0 { sim_sums[i] / sim_counts[i] as f64 } else { 0.0 };
+                LayerRedundancyReport { layer_index: i, block_influence: (1.0 - avg_sim) as f32, sample_count: sim_counts[i] }
+            })
+            .collect())
+    }
+
+    /// **2026-09-01新設**: [`analyze_layer_redundancy`](Self::analyze_layer_redundancy)
+    /// が返した`redundancy`をもとに、`block_influence`が
+    /// `block_influence_threshold`未満(=ほぼ恒等写像=冗長)の層を
+    /// **実際に`self.layers`から取り除く**——これは読み取り専用の分析
+    /// ではなく、モデルの構造そのものを不可逆に変更する破壊的操作。
+    /// 除去した分だけ`config.num_layers`も同期して減らす(KVキャッシュの
+    /// 割り当て数〈`new_caches`〉と層数を必ず一致させるため、ここを
+    /// 怠ると`forward_prefill_hidden`の`zip`が黙って後方の層を無視する
+    /// 深刻なバグになる)。
+    ///
+    /// 安全策として、`redundancy`が全層を冗長と判定した場合でも
+    /// **最低1層は必ず残す**(BIが最も低い順に間引き、上限で打ち切る)。
+    ///
+    /// # 正直な制約
+    /// - MLA圧縮(`enable_mla_kv_compression*`)が有効な層は今回のスコープ
+    ///   外——安全のため、いずれかの層に`mla.is_some()`があれば
+    ///   エラーで拒否する(圧縮済みの潜在表現から層除去の妥当性を
+    ///   検証する手段が無いため)。
+    /// - `redundancy`は必ず直前に`analyze_layer_redundancy`で計算した
+    ///   ものを渡すこと(`layer_index`が現在の`self.layers`と1対1で
+    ///   対応している前提)——長さが一致しない場合はエラーで拒否する。
+    /// - 少数のサンプル文から推定したBIはあくまでヒューリスティックで
+    ///   あり、除去後の生成品質を保証しない(ShortGPT論文も同様の注意を
+    ///   明記している)。呼び出し側は除去前後で実際に生成させて品質を
+    ///   比較することを強く推奨する。
+    pub fn prune_redundant_layers(&mut self, redundancy: &[LayerRedundancyReport], block_influence_threshold: f32) -> Result<LayerPruneReport> {
+        anyhow::ensure!(redundancy.len() == self.layers.len(), "open-cuda-llm: prune_redundant_layers: redundancy.len()={} must match current layer_count()={}", redundancy.len(), self.layers.len());
+        anyhow::ensure!(self.layers.iter().all(|l| l.mla.is_none()), "open-cuda-llm: prune_redundant_layers: MLA-compressed layers are not supported (cannot validate pruning against compressed latents)");
+
+        let mut candidates: Vec<usize> = redundancy.iter().filter(|r| r.block_influence < block_influence_threshold).map(|r| r.layer_index).collect();
+        let max_removable = self.layers.len().saturating_sub(1);
+        if candidates.len() > max_removable {
+            candidates.sort_by(|&a, &b| redundancy[a].block_influence.partial_cmp(&redundancy[b].block_influence).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.truncate(max_removable);
+        }
+        candidates.sort_unstable();
+
+        let original_layer_count = self.layers.len();
+        // インデックスがずれないよう、大きい方から削除する。
+        for &idx in candidates.iter().rev() {
+            self.layers.remove(idx);
+        }
+        self.config.num_layers = self.layers.len();
+
+        Ok(LayerPruneReport {
+            original_layer_count,
+            pruned_layer_count: self.layers.len(),
+            removed_layer_indices: candidates,
+            disclosure: "これはICLR 2025 'Model Folding'論文(arXiv:2502.10216)のニューロン単位k-meansクラスタリングではなく、\
+                ShortGPT(arXiv:2403.03853)/Gromov et al.(arXiv:2403.17887)方式の層単位Block Influence冗長性検出+\
+                実際の層除去です。少数のサンプル文からの推定に基づくヒューリスティックであり、除去後の生成品質を保証しません。 / \
+                This is NOT the neuron-level k-means clustering of the ICLR 2025 'Model Folding' paper (arXiv:2502.10216) — \
+                it is layer-level Block Influence redundancy detection and actual layer removal, following ShortGPT \
+                (arXiv:2403.03853) / Gromov et al. (arXiv:2403.17887). It is a heuristic based on a small sample of \
+                prompts and does not guarantee post-pruning generation quality.",
+        })
+    }
+
     /// 新規のKVキャッシュ集合(レイヤー数 x ヘッド数)を作る。
     fn new_caches(&self) -> Vec<Vec<KvCacheHead>> {
         (0..self.config.num_layers).map(|_| (0..self.config.num_heads).map(|_| KvCacheHead::empty()).collect()).collect()
@@ -1172,11 +1351,15 @@ impl GptModel {
     /// ではなく既存キャッシュの続きから始まる位置埋め込みを正しく
     /// 計算するために必要になった)。プロンプトの初回呼び出しは
     /// `start_pos=0`を渡せば従来と完全に同じ挙動になる(後方互換)。
-    fn forward_prefill_hidden(&self, device: &dyn GpuDevice, token_ids: &[u32], start_pos: usize, caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
+    /// トークン埋め込み+位置埋め込みの合算のみ(まだどのデコーダ層も
+    /// 通していない、レイヤー0への入力)。**2026-09-01新設**:
+    /// `forward_prefill_hidden`から埋め込み構築部分を切り出したもの
+    /// (挙動は完全に無変更のリファクタリング)——
+    /// [`analyze_layer_redundancy`](Self::analyze_layer_redundancy)が
+    /// 同じ埋め込みロジックを再利用するために公開が必要になったため。
+    fn embed_tokens(&self, token_ids: &[u32], start_pos: usize) -> Result<Vec<f32>> {
         let hidden_size = self.config.hidden_size;
-        let seq_len = token_ids.len();
-
-        let mut hidden_batch = vec![0.0f32; seq_len * hidden_size];
+        let mut hidden_batch = vec![0.0f32; token_ids.len() * hidden_size];
         for (row, &tok) in token_ids.iter().enumerate() {
             let pos = start_pos + row;
             anyhow::ensure!(pos < self.config.max_seq_len, "open-cuda-llm: position {pos} exceeds max_seq_len {}", self.config.max_seq_len);
@@ -1189,6 +1372,13 @@ impl GptModel {
                 *d = w + p;
             }
         }
+        Ok(hidden_batch)
+    }
+
+    fn forward_prefill_hidden(&self, device: &dyn GpuDevice, token_ids: &[u32], start_pos: usize, caches: &mut [Vec<KvCacheHead>]) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let seq_len = token_ids.len();
+        let mut hidden_batch = self.embed_tokens(token_ids, start_pos)?;
 
         let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
         let flash_spirv = self.flash_attn_spirv.as_ref().map(|(bytes, bs)| (bytes.as_slice(), *bs));
@@ -2523,6 +2713,71 @@ mod tests {
         let prompt = ByteTokenizer::encode("mla on real vulkan hardware");
         let generated = model.generate(&vulkan_device, &prompt, 6).unwrap();
         assert_eq!(generated.len(), 6, "generate() should complete end-to-end through the compressed KV cache path on real Vulkan hardware");
+    }
+
+    /// **2026-09-01新設**: `analyze_layer_redundancy`+`prune_redundant_layers`
+    /// の基本動作。ランダム初期化の小型モデル(層数を6に増やしたもの、
+    /// `tiny`の2層では冗長性の差が観測しにくいため)で、(a) BIレポートが
+    /// 全層ぶん返ること、(b) 閾値を非常に高く(実質全層が対象になる値)
+    /// 設定した場合でも「最低1層は残す」安全策が働くこと、を検証する。
+    #[test]
+    fn analyze_and_prune_redundant_layers_respects_min_one_layer_safety_cap() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 6;
+        let mut model = GptModel::load_random(config, 11);
+        let device = device();
+        let prompts = vec![ByteTokenizer::encode("the weather today is sunny and warm"), ByteTokenizer::encode("stock markets rose sharply this quarter"), ByteTokenizer::encode("she walked slowly through the old library")];
+
+        let redundancy = model.analyze_layer_redundancy(&device, &prompts).unwrap();
+        assert_eq!(redundancy.len(), 6);
+        for r in &redundancy {
+            assert!(r.sample_count > 0, "layer {} should have collected at least one similarity sample", r.layer_index);
+            assert!(r.block_influence.is_finite());
+        }
+
+        // 閾値を極端に高く設定 = 全層が「冗長」と判定される病的なケース。
+        // それでも最低1層は残るはず(安全策)。
+        let report = model.prune_redundant_layers(&redundancy, 999.0).unwrap();
+        assert_eq!(report.original_layer_count, 6);
+        assert_eq!(report.pruned_layer_count, 1, "even a pathological all-redundant case must keep at least one layer");
+        assert_eq!(report.removed_layer_indices.len(), 5);
+        assert_eq!(model.layer_count(), 1);
+        assert_eq!(model.config().num_layers, 1, "config.num_layers must stay in sync with the actual layer count (cache allocation depends on it)");
+
+        // 折りたたみ後もgenerate()が最後まで動作すること(KVキャッシュの
+        // 割り当て数と層数がずれていれば、ここでpanicか不整合が起きる)。
+        let prompt = ByteTokenizer::encode("after pruning");
+        let generated = model.generate(&device, &prompt, 4).unwrap();
+        assert_eq!(generated.len(), 4);
+    }
+
+    /// 閾値を非常に低く(実質どの層も下回らない値)設定した場合は、
+    /// 何も除去されずレイヤー数が不変であること(誤って全部消してしまう
+    /// バグが無いことの確認)。
+    #[test]
+    fn prune_redundant_layers_removes_nothing_below_a_permissive_threshold() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 4;
+        let mut model = GptModel::load_random(config, 3);
+        let device = device();
+        let prompts = vec![ByteTokenizer::encode("a short sample sentence")];
+        let redundancy = model.analyze_layer_redundancy(&device, &prompts).unwrap();
+
+        let report = model.prune_redundant_layers(&redundancy, -1.0).unwrap();
+        assert_eq!(report.pruned_layer_count, 4);
+        assert!(report.removed_layer_indices.is_empty());
+        assert_eq!(model.layer_count(), 4);
+    }
+
+    /// `redundancy`の件数がモデルの現在の層数と食い違う場合は、黙って
+    /// 誤ったインデックスを削除せず正直にエラーを返すこと。
+    #[test]
+    fn prune_redundant_layers_rejects_mismatched_redundancy_length() {
+        let config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE); // 2 layers
+        let mut model = GptModel::load_random(config, 5);
+        let bogus_redundancy = vec![LayerRedundancyReport { layer_index: 0, block_influence: 0.0, sample_count: 1 }];
+        let err = model.prune_redundant_layers(&bogus_redundancy, 0.5).unwrap_err();
+        assert!(err.to_string().contains("must match current layer_count"));
     }
 }
 
