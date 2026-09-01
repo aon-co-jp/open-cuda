@@ -157,6 +157,77 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
 
 コミット: `890f8b1`(方式1)・`74263e1`(方式2)・`3a887ad`(方式3)。
 
+## HANDOFF追記(2026-09-01(続き)、Model Foldingの残課題4項目に着手・完了 / Follow-up: addressed all 4 remaining Model Folding gaps)
+
+直前エントリの「未着手・次回検討候補」4項目すべてに着手した(複数
+セッション並行作業、コミット`761cb76`)。
+
+1. **`ridge_lambda`の外部調整可能化**: `GptModel::
+   fold_block_with_linear_adapter`のシグネチャに`ridge_lambda:
+   Option<f32>`引数を追加。`None`なら既定値`1e-2`、`Some(v)`なら
+   `v`をそのまま使う(`v`が非有限・0以下なら`ensure!`で正直に拒否)。
+   `AdapterFoldReport::ridge_lambda_used`で実際に使われた値を常に
+   開示する。`aruaru-llm`側`POST /v1/models/fold-layers`の
+   `ridge_lambda`リクエストパラメータ経由でHTTPから調整可能
+   (`aruaru-llm/CLAUDE.md`同日エントリ参照)。新規テスト2件
+   (既定/明示値の反映確認・非正/NaN/inf値の拒否確認)。
+2. **実GPU経路(Vulkan/DirectX)での3手法の実測**: 新規
+   `manual_bench_fold_layers_cpu_vs_vulkan_vs_directx_on_real_gpt2_
+   weights`(`--ignored`、実重み・実GPU必要)。このマシン
+   (NVIDIA GeForce GT 730、Windows)で実際に実行した結果
+   (`analyze_layer_redundancy`/`find_best_layer_block_to_remove`/
+   `fold_block_with_linear_adapter`、実GPT-2 124M・12層・2層除去):
+
+   | 経路 | analyze_layer_redundancy | find_best_layer_block_to_remove | fold_block_with_linear_adapter |
+   |---|---|---|---|
+   | CPU | 1.96s | 1.90s | 2.07s |
+   | Vulkan | 43.69s | 32.18s | 34.58s |
+   | DirectX(DXIL常駐オフロード) | 4.03s | 4.62s | 4.22s |
+
+   **正直な結論: このマシンではCPUが最速、DirectXがCPUの約2倍、
+   Vulkanが最も遅い(CPUの約17〜22倍)**。これは過去HANDOFF
+   (2026-08-15・2026-08-22・2026-08-23)で既に実測済みの傾向
+   ——GT730はGEMMそのものがCPUより遅く、かつAttention/LayerNorm/
+   GELU自体はCPU側で計算するハイブリッド構成(DXILオフロードは
+   密GEMMのみ)のため、H2D/D2H転送・ディスパッチのオーバーヘッドが
+   支配的になる——と一致する。「GPUで速くなった」とは主張しない。
+   より強い統合GPU+弱いCPUの組み合わせ(過去実測のAdreno 619)なら
+   有利になり得るが、**この機・このワークロードでは未検証のまま**。
+3. **日本語・多言語較正データでの検証**: `aruaru-llm`側に
+   `multilingual_fold_calibration_prompts()`(英語・日本語・中国語・
+   フランス語・ドイツ語・スペイン語混在12文)を新設し、
+   `fold_active_model`系3関数すべての既定較正データ(`sample_prompts`
+   省略時)をこれに切り替えた。実GPT-2 124M重みで
+   `fold_active_model_by_block`(1層除去)を実行し、折りたたみ前後
+   とも`generate()`が正常に動作すること(クラッシュしない、空文字
+   列を返さない)を確認済み。**正直な開示**: `GptTokenizer`は英語
+   中心の学習済みBPE語彙(GPT-2本体)のため、日本語・多言語入力でも
+   トークン化自体は失敗しないが「日本語での折りたたみ後品質が英語と
+   同等」であることまでは主張しない(詳細は`aruaru-llm/CLAUDE.md`
+   同日エントリ参照)。
+4. **UIボタンからの実際のE2E呼び出し**: `open-english`側
+   `index.html`/`app.js`に`POST /v1/models/fold-layers`を実際に
+   呼ぶボタン(層数・線形アダプタチェックボックス・`ridge_lambda`
+   入力欄)を新設。このセッションで実際にaruaru-llmサーバーを起動し
+   (`127.0.0.1:4601`)、UIのJSが送るのと同じリクエストボディ
+   (`{"num_layers_to_remove":1,"use_linear_adapter":true,
+   "ridge_lambda":0.5}`)を`curl`で送信、`ridge_lambda_used:0.5`が
+   レスポンスに正しく反映されること、折りたたみ前後の生成サンプルが
+   両方とも文法的に妥当な英文であることを実HTTPで確認した(詳細は
+   `aruaru-llm/CLAUDE.md`・`open-english/CLAUDE.md`同日エントリ参照)。
+
+**検証**: `cargo test -p open-cuda-llm --release -- --test-threads=1`
+**34件全green**(0失敗、3件`--ignored`)。`--ignored`ベンチ
+(上記2.)も実際に実行し実測値を取得済み(モックやスキップではない)。
+`aruaru-llm`側`cargo test --release -- --test-threads=1`
+**101件全green**(2件`--ignored`、うち多言語較正テストは実際に
+`--ignored`で実行し実測を確認済み)。
+
+**残課題(正直な開示)**: (1) Attentionサブ層を完全にスキップする
+軽量パス(QKV射影自体を省略)は未実装のまま(前回HANDOFFから変更
+なし)。(2) より高性能な統合GPU(Adreno等)でのDirectX/Vulkan経路
+再実測は、このマシンにその種のGPUが無いため引き続き未検証。
+
 ## HANDOFF追記(2026-08-23、階層的アクセラレーション: D3D12 Compute経由のGEMMオフロードを実装 / Hierarchical acceleration: DXIL GEMM offload)
 
 ユーザーの目的「NVIDIA GPU非搭載の安価なPCでもAI推論をなるべく速く」への対応として、
