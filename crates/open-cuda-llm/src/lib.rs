@@ -391,6 +391,16 @@ struct DecoderLayer {
     /// `mla_decompress_kv`土台)、`None`(既定)なら従来通りKVキャッシュを
     /// フル精度のまま保持する(後方互換、既存テストへの影響ゼロ)。
     mla: Option<Vec<MlaHeadProjection>>,
+    /// **2026-09-01新設: Attentionサブ層を丸ごとスキップする軽量パス**。
+    /// `true`のとき、`forward_step`/`forward_prefill`は`ln_1`・QKV射影・
+    /// Attention計算(QKᵀ/softmax/P·V)・`attn_out`・KVキャッシュへの
+    /// push を**一切実行せず**、残差(`hidden`)をそのままFFNサブ層へ
+    /// 渡す。[`DecoderLayer::linear_adapter`]が構築するアダプタ層は
+    /// `qkv`/`attn_out`が常にゼロ出力(=Attention寄与がゼロ)なので、
+    /// このスキップは数値的にビット単位で等価でありながら、無駄な
+    /// QKV射影・softmax・GEMMディスパッチを丸ごと省ける。既定は`false`
+    /// (通常の層は従来通りAttentionを計算する、後方互換)。
+    skip_attention: bool,
 }
 
 impl DecoderLayer {
@@ -403,6 +413,7 @@ impl DecoderLayer {
             intermediate: Linear::random(rng, hidden, intermediate),
             output: Linear::random(rng, intermediate, hidden),
             mla: None,
+            skip_attention: false,
         }
     }
 
@@ -418,9 +429,14 @@ impl DecoderLayer {
     /// 構造:
     /// - `ln_1`: アフィン変換なしのLayerNorm(既存の`identity`と同じ)
     /// - `qkv`/`attn_out`: **常にゼロを出力する`Linear`**——Attention
-    ///   サブ層の計算(QKV射影・softmax・重み付き和)自体は実行される
-    ///   (正直な開示: 計算コスト自体はゼロにならない)が、その出力は
-    ///   ゼロに潰されるため、残差(`hidden`)だけがそのまま通過する。
+    ///   サブ層の寄与をゼロに潰し、残差(`hidden`)だけがそのまま通過
+    ///   する。**2026-09-01**: 加えて`skip_attention = true`を立てる
+    ///   ため、`forward_step`/`forward_prefill`はこの層のQKV射影・
+    ///   softmax・P·V・`attn_out`・KVキャッシュpushを**そもそも実行
+    ///   しない**(ゼロの`Linear`は数学的なフォールバックとしてのみ
+    ///   残す)。従来は「出力を捨てるだけで計算コストは残る」設計
+    ///   だったが、この軽量パスで無駄な演算・GEMMディスパッチを丸ごと
+    ///   省ける(数値的にはビット単位で等価)。
     /// - `ln_2`: アフィン変換なしのLayerNorm(標準化のみ)
     /// - `intermediate`: 恒等写像の`Linear`(`intermediate_size ==
     ///   hidden_size`固定)——実質的な非線形特徴抽出は次のGELU自体が担う
@@ -438,6 +454,7 @@ impl DecoderLayer {
             intermediate: Linear::identity(hidden_size),
             output: Linear::from_weights(output_weight_t, output_bias, hidden_size, hidden_size),
             mla: None,
+            skip_attention: true,
         }
     }
 
@@ -457,6 +474,25 @@ impl DecoderLayer {
         softmax_spirv: Option<&[u8]>,
         flash_spirv: Option<(&[u8], usize)>,
     ) -> Result<Vec<f32>> {
+        // **2026-09-01: Attentionスキップ軽量パス**。`linear_adapter`が
+        // 構築した層は`qkv`/`attn_out`が常にゼロ出力=Attention寄与が
+        // ゼロなので、ln_1・QKV射影・softmax・P·V・attn_out・KVキャッシュ
+        // pushを丸ごと省いて残差だけをFFNへ渡しても数値的にビット単位で
+        // 等価。無駄なGEMM/softmaxディスパッチを削減する。
+        if self.skip_attention {
+            let hidden2 = hidden.to_vec();
+            let mut normed2 = hidden2.clone();
+            self.ln_2.forward(&mut normed2, 1, hidden_size);
+            let mut intermediate = self.intermediate.forward(device, &normed2, 1)?;
+            gelu_inplace(&mut intermediate);
+            let ffn_out = self.output.forward(device, &intermediate, 1)?;
+            let mut hidden3 = hidden2;
+            for (a, b) in hidden3.iter_mut().zip(ffn_out.iter()) {
+                *a += b;
+            }
+            return Ok(hidden3);
+        }
+
         let head_dim = hidden_size / num_heads;
 
         let mut normed = hidden.to_vec();
@@ -572,8 +608,28 @@ impl DecoderLayer {
         softmax_spirv: Option<&[u8]>,
         flash_spirv: Option<(&[u8], usize)>,
     ) -> Result<Vec<f32>> {
-        let head_dim = hidden_size / num_heads;
         debug_assert_eq!(hidden_batch.len(), seq_len * hidden_size);
+
+        // **2026-09-01: Attentionスキップ軽量パス**(`forward_step`と同じ
+        // 理由——`linear_adapter`層はAttention寄与がゼロなのでビット単位で
+        // 等価)。バッチ全体のQKV射影・行ごとのsoftmax・P·V・`attn_out`の
+        // 4回ぶんのGEMM/ディスパッチと、seq_len個ぶんのKVキャッシュpushを
+        // 丸ごと省く。
+        if self.skip_attention {
+            let hidden2 = hidden_batch.to_vec();
+            let mut normed2 = hidden2.clone();
+            self.ln_2.forward(&mut normed2, seq_len, hidden_size);
+            let mut intermediate = self.intermediate.forward(device, &normed2, seq_len)?;
+            gelu_inplace(&mut intermediate);
+            let ffn_out = self.output.forward(device, &intermediate, seq_len)?;
+            let mut hidden3 = hidden2;
+            for (a, b) in hidden3.iter_mut().zip(ffn_out.iter()) {
+                *a += b;
+            }
+            return Ok(hidden3);
+        }
+
+        let head_dim = hidden_size / num_heads;
 
         let mut normed = hidden_batch.to_vec();
         self.ln_1.forward(&mut normed, seq_len, hidden_size);
@@ -892,6 +948,13 @@ pub struct AdapterFoldReport {
     /// **2026-09-01新設**: 実際に使われたリッジ正則化係数(呼び出し側が
     /// `Some`で上書きしなかった場合は既定値`1e-2`がそのまま入る)。
     pub ridge_lambda_used: f32,
+    /// **2026-09-01新設**: 挿入したアダプタ層が、推論時にAttentionサブ層
+    /// (QKV射影・softmax・P·V・`attn_out`・KVキャッシュpush)を**丸ごと
+    /// スキップ**するかどうか。`true`(常に`true`)は「出力をゼロで捨てる
+    /// だけ」の旧設計から、無駄な演算・GEMMディスパッチを実際に省く
+    /// 軽量パス([`DecoderLayer`]の`skip_attention`)へ移行済みであることを
+    /// 示す。数値的にはビット単位で等価。
+    pub attention_compute_skipped: bool,
     pub disclosure: &'static str,
 }
 
@@ -1027,6 +1090,7 @@ impl GptModel {
                 intermediate: load_conv1d(&tensors, &format!("{p}.mlp.c_fc"), hidden, config.intermediate_size)?,
                 output: load_conv1d(&tensors, &format!("{p}.mlp.c_proj"), config.intermediate_size, hidden)?,
                 mla: None,
+                skip_attention: false,
             });
         }
 
@@ -1699,17 +1763,24 @@ impl GptModel {
             block_len: candidate.len,
             fit_sample_rows: num_rows,
             ridge_lambda_used: ridge_lambda,
+            attention_compute_skipped: true,
             disclosure: "除去したブロックの代わりに、最小二乗法(閉形式のリッジ回帰、勾配降下法は使わない)でフィットした\
                 1つの軽量な線形アダプタ層を挿入しました(SHIFT-LLM/SlimLLM等のclosed-form線形置換手法に着想、\
                 arXiv:2608.25068/arXiv:2505.22689——これらは非常に新しい論文であり、本実装は再現実装ではなく着想の\
                 みを借りた独自の簡略版です)。何もしない単純な層除去より品質を保ちやすいことを期待した設計ですが、\
-                較正データへのフィットに過ぎず、除去後の生成品質を保証するものではありません。 / \
+                較正データへのフィットに過ぎず、除去後の生成品質を保証するものではありません。\
+                挿入したアダプタ層は推論時にAttentionサブ層(QKV射影・softmax・P·V・KVキャッシュ)を丸ごと\
+                スキップするため、除去したブロックぶんのAttention計算コストは実際に削減されます\
+                (旧設計は出力をゼロで捨てるだけで演算は残っていました)。 / \
                 Instead of deleting the removed block outright, we inserted a single lightweight linear adapter \
                 layer fit via closed-form ridge regression (no gradient descent) — inspired by SHIFT-LLM/SlimLLM-style \
                 closed-form linear replacement techniques (arXiv:2608.25068 / arXiv:2505.22689; these are very \
                 recent papers and this is our own simplified implementation inspired by the idea, not a faithful \
                 reproduction). Designed to preserve quality better than plain deletion, but it is only a fit to the \
-                calibration data and does not guarantee post-fold generation quality.",
+                calibration data and does not guarantee post-fold generation quality. The inserted adapter layer skips \
+                the entire attention sub-layer at inference time (QKV projection, softmax, P·V, KV-cache push), so the \
+                removed block's attention compute cost is genuinely eliminated (the previous design merely discarded the \
+                output while still running the math).",
         })
     }
 
@@ -3268,6 +3339,41 @@ mod tests {
         assert_eq!(report_custom.ridge_lambda_used, 5.0, "an explicit Some(value) must be used as-is and reported back");
     }
 
+    /// **2026-09-01新設**: `linear_adapter`層のAttentionスキップ軽量パス
+    /// (`skip_attention = true`)が、Attentionを実際に計算してゼロ出力を
+    /// 捨てる旧経路と**ビット単位で完全一致**すること。無駄な演算を
+    /// 省くだけの最適化であって、生成結果を1トークンも変えないことを
+    /// 保証する(挙動を変えない最適化の実証)。
+    #[test]
+    fn linear_adapter_attention_skip_is_bitwise_identical_to_computing_zeroed_attention() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 8;
+        let device = device();
+        let prompts: Vec<Vec<u32>> = ["the weather today is sunny and warm outside", "stock markets rose sharply again this quarter", "she walked slowly through the old quiet library"]
+            .iter()
+            .map(|s| ByteTokenizer::encode(s))
+            .collect();
+
+        // スキップ経路(既定)
+        let mut model_skip = GptModel::load_random(config.clone(), 33);
+        let candidate = model_skip.find_best_layer_block_to_remove(&device, &prompts, 3).unwrap();
+        let report = model_skip.fold_block_with_linear_adapter(&device, &prompts, &candidate, None).unwrap();
+        assert!(report.attention_compute_skipped, "the adapter layer must report that attention compute is skipped");
+
+        // 同一の折りたたみを行った上で、アダプタ層の`skip_attention`を
+        // 明示的に`false`へ戻す(=Attentionを実際に計算しゼロ出力を捨てる
+        // 旧経路)。
+        let mut model_compute = GptModel::load_random(config, 33);
+        let candidate2 = model_compute.find_best_layer_block_to_remove(&device, &prompts, 3).unwrap();
+        model_compute.fold_block_with_linear_adapter(&device, &prompts, &candidate2, None).unwrap();
+        model_compute.layers[candidate2.start].skip_attention = false;
+
+        let prompt = ByteTokenizer::encode("verifying the attention skip fast path");
+        let out_skip = model_skip.generate(&device, &prompt, 12).unwrap();
+        let out_compute = model_compute.generate(&device, &prompt, 12).unwrap();
+        assert_eq!(out_skip, out_compute, "attention-skip fast path must produce byte-identical output to computing zeroed attention");
+    }
+
     /// **2026-09-01新設**: 非正の値・NaN・infの`ridge_lambda`は、数値的に
     /// 不安定な解や特異行列エラーを招く前に、正直な`ensure!`エラーで
     /// 即座に拒否されること(サイレントに変な解を返さない)。
@@ -3572,5 +3678,56 @@ mod bench_manual {
         let out = model.generate(&device, &prompt, 20).unwrap();
         let elapsed = start.elapsed();
         eprintln!("generate(20 new tokens) elapsed={elapsed:?}, out_len={}", out.len());
+    }
+
+    /// **2026-09-01新設**: 線形アダプタ折りたたみで挿入した層の
+    /// Attentionスキップ軽量パス(`DecoderLayer::skip_attention`)が、
+    /// Attentionを実際に計算してゼロ出力を捨てる旧経路と比べて実際に
+    /// 速いことを実測する。合成乱数重み(実GPT-2重み不要)で、大きな
+    /// ブロック(12層中8層)を1つのアダプタ層へ折りたたんだモデルの
+    /// `generate()`所要時間を、`skip_attention=true`(既定)と
+    /// `skip_attention=false`(旧経路相当)で比較する。`--ignored`時のみ。
+    #[test]
+    #[ignore]
+    fn manual_bench_attention_skip_vs_computed_zeroed_attention() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.hidden_size = 256;
+        config.num_heads = 8;
+        config.intermediate_size = 256;
+        config.num_layers = 12;
+        let device: Arc<dyn GpuDevice> = CpuDevice::new(0);
+        let prompts: Vec<Vec<u32>> = ["the weather today is sunny and warm outside and pleasant", "stock markets rose sharply again this quarter across the board"]
+            .iter()
+            .map(|s| ByteTokenizer::encode(s))
+            .collect();
+        let prompt = ByteTokenizer::encode("benchmarking the attention skip fast path against the old computed path");
+
+        let mut model_skip = GptModel::load_random(config.clone(), 7);
+        let candidate = model_skip.find_best_layer_block_to_remove(&device, &prompts, 8).unwrap();
+        model_skip.fold_block_with_linear_adapter(&device, &prompts, &candidate, None).unwrap();
+
+        let mut model_compute = GptModel::load_random(config, 7);
+        let candidate2 = model_compute.find_best_layer_block_to_remove(&device, &prompts, 8).unwrap();
+        model_compute.fold_block_with_linear_adapter(&device, &prompts, &candidate2, None).unwrap();
+        model_compute.layers[candidate2.start].skip_attention = false;
+
+        // ウォームアップ(初回のアロケータ・キャッシュ効果を排除)
+        let _ = model_skip.generate(&device, &prompt, 4).unwrap();
+        let _ = model_compute.generate(&device, &prompt, 4).unwrap();
+
+        const ITERS: u32 = 5;
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let _ = model_skip.generate(&device, &prompt, 24).unwrap();
+        }
+        let skip_elapsed = t0.elapsed() / ITERS;
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            let _ = model_compute.generate(&device, &prompt, 24).unwrap();
+        }
+        let compute_elapsed = t1.elapsed() / ITERS;
+        eprintln!(
+            "attention-skip fast path: {skip_elapsed:?}/gen  vs  computed-zeroed-attention: {compute_elapsed:?}/gen  (folded 8-of-12 layers into 1 adapter)"
+        );
     }
 }

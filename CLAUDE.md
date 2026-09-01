@@ -228,6 +228,48 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
 なし)。(2) より高性能な統合GPU(Adreno等)でのDirectX/Vulkan経路
 再実測は、このマシンにその種のGPUが無いため引き続き未検証。
 
+## HANDOFF追記(2026-09-01(続き2)、Model Folding: Attentionサブ層を丸ごとスキップする軽量パスを`DecoderLayer`へ追加 / Follow-up: added a real attention-skip fast path to `DecoderLayer`)
+
+直前エントリの残課題(1)「Attentionサブ層を完全にスキップする軽量パス」を
+実装した(open-cuda + aruaru-llm + open-english の3リポジトリにまたがる
+スライス、正本は`aruaru-llm/CLAUDE.md`同日エントリ)。
+
+**背景**: 線形アダプタ折りたたみ(`fold_block_with_linear_adapter`)で
+挿入する`DecoderLayer::linear_adapter`は、`qkv`/`attn_out`を
+`Linear::zeroed`で常にゼロ出力にしてAttention寄与を潰す設計だったが、
+QKV射影・softmax・P·V・KVキャッシュpushの演算自体は毎回実行され、
+「出力をゼロで捨てるだけ」で計算コストが残っていた。
+
+**実装**(`crates/open-cuda-llm/src/lib.rs`):
+- `DecoderLayer`へ`skip_attention: bool`フィールドを追加(既定`false`、
+  全既存コンストラクタ〈`random`/`load`〉で明示的に`false`)。
+  `linear_adapter`コンストラクタのみ`true`。
+- `forward_step`/`forward_prefill`の冒頭で`self.skip_attention`なら、
+  ln_1・QKV射影・per-head Attentionループ・attn_out・KVキャッシュpushを
+  **一切実行せず**、残差(`hidden`)をそのままFFNサブ層(ln_2→intermediate
+  →GELU→output→残差)へ渡す。`linear_adapter`の`qkv`/`attn_out`はゼロ
+  出力なので、これは**数値的にビット単位で等価**(生成トークン列が
+  1トークンも変わらない)。
+- `AdapterFoldReport`へ`attention_compute_skipped: bool`(常に`true`)を
+  追加、日英のdisclosure文も更新。
+- 新しいレイヤー型・GPU固有コードは追加していない(既存の`DecoderLayer`
+  インフラを100%再利用、`device: &Arc<dyn GpuDevice>`経由でCPU/Vulkan/
+  DirectXいずれでも動く設計を維持)。
+
+**検証**: `cargo test -p open-cuda-llm --release -- --test-threads=1`
+**35件全green**(新規テスト
+`linear_adapter_attention_skip_is_bitwise_identical_to_computing_zeroed_attention`
+——同一乱数モデルを折りたたみ、片方は`skip_attention=true`〈既定〉、
+もう片方は折りたたみ後にアダプタ層の`skip_attention`を明示的に`false`へ
+戻し、`generate()`の出力が**バイト単位で完全一致**することを確認)。
+`--ignored`ベンチ`manual_bench_attention_skip_vs_computed_zeroed_attention`
+(合成乱数重み、12層中8層を1アダプタへ折りたたみ、CPU実行の`generate()`
+所要時間をskip有無で比較)も追加(実測は次回、開発機で`--ignored`実行)。
+
+**残課題**: (1) より高性能な統合GPU(Adreno等)でのDirectX/Vulkan経路
+再実測は引き続き未検証(直前エントリから変更なし)。(2) skip版の
+実速度向上幅(合成モデルでのCPU実測、`--ignored`ベンチ)は次回取得。
+
 ## HANDOFF追記(2026-08-23、階層的アクセラレーション: D3D12 Compute経由のGEMMオフロードを実装 / Hierarchical acceleration: DXIL GEMM offload)
 
 ユーザーの目的「NVIDIA GPU非搭載の安価なPCでもAI推論をなるべく速く」への対応として、
