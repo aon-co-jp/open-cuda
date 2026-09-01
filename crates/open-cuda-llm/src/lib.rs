@@ -740,6 +740,18 @@ pub struct LayerRedundancyReport {
     pub sample_count: usize,
 }
 
+/// **2026-09-01新設**: [`GptModel::find_best_layer_block_to_remove`]が
+/// 選んだ、除去対象の連続ブロック。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockRemovalCandidate {
+    pub start: usize,
+    pub len: usize,
+    /// ブロック直前/直後の隠れ状態の平均コサイン類似度(1に近いほど
+    /// 「除去してもほぼ変わらない」)。
+    pub block_similarity: f32,
+    pub sample_count: usize,
+}
+
 /// **2026-09-01新設**: [`GptModel::prune_redundant_layers`]の結果。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LayerPruneReport {
@@ -1315,6 +1327,141 @@ impl GptModel {
                 it is layer-level Block Influence redundancy detection and actual layer removal, following ShortGPT \
                 (arXiv:2403.03853) / Gromov et al. (arXiv:2403.17887). It is a heuristic based on a small sample of \
                 prompts and does not guarantee post-pruning generation quality.",
+        })
+    }
+
+    /// **2026-09-01新設: 連続ブロック探索による層除去(Gromov et al.
+    /// 方式)**。ユーザーからの追加指示「極端な閾値での品質劣化を
+    /// open-directx/open-cuda/aruaru-llm/open-cpuを駆使して改善して
+    /// ほしい」への対応として、[`analyze_layer_redundancy`]/
+    /// [`prune_redundant_layers`](既存、独立した層をそれぞれ個別の
+    /// 閾値で判定する方式)の弱点を、**より論文に忠実なアルゴリズムへ
+    /// 改良**する形で解決した。
+    ///
+    /// # 何が問題だったか(正直な原因分析)
+    /// 旧`prune_redundant_layers`は「各層を個別にBIで判定し、閾値未満の
+    /// 層をすべて集めて削除」という設計だった。閾値を緩めると
+    /// **たまたま閾値を下回った層の集合**(連続とは限らない、モデル全体に
+    /// 散らばりうる)がまとめて削除される——実測(distilgpt2、
+    /// `block_influence_threshold=0.99`)では6層中5層(層1〜5)が一度に
+    /// 削除され、"Theodoreodoreodore..."のような明確な破綻を招いた。
+    /// これは「削除候補群を1つのまとまりとして評価していない」ことが
+    /// 根本原因——Gromov et al.
+    /// ([arXiv:2403.17887](https://arxiv.org/abs/2403.17887))は元々
+    /// この失敗を避けるため、**削除したい層数を決めた上で、その本数分の
+    /// 「連続する層のブロック」を総当たりで比較し、除去による影響
+    /// (ブロック直前の隠れ状態とブロック直後の隠れ状態の角度距離)が
+    /// 最小になる、たった1つの最適なブロックだけを選んで除去する**、
+    /// という設計になっている——独立した層を寄せ集めるのではなく、
+    /// 「このN層をまとめて削ったら実際にどれだけ変わるか」を候補ごとに
+    /// 直接測る点が本質的な違い。
+    ///
+    /// # 実行経路(open-directx/open-cuda/open-cpu/aruaru-llmとの関係)
+    /// この探索自体は`forward_prefill`(既存のAttention/GEMM計算)を
+    /// 候補ブロック数ぶん繰り返すだけであり、計算内容自体は
+    /// [`analyze_layer_redundancy`]と同じ土台を使う——つまりこの探索も
+    /// **既存のデバイス抽象化(`device: &Arc<dyn GpuDevice>`)を通じて、
+    /// `opencuda-cpu`(open-cpu連携のSIMD経路)・`opencuda-vulkan`
+    /// (open-cuda内蔵Vulkan)・`opencuda-directx`(open-cuda内蔵DirectX、
+    /// `set_matmul_dxil_offload`配線時)のいずれでも動く**設計のまま
+    /// (呼び出し元の`aruaru-llm`が渡すデバイス次第)。新規のGPU固有コードを
+    /// このメソッド専用に追加してはいない——改善したのは**アルゴリズムの
+    /// 選び方**であり、計算基盤自体は既存のSET連携をそのまま再利用する。
+    ///
+    /// # 戻り値
+    /// `(start, len)`が実際に選ばれた連続ブロック(`self.layers[start..
+    /// start+len]`)、`block_similarity`はブロック除去前後の隠れ状態
+    /// コサイン類似度(高いほど「除去しても実質同じ」に近い、
+    /// [`LayerRedundancyReport::block_influence`]とは符号が逆——ここでは
+    /// 直感的に「高いほど良い」候補を選ぶため類似度をそのまま返す)。
+    ///
+    /// `num_layers_to_remove`が現在の層数以上、または0の場合はエラー。
+    pub fn find_best_layer_block_to_remove(&self, device: &std::sync::Arc<dyn GpuDevice>, sample_prompts: &[Vec<u32>], num_layers_to_remove: usize) -> Result<BlockRemovalCandidate> {
+        anyhow::ensure!(!sample_prompts.is_empty(), "open-cuda-llm: find_best_layer_block_to_remove: sample_prompts must not be empty");
+        let n = self.layers.len();
+        anyhow::ensure!(num_layers_to_remove > 0 && num_layers_to_remove < n, "open-cuda-llm: find_best_layer_block_to_remove: num_layers_to_remove={num_layers_to_remove} must satisfy 0 < num_layers_to_remove < layer_count()={n}");
+        anyhow::ensure!(self.layers.iter().all(|l| l.mla.is_none()), "open-cuda-llm: find_best_layer_block_to_remove: MLA-compressed layers are not supported");
+
+        let hidden_size = self.config.hidden_size;
+        let softmax_spirv = self.softmax_spirv.as_deref().map(|v| v.as_slice());
+        let flash_spirv = self.flash_attn_spirv.as_ref().map(|(bytes, bs)| (bytes.as_slice(), *bs));
+
+        // 各サンプル文について、全層通過後の隠れ状態を層ごとに記録しておく
+        // (層0の入力=埋め込み直後、層iの出力=hidden_states[i+1])。
+        // これを1回だけ計算し、あとは候補ブロックごとに配列のスライスを
+        // 比較するだけにすることで、候補数(n - num_layers_to_remove + 1)
+        // 分のforward再計算を避ける(O(n)回のforwardで済む設計)。
+        let num_candidates = n - num_layers_to_remove + 1;
+        let mut sim_sums = vec![0.0f64; num_candidates];
+        let mut sim_counts = vec![0usize; num_candidates];
+
+        for prompt in sample_prompts {
+            anyhow::ensure!(!prompt.is_empty(), "open-cuda-llm: find_best_layer_block_to_remove: sample prompt must not be empty");
+            let seq_len = prompt.len();
+            let mut caches = self.new_caches();
+            let mut hidden_states: Vec<Vec<f32>> = Vec::with_capacity(n + 1);
+            hidden_states.push(self.embed_tokens(prompt, 0)?);
+            for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+                let prev = hidden_states.last().unwrap();
+                let next = layer.forward_prefill(device.as_ref(), prev, seq_len, cache, hidden_size, self.config.num_heads, softmax_spirv, flash_spirv)?;
+                hidden_states.push(next);
+            }
+
+            for start in 0..num_candidates {
+                let before = &hidden_states[start];
+                let after = &hidden_states[start + num_layers_to_remove];
+                for row in 0..seq_len {
+                    let a = &before[row * hidden_size..(row + 1) * hidden_size];
+                    let b = &after[row * hidden_size..(row + 1) * hidden_size];
+                    if let Some(sim) = cosine_similarity(a, b) {
+                        sim_sums[start] += sim as f64;
+                        sim_counts[start] += 1;
+                    }
+                }
+            }
+        }
+
+        let mut best_start = 0usize;
+        let mut best_sim = f64::NEG_INFINITY;
+        for start in 0..num_candidates {
+            let avg = if sim_counts[start] > 0 { sim_sums[start] / sim_counts[start] as f64 } else { f64::NEG_INFINITY };
+            if avg > best_sim {
+                best_sim = avg;
+                best_start = start;
+            }
+        }
+
+        anyhow::ensure!(sim_counts[best_start] > 0, "open-cuda-llm: find_best_layer_block_to_remove: no similarity samples were collected (sample_prompts may be malformed)");
+        Ok(BlockRemovalCandidate { start: best_start, len: num_layers_to_remove, block_similarity: best_sim as f32, sample_count: sim_counts[best_start] })
+    }
+
+    /// [`find_best_layer_block_to_remove`]が選んだ連続ブロックを**実際に
+    /// 除去する**(破壊的操作)。`prune_redundant_layers`と同様、
+    /// `config.num_layers`をレイヤー数に同期させる(必ず1層は残す——
+    /// `find_best_layer_block_to_remove`自体が`num_layers_to_remove <
+    /// layer_count()`を要求するため、ここでは追加の安全策チェックのみ)。
+    pub fn remove_layer_block(&mut self, candidate: &BlockRemovalCandidate) -> Result<LayerPruneReport> {
+        anyhow::ensure!(candidate.start + candidate.len <= self.layers.len(), "open-cuda-llm: remove_layer_block: candidate range [{}, {}) exceeds current layer_count()={}", candidate.start, candidate.start + candidate.len, self.layers.len());
+        anyhow::ensure!(candidate.len < self.layers.len(), "open-cuda-llm: remove_layer_block: cannot remove all layers (must keep at least one)");
+        let original_layer_count = self.layers.len();
+        let removed_layer_indices: Vec<usize> = (candidate.start..candidate.start + candidate.len).collect();
+        self.layers.drain(candidate.start..candidate.start + candidate.len);
+        self.config.num_layers = self.layers.len();
+        Ok(LayerPruneReport {
+            original_layer_count,
+            pruned_layer_count: self.layers.len(),
+            removed_layer_indices,
+            disclosure: "これはGromov et al.(arXiv:2403.17887)方式の連続ブロック探索による層除去です。\
+                削除したい層数を固定した上で、その本数の連続する層の中で除去による影響(隠れ状態の変化)が\
+                最小になる1つのブロックのみを選んで除去します(独立した層を寄せ集める旧方式より、除去する\
+                層数が多い場合に品質を保ちやすい設計です)。fine-tuningによる補正(healing)は行っていない\
+                データフリーな除去のため、除去後の生成品質は保証されません。 / \
+                This is Gromov et al.-style (arXiv:2403.17887) contiguous block search layer removal. Given a fixed \
+                number of layers to remove, it searches all contiguous blocks of that size and removes only the \
+                single block whose removal changes the hidden state the least (more quality-preserving than \
+                independently thresholding scattered layers when removing more than one layer). No fine-tuning \
+                (healing) is applied — this is data-free removal, so post-removal generation quality is not \
+                guaranteed.",
         })
     }
 
@@ -2778,6 +2925,94 @@ mod tests {
         let bogus_redundancy = vec![LayerRedundancyReport { layer_index: 0, block_influence: 0.0, sample_count: 1 }];
         let err = model.prune_redundant_layers(&bogus_redundancy, 0.5).unwrap_err();
         assert!(err.to_string().contains("must match current layer_count"));
+    }
+
+    /// **2026-09-01新設**: `find_best_layer_block_to_remove`が返す候補は
+    /// 常に妥当な範囲(`start+len <= layer_count()`)であり、
+    /// `remove_layer_block`で実際に指定した本数ぶんだけ層数が減ること。
+    #[test]
+    fn find_best_layer_block_to_remove_returns_a_valid_contiguous_range() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 8;
+        let mut model = GptModel::load_random(config, 21);
+        let device = device();
+        let prompts = vec![ByteTokenizer::encode("the weather today is sunny and warm"), ByteTokenizer::encode("stock markets rose sharply this quarter"), ByteTokenizer::encode("she walked slowly through the old library")];
+
+        let candidate = model.find_best_layer_block_to_remove(&device, &prompts, 3).unwrap();
+        assert_eq!(candidate.len, 3);
+        assert!(candidate.start + candidate.len <= 8);
+        assert!(candidate.sample_count > 0);
+        assert!(candidate.block_similarity.is_finite());
+
+        let report = model.remove_layer_block(&candidate).unwrap();
+        assert_eq!(report.original_layer_count, 8);
+        assert_eq!(report.pruned_layer_count, 5);
+        assert_eq!(report.removed_layer_indices.len(), 3);
+        assert_eq!(model.layer_count(), 5);
+        assert_eq!(model.config().num_layers, 5);
+
+        // 折りたたみ後もgenerate()が最後まで動作すること。
+        let prompt = ByteTokenizer::encode("after block removal");
+        let generated = model.generate(&device, &prompt, 4).unwrap();
+        assert_eq!(generated.len(), 4);
+    }
+
+    /// 0本・全層本数以上の除去要求は正直にエラーで拒否されること
+    /// (「全部消す」を許すと壊れたモデルが残ってしまうため)。
+    #[test]
+    fn find_best_layer_block_to_remove_rejects_out_of_range_counts() {
+        let mut config = GptConfig::tiny(ByteTokenizer::VOCAB_SIZE);
+        config.num_layers = 4;
+        let model = GptModel::load_random(config, 9);
+        let device = device();
+        let prompts = vec![ByteTokenizer::encode("a short sample sentence")];
+
+        assert!(model.find_best_layer_block_to_remove(&device, &prompts, 0).is_err());
+        assert!(model.find_best_layer_block_to_remove(&device, &prompts, 4).is_err()); // == layer_count(), must keep >=1
+        assert!(model.find_best_layer_block_to_remove(&device, &prompts, 5).is_err()); // > layer_count()
+    }
+
+    /// **本命の実測検証**: 実GPT-2 124M重みで、旧方式(独立閾値で6層中5層を
+    /// 一度に削除、CLAUDE.mdに記録した実測では明確な破綻を招いた)と
+    /// 新方式(連続ブロック探索で同じ5層削除を行うが、最良のブロックを
+    /// 選ぶ)を比較する。新方式は必ずしも劣化を完全に防ぐわけではない
+    /// (5/6層を消すという極端な設定である以上、大きな劣化は避けられない)
+    /// が、少なくとも「妥当な1つのブロックを選んだ結果」であることを
+    /// 示す——`--ignored`指定時のみ実行(実重みが必要なため)。
+    #[test]
+    #[ignore]
+    fn manual_compare_independent_threshold_vs_block_search_on_real_gpt2_weights() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/gpt2");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: no real GPT-2 weights");
+            return;
+        }
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let device: std::sync::Arc<dyn GpuDevice> = opencuda_cpu::CpuDevice::new(0);
+        let prompts: Vec<Vec<u32>> = ["The weather today is quite pleasant and sunny.", "In economics, supply and demand determine prices in a market.", "She walked into the kitchen and started making breakfast."]
+            .iter()
+            .map(|s| tokenizer.encode(s).unwrap())
+            .collect();
+        let sample_prompt = tokenizer.encode("The weather today is quite pleasant and sunny.").unwrap();
+
+        let uncompressed = GptModel::load(&dir).unwrap();
+        let baseline_output = uncompressed.generate(&device, &sample_prompt, 20).unwrap();
+        eprintln!("baseline (6 layers, no removal): {:?}", tokenizer.decode(&baseline_output).unwrap());
+
+        // 予算(削除する層数)を1・2・5と変えて、それぞれブロック探索の
+        // 結果を実測する。5(=6層中5層)は前回の独立閾値方式で明確な破綻を
+        // 招いた極端なケース、1・2はより現実的な軽度の削減。
+        for &n_remove in &[1usize, 2, 5] {
+            let mut model = GptModel::load(&dir).unwrap();
+            let candidate = model.find_best_layer_block_to_remove(&device, &prompts, n_remove).unwrap();
+            model.remove_layer_block(&candidate).unwrap();
+            let output = model.generate(&device, &sample_prompt, 20).unwrap();
+            let text = tokenizer.decode(&output).unwrap();
+            eprintln!(
+                "remove {n_remove} layer(s): candidate=(start={}, len={}, block_similarity={:.4}) -> output={text:?}",
+                candidate.start, candidate.len, candidate.block_similarity
+            );
+        }
     }
 }
 
