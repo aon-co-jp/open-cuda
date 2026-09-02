@@ -228,6 +228,63 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
 なし)。(2) より高性能な統合GPU(Adreno等)でのDirectX/Vulkan経路
 再実測は、このマシンにその種のGPUが無いため引き続き未検証。
 
+## HANDOFF追記(2026-09-02(続き)、FP8(E4M3/E5M2)量子化+演算パス、および tensor_f32 の全数値dtype対応 / Follow-up: FP8 quantization + compute path, plus full numeric-dtype loader)
+
+直前エントリ(F16/BF16/FP8 → f32 の**読み込み時変換**)に対しユーザーから
+「**FP8とF8演算カーネルを実装開発対応して**」「**対応外dtype(INT8/INT4)の
+エラーを修正して**」との追加要望。コミット `b9fae40`。
+
+### `opencuda-blas`: FP8 量子化 + 演算パス(INT4/INT6/INT8 と同じ枠組み)
+- `Fp8Format`(E4M3=1-4-3・バイアス7・**無限大なし**・最大正規448、
+  E5M2=1-5-2・バイアス15・IEEE類似・最大正規57344)。
+- `f8_e4m3_to_f32`/`f8_e5m2_to_f32`(OCP OFP8 準拠デコーダ、
+  `open-cuda-llm` のものをここへ正本化)、`f8_nearest`(全256コードの
+  線形探索による非一様丸めエンコーダ、NaN/inf コード除外)。
+- `QuantizedFp8Tensor`、`quantize_fp8_e4m3`/`quantize_fp8_e5m2`
+  (グループ単位スケール = `max_abs / fp8_max`、`launch_scale_kernel` で
+  `x/scale` をデバイスカーネル経由で計算し FP8 丸めのみホスト側
+  ——INT4 のニブルパッキングをホスト側で行うのと同じ役割分担)、
+  `dequantize_fp8`。
+- **`sgemm_fp8_weight`(FP8 演算カーネルの実体)**: FP8 量子化済み重み
+  `B` を dequant-on-the-fly で `A·dequant(B)` する GEMM。
+- **正直な開示**: GT730 に FP8 Tensor Core は無い(NVIDIA は
+  Hopper/Ada 以降)。したがってこれは「FP8 表現の重みを f32 へ復元して
+  から f32 で積和する」ソフトウェア実装で、利益は**重みメモリ 1/4**
+  であり演算速度ではない。DeepSeek-V3 が Hopper 上で得ている FP8 の
+  ネイティブ実行速度は再現しない。Hopper/Ada 実機なら
+  `select_gemm_path` からベンダー FP8 GEMM へ分岐する余地を残してある。
+
+### `open-cuda-llm`: 全数値dtypeローダー + `GptModel::enable_fp8_weights`
+- `tensor_f32` が F64 + BOOL/U8..U64/I8..I64 も **直接キャストで f32 へ**
+  読めるようになった(生の整数テンソル向け。scales/zeros を伴う
+  GPTQ/AWQ の**パック済み**量子化——別テンソルの scales/zeros を
+  必要とし単一 dtype だけでは復元できない——とは別物で、そちらの
+  自動対応は範囲外)。「対応外エラー」は**本当に未知の dtype のみ**へ。
+- `Linear` に `fp8_weight: Option<QuantizedFp8Tensor>` + `quantize_to_fp8`、
+  `GptModel::enable_fp8_weights(device, format)`(opt-in、全 Linear を
+  FP8 化し `forward` が `sgemm_fp8_weight` を通る)。既定 f32 のまま
+  (後方互換)。品質は FP8 量子化誤差(E4M3 で相対 ~2^-3)ぶん劣化する
+  ——`enable_mla_kv_compression` 等と同じく「配線が正しく動く + メモリ
+  削減」の実証で「品質維持」は主張しない。
+
+### 検証
+`cargo test -p opencuda-blas --release --lib` **42 passed / 1 ignored**
+(FP8 新規5: OCP既知値・E4M3のnarrow-range精度優位・全ゼロ・
+`sgemm_fp8_weight` が f32 sgemm と FP8 許容誤差内一致・shape mismatch 拒否)。
+`cargo test -p open-cuda-llm --release -- --test-threads=1`
+**43 passed / 7 ignored**(新規3: I8 直接キャスト・FP8 E4M3/E5M2 での
+`generate` 完走・FP8 往復誤差の上限)。`cargo clippy -p open-cuda-llm
+-p opencuda-blas --release --all-targets -- -D warnings` **警告0件**。
+`cargo build --workspace --release` 成功。`aruaru-llm` 側で
+`ARUARU_LLM_ENABLE_FP8_WEIGHTS=e4m3` の opt-in 配線 + 実 HTTP E2E
+(distilgpt2 でサーバー起動 → 配線ログ発火 → `/v1/generate` がコヒーレントな
+英文を生成、f32 版と僅かに異なる継続 = FP8 が実際に効いている)を確認済み
+(詳細は `aruaru-llm/CLAUDE.md` 同日エントリ)。
+
+**残課題**: Hopper/Ada 実機での `select_gemm_path` からのベンダー FP8
+GEMM 分岐。パック済み量子化(GPTQ/AWQ、scales/zeros 別テンソル)の
+自動検出ロード。
+
 ## HANDOFF追記(2026-09-02、safetensorsローダーを F16/BF16/FP8(E4M3/E5M2)対応へ拡張 — 対話FT済みGPT-2互換モデルのロードを可能に / Follow-up: safetensors loader now converts F16/BF16/FP8 to f32)
 
 `GptModel::load` の `tensor_f32` を、従来の F32 のみから
