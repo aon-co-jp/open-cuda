@@ -84,10 +84,45 @@ struct GPT2Config {
     n_positions: Option<usize>,
     #[serde(default = "default_gpt2_eps")]
     layer_norm_epsilon: f32,
+    /// GPTQ 等の整数量子化モデルの `config.json` に含まれる
+    /// `quantization_config` ブロック(無ければ `None` = 非量子化 f32/f16 等)。
+    #[serde(default)]
+    quantization_config: Option<QuantizationConfig>,
+}
+
+/// `config.json` の `quantization_config`(AutoGPTQ / GPTQ-for-LLaMa 形式)。
+/// AWQ(パック順が interleave で異なる)は今回未対応——`quant_method` が
+/// `"awq"` の場合はロード時に正直なエラーを返す。
+#[derive(Debug, Clone, Deserialize)]
+struct QuantizationConfig {
+    /// 量子化ビット数(4 または 8)。
+    bits: u32,
+    /// グループ単位スケールのグループサイズ(-1 = チャネル全体で1グループ)。
+    #[serde(default = "default_gptq_group_size")]
+    group_size: i64,
+    /// 量子化方式。既定 `"gptq"`。
+    #[serde(default = "default_quant_method")]
+    quant_method: String,
+    /// activation-order(desc_act)。true なら `g_idx` テンソルで
+    /// 各入力チャネルの所属グループが決まる。
+    #[serde(default)]
+    desc_act: bool,
+    /// GPTQ の zero-point に +1 するかどうか(AutoGPTQ v1 は true)。
+    #[serde(default = "default_true")]
+    sym_zero_plus_one: bool,
 }
 
 fn default_gpt2_eps() -> f32 {
     1e-5
+}
+fn default_gptq_group_size() -> i64 {
+    128
+}
+fn default_quant_method() -> String {
+    "gptq".to_string()
+}
+fn default_true() -> bool {
+    true
 }
 
 impl GPT2Config {
@@ -280,6 +315,126 @@ fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
     );
     let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
     Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+}
+
+/// ビットパック済み整数テンソル(GPTQ の `qweight`/`qzeros`、I32/U32)を
+/// 生の `u32` 列として読む。`tensor_f32` は f32 へキャストするため 2²⁴ を
+/// 超える値のビットが化ける——量子化のパック展開には生ビットが要る。
+fn tensor_u32_raw(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<u32>> {
+    let view = tensors.tensor(name).with_context(|| format!("open-cuda-llm: missing tensor '{name}'"))?;
+    let bytes = view.data();
+    match view.dtype() {
+        safetensors::Dtype::I32 | safetensors::Dtype::U32 => {
+            anyhow::ensure!(bytes.len() % 4 == 0, "open-cuda-llm: '{name}' byte length {} not a multiple of 4", bytes.len());
+            Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        }
+        other => anyhow::bail!("open-cuda-llm: packed quant tensor '{name}' must be I32/U32, got {other:?}"),
+    }
+}
+
+/// GPTQ(AutoGPTQ / GPTQ-for-LLaMa 形式)の量子化済み `Conv1D` 重みを
+/// 逆量子化して `Linear` を組み立てる。
+///
+/// レイアウト(GPT-2 の `Conv1D` は `[in_dim, out_dim]`、転置不要):
+/// - `{prefix}.qweight`: `I32 [in_dim / pack, out_dim]`。dim0 方向に
+///   `pack = 32/bits` 個の量子化値を1つの `i32` へ詰める。
+/// - `{prefix}.scales` : `F16/F32 [in_dim / group_size, out_dim]`。
+/// - `{prefix}.qzeros` : `I32 [in_dim / group_size, out_dim / pack]`。
+///   out 方向に `pack` 個の zero-point を詰める。
+/// - `{prefix}.g_idx`  : `I32 [in_dim]`(`desc_act` 時のみ意味を持つ。
+///   各入力チャネルの所属グループ)。無ければ `i / group_size`。
+/// - `{prefix}.bias`   : `F16/F32 [out_dim]`(省略可、無ければ 0)。
+///
+/// 逆量子化: `w[i,o] = (q[i,o] - zero[grp(i),o]) * scale[grp(i),o]`
+/// (AutoGPTQ v1 は zero に +1 する ⇒ `sym_zero_plus_one`)。
+fn load_conv1d_gptq(
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+    in_dim: usize,
+    out_dim: usize,
+    qc: &QuantizationConfig,
+) -> Result<Linear> {
+    anyhow::ensure!(
+        qc.quant_method.eq_ignore_ascii_case("gptq"),
+        "open-cuda-llm: quantization_config.quant_method={:?} is not supported (only 'gptq'; AWQ uses a different pack order)",
+        qc.quant_method
+    );
+    anyhow::ensure!(qc.bits == 4 || qc.bits == 8, "open-cuda-llm: GPTQ bits must be 4 or 8, got {}", qc.bits);
+    let bits = qc.bits as usize;
+    let pack = 32 / bits; // 8 (4bit) or 4 (8bit)
+    let mask: u32 = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    let group_size: usize = if qc.group_size <= 0 { in_dim } else { qc.group_size as usize };
+    let num_groups = in_dim.div_ceil(group_size);
+
+    let qweight = tensor_u32_raw(tensors, &format!("{prefix}.qweight"))?;
+    let qzeros = tensor_u32_raw(tensors, &format!("{prefix}.qzeros"))?;
+    let scales = tensor_f32(tensors, &format!("{prefix}.scales"))?;
+    anyhow::ensure!(
+        qweight.len() == (in_dim / pack) * out_dim,
+        "open-cuda-llm: '{prefix}.qweight' has {} elements, expected {}x{}",
+        qweight.len(), in_dim / pack, out_dim
+    );
+    anyhow::ensure!(
+        scales.len() == num_groups * out_dim,
+        "open-cuda-llm: '{prefix}.scales' has {} elements, expected {}x{}",
+        scales.len(), num_groups, out_dim
+    );
+    anyhow::ensure!(
+        qzeros.len() == num_groups * (out_dim / pack),
+        "open-cuda-llm: '{prefix}.qzeros' has {} elements, expected {}x{}",
+        qzeros.len(), num_groups, out_dim / pack
+    );
+
+    // desc_act 時の g_idx。無ければ均等グループ分け。
+    let g_idx: Option<Vec<u32>> = if qc.desc_act {
+        tensor_u32_raw(tensors, &format!("{prefix}.g_idx")).ok()
+    } else {
+        None
+    };
+    let group_of = |i: usize| -> usize {
+        match &g_idx {
+            Some(gi) if i < gi.len() => gi[i] as usize,
+            _ => (i / group_size).min(num_groups - 1),
+        }
+    };
+
+    let zero_bump: u32 = if qc.sym_zero_plus_one { 1 } else { 0 };
+    let qz_cols = out_dim / pack;
+    let mut weight_t = vec![0.0f32; in_dim * out_dim];
+    for i in 0..in_dim {
+        let qw_row = i / pack;
+        let qw_shift = (i % pack) * bits;
+        let grp = group_of(i);
+        for o in 0..out_dim {
+            let q = (qweight[qw_row * out_dim + o] >> qw_shift) & mask;
+            let qz_word = qzeros[grp * qz_cols + (o / pack)];
+            let qz = ((qz_word >> ((o % pack) * bits)) & mask).wrapping_add(zero_bump);
+            let scale = scales[grp * out_dim + o];
+            weight_t[i * out_dim + o] = (q as f32 - qz as f32) * scale;
+        }
+    }
+
+    let bias = tensor_f32(tensors, &format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0f32; out_dim]);
+    anyhow::ensure!(
+        bias.len() == out_dim,
+        "open-cuda-llm: '{prefix}.bias' has {} elements, expected {out_dim}",
+        bias.len()
+    );
+    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+}
+
+/// `quantization_config` の有無で GPTQ 逆量子化ロードか通常ロードかを選ぶ。
+fn load_conv1d_maybe_quant(
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+    in_dim: usize,
+    out_dim: usize,
+    qc: Option<&QuantizationConfig>,
+) -> Result<Linear> {
+    match qc {
+        Some(qc) => load_conv1d_gptq(tensors, prefix, in_dim, out_dim, qc),
+        None => load_conv1d(tensors, prefix, in_dim, out_dim),
+    }
 }
 
 // **2026-08-04変更**: GPT-2はQ/K/Vを1本の`c_attn`(`[hidden, 3*hidden]`)へ
@@ -1203,6 +1358,16 @@ impl GptModel {
         let config_json = std::fs::read_to_string(dir.join("config.json"))
             .with_context(|| format!("open-cuda-llm: failed to read config.json in {dir:?}"))?;
         let raw_config: GPT2Config = serde_json::from_str(&config_json).context("open-cuda-llm: failed to parse config.json")?;
+        // GPTQ 等の整数量子化ブロック(あれば `Conv1D` 重みは
+        // `.qweight`/`.scales`/`.qzeros` から逆量子化してロードする)。
+        let quant: Option<QuantizationConfig> = raw_config.quantization_config.clone();
+        if let Some(qc) = &quant {
+            tracing::info!(
+                "open-cuda-llm: config.json has quantization_config (method={}, bits={}, group_size={}); \
+                 dequantizing Conv1D weights at load time",
+                qc.quant_method, qc.bits, qc.group_size
+            );
+        }
         let config = raw_config.into_gpt_config()?;
 
         let weights_bytes = std::fs::read(dir.join("model.safetensors"))
@@ -1247,14 +1412,14 @@ impl GptModel {
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
             let p = format!("{key_prefix}h.{i}");
-            let qkv = load_conv1d(&tensors, &format!("{p}.attn.c_attn"), hidden, 3 * hidden)?;
+            let qkv = load_conv1d_maybe_quant(&tensors, &format!("{p}.attn.c_attn"), hidden, 3 * hidden, quant.as_ref())?;
             layers.push(DecoderLayer {
                 ln_1: load_layer_norm(&tensors, &format!("{p}.ln_1"), config.layer_norm_eps)?,
                 qkv,
-                attn_out: load_conv1d(&tensors, &format!("{p}.attn.c_proj"), hidden, hidden)?,
+                attn_out: load_conv1d_maybe_quant(&tensors, &format!("{p}.attn.c_proj"), hidden, hidden, quant.as_ref())?,
                 ln_2: load_layer_norm(&tensors, &format!("{p}.ln_2"), config.layer_norm_eps)?,
-                intermediate: load_conv1d(&tensors, &format!("{p}.mlp.c_fc"), hidden, config.intermediate_size)?,
-                output: load_conv1d(&tensors, &format!("{p}.mlp.c_proj"), config.intermediate_size, hidden)?,
+                intermediate: load_conv1d_maybe_quant(&tensors, &format!("{p}.mlp.c_fc"), hidden, config.intermediate_size, quant.as_ref())?,
+                output: load_conv1d_maybe_quant(&tensors, &format!("{p}.mlp.c_proj"), config.intermediate_size, hidden, quant.as_ref())?,
                 mla: None,
                 skip_attention: false,
             });
@@ -2894,6 +3059,95 @@ mod tests {
         let out = tensor_f32(&st, "transformer.wte.weight").unwrap();
         assert_eq!(out, vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0]);
         let _ = ones8; // 未使用回避
+    }
+
+    /// **2026-09-02新設**: GPTQ(4bit)量子化済み `Conv1D` 重みを
+    /// `load_conv1d_gptq` が正しく逆量子化すること。`w = (q - zero) * scale`
+    /// という定義から合成し、ロード結果が厳密一致することを確認する。
+    #[test]
+    fn load_conv1d_gptq_dequantizes_a_synthetic_4bit_tensor_exactly() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use std::collections::HashMap;
+
+        let (in_dim, out_dim, bits) = (16usize, 8usize, 4usize);
+        let pack = 32 / bits; // 8
+        let group_size = 16usize; // 1 グループ
+        // 決定的な q / zero / scale。
+        let q = |i: usize, o: usize| -> u32 { ((i * 3 + o * 5) % 16) as u32 };
+        let zero = |o: usize| -> u32 { (1 + o % 14) as u32 }; // 1..=14
+        let scale = |o: usize| -> f32 { 0.01 * (o as f32 + 1.0) };
+
+        // 期待する f32 重み。
+        let mut expected = vec![0.0f32; in_dim * out_dim];
+        for i in 0..in_dim {
+            for o in 0..out_dim {
+                expected[i * out_dim + o] = (q(i, o) as f32 - zero(o) as f32) * scale(o);
+            }
+        }
+
+        // qweight: [in_dim/pack, out_dim] の i32、dim0 方向に pack 個詰める。
+        let mut qweight = vec![0u32; (in_dim / pack) * out_dim];
+        for i in 0..in_dim {
+            for o in 0..out_dim {
+                let row = i / pack;
+                let shift = (i % pack) * bits;
+                qweight[row * out_dim + o] |= (q(i, o) & 0xF) << shift;
+            }
+        }
+        // qzeros: [1, out_dim/pack] の i32。sym_zero_plus_one なので (zero-1) を格納。
+        let mut qzeros = vec![0u32; out_dim / pack];
+        for o in 0..out_dim {
+            let shift = (o % pack) * bits;
+            qzeros[o / pack] |= ((zero(o) - 1) & 0xF) << shift;
+        }
+        // scales: [1, out_dim] の f32。
+        let scales: Vec<f32> = (0..out_dim).map(scale).collect();
+
+        let to_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let scales_bytes: Vec<u8> = scales.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let qw_b = to_bytes(&qweight);
+        let qz_b = to_bytes(&qzeros);
+
+        let mut views: HashMap<String, TensorView> = HashMap::new();
+        views.insert("h.0.attn.c_attn.qweight".into(), TensorView::new(Dtype::I32, vec![in_dim / pack, out_dim], &qw_b).unwrap());
+        views.insert("h.0.attn.c_attn.qzeros".into(), TensorView::new(Dtype::I32, vec![1, out_dim / pack], &qz_b).unwrap());
+        views.insert("h.0.attn.c_attn.scales".into(), TensorView::new(Dtype::F32, vec![1, out_dim], &scales_bytes).unwrap());
+        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
+
+        let qc = QuantizationConfig {
+            bits: bits as u32,
+            group_size: group_size as i64,
+            quant_method: "gptq".into(),
+            desc_act: false,
+            sym_zero_plus_one: true,
+        };
+        let lin = load_conv1d_gptq(&st, "h.0.attn.c_attn", in_dim, out_dim, &qc).unwrap();
+        assert_eq!(lin.weight_t.len(), in_dim * out_dim);
+        for (idx, (&got, &exp)) in lin.weight_t.iter().zip(&expected).enumerate() {
+            assert!((got - exp).abs() < 1e-6, "idx {idx}: got {got}, expected {exp}");
+        }
+        assert_eq!(lin.bias, vec![0.0f32; out_dim], "missing bias defaults to zeros");
+    }
+
+    /// AWQ(パック順が異なる)は正直なエラーを返すこと。
+    #[test]
+    fn load_conv1d_gptq_rejects_awq_method() {
+        let empty: std::collections::HashMap<String, safetensors::tensor::TensorView> = std::collections::HashMap::new();
+        let serialized = safetensors::serialize(&empty, &None).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
+        let qc = QuantizationConfig {
+            bits: 4,
+            group_size: 128,
+            quant_method: "awq".into(),
+            desc_act: false,
+            sym_zero_plus_one: true,
+        };
+        let err = match load_conv1d_gptq(&st, "h.0.attn.c_attn", 16, 8, &qc) {
+            Ok(_) => panic!("expected AWQ to be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("awq") || err.contains("AWQ"), "unexpected error: {err}");
     }
 
     /// 実GPT-2(124M、`openai-community/gpt2`のsafetensors)がこのマシンに
