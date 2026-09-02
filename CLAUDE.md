@@ -254,12 +254,22 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
   ネイティブ実行速度は再現しない。Hopper/Ada 実機なら
   `select_gemm_path` からベンダー FP8 GEMM へ分岐する余地を残してある。
 
-### `open-cuda-llm`: 全数値dtypeローダー + `GptModel::enable_fp8_weights`
+### `open-cuda-llm`: 全数値dtypeローダー + GPTQ 逆量子化ロード + `GptModel::enable_fp8_weights`
 - `tensor_f32` が F64 + BOOL/U8..U64/I8..I64 も **直接キャストで f32 へ**
-  読めるようになった(生の整数テンソル向け。scales/zeros を伴う
-  GPTQ/AWQ の**パック済み**量子化——別テンソルの scales/zeros を
-  必要とし単一 dtype だけでは復元できない——とは別物で、そちらの
-  自動対応は範囲外)。「対応外エラー」は**本当に未知の dtype のみ**へ。
+  読めるようになった(生の整数テンソル向け)。「対応外エラー」は
+  **本当に未知の dtype のみ**へ。
+- **GPTQ(AutoGPTQ / GPTQ-for-LLaMa 形式)の INT4/INT8 パック済み量子化を
+  逆量子化ロード**(ユーザー追加要望「対応外dtype(INT8/INT4)は正直な
+  エラー。対応して」への対応):`config.json` の `quantization_config`
+  (`bits`/`group_size`/`quant_method`/`desc_act`)を自動検出し、`Conv1D`
+  重みを `{prefix}.weight` ではなく `{prefix}.qweight`(I32 ビットパック)+
+  `.scales` + `.qzeros`(+ `desc_act` 時は `.g_idx`)から
+  `w[i,o] = (q - (zero+1)) * scale` で復元して `weight_t`(f32)へ。
+  4bit は 8値/i32、8bit は 4値/i32。`tensor_u32_raw`(f32 キャストせず
+  生ビットを読む)+ `load_conv1d_gptq` + `load_conv1d_maybe_quant`。
+  **AWQ(パック順が interleave で異なる)は `quant_method="awq"` を
+  正直なエラーで拒否**——今回は GPTQ 標準レイアウトのみ。合成 4bit
+  テンソルの厳密一致テスト + AWQ 拒否テスト。
 - `Linear` に `fp8_weight: Option<QuantizedFp8Tensor>` + `quantize_to_fp8`、
   `GptModel::enable_fp8_weights(device, format)`(opt-in、全 Linear を
   FP8 化し `forward` が `sgemm_fp8_weight` を通る)。既定 f32 のまま
@@ -272,8 +282,9 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
 (FP8 新規5: OCP既知値・E4M3のnarrow-range精度優位・全ゼロ・
 `sgemm_fp8_weight` が f32 sgemm と FP8 許容誤差内一致・shape mismatch 拒否)。
 `cargo test -p open-cuda-llm --release -- --test-threads=1`
-**43 passed / 7 ignored**(新規3: I8 直接キャスト・FP8 E4M3/E5M2 での
-`generate` 完走・FP8 往復誤差の上限)。`cargo clippy -p open-cuda-llm
+**45 passed / 7 ignored**(新規5: I8 直接キャスト・FP8 E4M3/E5M2 での
+`generate` 完走・FP8 往復誤差の上限・GPTQ 4bit 合成テンソルの厳密
+逆量子化・AWQ 拒否)。`cargo clippy -p open-cuda-llm
 -p opencuda-blas --release --all-targets -- -D warnings` **警告0件**。
 `cargo build --workspace --release` 成功。`aruaru-llm` 側で
 `ARUARU_LLM_ENABLE_FP8_WEIGHTS=e4m3` の opt-in 配線 + 実 HTTP E2E
@@ -282,8 +293,8 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
 (詳細は `aruaru-llm/CLAUDE.md` 同日エントリ)。
 
 **残課題**: Hopper/Ada 実機での `select_gemm_path` からのベンダー FP8
-GEMM 分岐。パック済み量子化(GPTQ/AWQ、scales/zeros 別テンソル)の
-自動検出ロード。
+GEMM 分岐。AWQ(interleave パック)の逆量子化ロード。GPTQ を
+逆量子化せず 4bit のまま GEMM する専用カーネル(現状は f32 へ展開)。
 
 ## HANDOFF追記(2026-09-02、safetensorsローダーを F16/BF16/FP8(E4M3/E5M2)対応へ拡張 — 対話FT済みGPT-2互換モデルのロードを可能に / Follow-up: safetensors loader now converts F16/BF16/FP8 to f32)
 
