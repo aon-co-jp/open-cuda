@@ -423,7 +423,84 @@ fn load_conv1d_gptq(
     Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
 }
 
-/// `quantization_config` の有無で GPTQ 逆量子化ロードか通常ロードかを選ぶ。
+/// AWQ(Activation-aware Weight Quantization、AutoAWQ / vLLM 形式)の
+/// INT4 パック済み `Conv1D` 重みを逆量子化してロードする。
+///
+/// GPTQ との違い:
+/// - `{prefix}.qweight` : `I32 [in_dim, out_dim / pack]`(GPTQ は
+///   `[in_dim / pack, out_dim]`。**out 方向にパックし、行は in そのまま**)。
+/// - `{prefix}.qzeros`  : `I32 [in_dim / group_size, out_dim / pack]`。
+/// - `{prefix}.scales`  : `F16/F32 [in_dim / group_size, out_dim]`。
+/// - **ニブルの並びが interleave**: pack 内の論理列 `c`(0..pack)は、
+///   ビット位置 `AWQ_ORDER[c] * bits` に格納される
+///   (4bit の `AWQ_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]`)。
+/// - zero-point は実値をそのまま格納(GPTQ の `+1` バンプは無い)。
+///
+/// 逆量子化: `w[i,o] = (q[i,o] - z[grp(i),o]) * scale[grp(i),o]`
+fn load_conv1d_awq(
+    tensors: &safetensors::SafeTensors,
+    prefix: &str,
+    in_dim: usize,
+    out_dim: usize,
+    qc: &QuantizationConfig,
+) -> Result<Linear> {
+    anyhow::ensure!(qc.bits == 4, "open-cuda-llm: AWQ support is INT4 only, got {} bits", qc.bits);
+    anyhow::ensure!(
+        !qc.desc_act,
+        "open-cuda-llm: AWQ with desc_act/g_idx is not supported"
+    );
+    let bits = qc.bits as usize;
+    let pack = 32 / bits; // 8
+    // 4bit AWQ の interleave 並び。論理列 c は AWQ_ORDER[c] 番目のニブルへ。
+    const AWQ_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    let mask: u32 = (1u32 << bits) - 1;
+    let group_size: usize = if qc.group_size <= 0 { in_dim } else { qc.group_size as usize };
+    let num_groups = in_dim.div_ceil(group_size);
+    let packed_out = out_dim / pack;
+
+    let qweight = tensor_u32_raw(tensors, &format!("{prefix}.qweight"))?;
+    let qzeros = tensor_u32_raw(tensors, &format!("{prefix}.qzeros"))?;
+    let scales = tensor_f32(tensors, &format!("{prefix}.scales"))?;
+    anyhow::ensure!(
+        qweight.len() == in_dim * packed_out,
+        "open-cuda-llm: '{prefix}.qweight' has {} elements, expected {}x{} (AWQ layout)",
+        qweight.len(), in_dim, packed_out
+    );
+    anyhow::ensure!(
+        scales.len() == num_groups * out_dim,
+        "open-cuda-llm: '{prefix}.scales' has {} elements, expected {}x{}",
+        scales.len(), num_groups, out_dim
+    );
+    anyhow::ensure!(
+        qzeros.len() == num_groups * packed_out,
+        "open-cuda-llm: '{prefix}.qzeros' has {} elements, expected {}x{}",
+        qzeros.len(), num_groups, packed_out
+    );
+
+    let mut weight_t = vec![0.0f32; in_dim * out_dim];
+    for i in 0..in_dim {
+        let grp = (i / group_size).min(num_groups - 1);
+        for o in 0..out_dim {
+            let pcol = o / pack;
+            let shift = AWQ_ORDER[o % pack] * bits;
+            let q = (qweight[i * packed_out + pcol] >> shift) & mask;
+            let z = (qzeros[grp * packed_out + pcol] >> shift) & mask;
+            let scale = scales[grp * out_dim + o];
+            weight_t[i * out_dim + o] = (q as f32 - z as f32) * scale;
+        }
+    }
+
+    let bias = tensor_f32(tensors, &format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0f32; out_dim]);
+    anyhow::ensure!(
+        bias.len() == out_dim,
+        "open-cuda-llm: '{prefix}.bias' has {} elements, expected {out_dim}",
+        bias.len()
+    );
+    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+}
+
+/// `quantization_config` の有無・方式で GPTQ / AWQ 逆量子化ロードか
+/// 通常ロードかを選ぶ。
 fn load_conv1d_maybe_quant(
     tensors: &safetensors::SafeTensors,
     prefix: &str,
@@ -432,6 +509,9 @@ fn load_conv1d_maybe_quant(
     qc: Option<&QuantizationConfig>,
 ) -> Result<Linear> {
     match qc {
+        Some(qc) if qc.quant_method.eq_ignore_ascii_case("awq") => {
+            load_conv1d_awq(tensors, prefix, in_dim, out_dim, qc)
+        }
         Some(qc) => load_conv1d_gptq(tensors, prefix, in_dim, out_dim, qc),
         None => load_conv1d(tensors, prefix, in_dim, out_dim),
     }
@@ -3130,7 +3210,89 @@ mod tests {
         assert_eq!(lin.bias, vec![0.0f32; out_dim], "missing bias defaults to zeros");
     }
 
-    /// AWQ(パック順が異なる)は正直なエラーを返すこと。
+    /// **2026-09-02新設**: AWQ(INT4、interleave パック)量子化済み
+    /// `Conv1D` 重みを `load_conv1d_awq` が正しく逆量子化すること。
+    /// `w = (q - z) * scale`、ニブルは `AWQ_ORDER = [0,2,4,6,1,3,5,7]`。
+    #[test]
+    fn load_conv1d_awq_dequantizes_a_synthetic_interleaved_4bit_tensor_exactly() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use std::collections::HashMap;
+
+        const AWQ_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+        let (in_dim, out_dim, bits) = (16usize, 8usize, 4usize);
+        let pack = 32 / bits; // 8
+        let group_size = 8usize; // 2 グループ
+        let num_groups = in_dim / group_size;
+        let packed_out = out_dim / pack; // 1
+
+        let q = |i: usize, o: usize| -> u32 { ((i * 7 + o * 3) % 16) as u32 };
+        let zero = |g: usize, o: usize| -> u32 { ((g * 2 + o) % 16) as u32 };
+        let scale = |g: usize, o: usize| -> f32 { 0.005 * ((g * out_dim + o) as f32 + 1.0) };
+
+        let mut expected = vec![0.0f32; in_dim * out_dim];
+        for i in 0..in_dim {
+            let g = i / group_size;
+            for o in 0..out_dim {
+                expected[i * out_dim + o] = (q(i, o) as f32 - zero(g, o) as f32) * scale(g, o);
+            }
+        }
+
+        // qweight: [in_dim, out_dim/pack]、論理列 o は AWQ_ORDER[o%pack] 番目のニブル。
+        let mut qweight = vec![0u32; in_dim * packed_out];
+        for i in 0..in_dim {
+            for o in 0..out_dim {
+                let shift = AWQ_ORDER[o % pack] * bits;
+                qweight[i * packed_out + o / pack] |= (q(i, o) & 0xF) << shift;
+            }
+        }
+        // qzeros: [num_groups, out_dim/pack]、同じ interleave。実値をそのまま格納。
+        let mut qzeros = vec![0u32; num_groups * packed_out];
+        for g in 0..num_groups {
+            for o in 0..out_dim {
+                let shift = AWQ_ORDER[o % pack] * bits;
+                qzeros[g * packed_out + o / pack] |= (zero(g, o) & 0xF) << shift;
+            }
+        }
+        // scales: [num_groups, out_dim]。
+        let mut scales = vec![0.0f32; num_groups * out_dim];
+        for g in 0..num_groups {
+            for o in 0..out_dim {
+                scales[g * out_dim + o] = scale(g, o);
+            }
+        }
+
+        let to_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let qw_b = to_bytes(&qweight);
+        let qz_b = to_bytes(&qzeros);
+        let sc_b: Vec<u8> = scales.iter().flat_map(|x| x.to_le_bytes()).collect();
+
+        let mut views: HashMap<String, TensorView> = HashMap::new();
+        views.insert("h.0.attn.c_attn.qweight".into(), TensorView::new(Dtype::I32, vec![in_dim, packed_out], &qw_b).unwrap());
+        views.insert("h.0.attn.c_attn.qzeros".into(), TensorView::new(Dtype::I32, vec![num_groups, packed_out], &qz_b).unwrap());
+        views.insert("h.0.attn.c_attn.scales".into(), TensorView::new(Dtype::F32, vec![num_groups, out_dim], &sc_b).unwrap());
+        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
+
+        let qc = QuantizationConfig {
+            bits: bits as u32,
+            group_size: group_size as i64,
+            quant_method: "awq".into(),
+            desc_act: false,
+            sym_zero_plus_one: true,
+        };
+        let lin = load_conv1d_awq(&st, "h.0.attn.c_attn", in_dim, out_dim, &qc).unwrap();
+        assert_eq!(lin.weight_t.len(), in_dim * out_dim);
+        for (idx, (&got, &exp)) in lin.weight_t.iter().zip(&expected).enumerate() {
+            assert!((got - exp).abs() < 1e-6, "idx {idx}: got {got}, expected {exp}");
+        }
+
+        // load_conv1d_maybe_quant が quant_method="awq" で AWQ 経路を選ぶこと。
+        let lin2 = load_conv1d_maybe_quant(&st, "h.0.attn.c_attn", in_dim, out_dim, Some(&qc)).unwrap();
+        assert_eq!(lin2.weight_t, lin.weight_t);
+    }
+
+    /// AWQ(パック順が異なる)は `load_conv1d_gptq` からは正直なエラーを返すこと
+    /// (AWQ 対応は `load_conv1d_awq` / `load_conv1d_maybe_quant` 経由)。
     #[test]
     fn load_conv1d_gptq_rejects_awq_method() {
         let empty: std::collections::HashMap<String, safetensors::tensor::TensorView> = std::collections::HashMap::new();
