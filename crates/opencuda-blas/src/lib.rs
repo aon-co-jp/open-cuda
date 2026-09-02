@@ -1185,6 +1185,255 @@ pub fn dequantize_int6(t: &QuantizedInt6Tensor) -> Vec<f32> {
         .collect()
 }
 
+// ===========================================================================
+// FP8 (E4M3 / E5M2) 量子化 + 演算パス
+// ---------------------------------------------------------------------------
+// 2026-09-02: 従来 `open-cuda-llm` のローダーは FP8 safetensors を「読み込み
+// 時に f32 へ展開する」だけで、**推論は常に f32** だった(配布フォーマット
+// 拡張)。ここでは INT4/INT6/INT8 量子化と同じ枠組みで、
+// (1) グループ単位スケール + OCP 仕様の FP8 コードへの丸めによる量子化 API、
+// (2) 量子化済み重み `B` を dequant-on-the-fly で掛ける GEMM
+//     (`sgemm_fp8_weight`)——これが「FP8 演算カーネル」の実体、
+// を提供する。
+//
+// **正直な開示(誇張しない)**: この開発機(NVIDIA GT730、Kepler 世代)には
+// FP8 をネイティブに扱う Tensor Core が無い(NVIDIA では Hopper/Ada 以降)。
+// したがって `sgemm_fp8_weight` は「FP8 表現の重みを f32 へ復元してから
+// f32 で積和する」ソフトウェア実装であり、得られる利益は**演算速度ではなく
+// 重みメモリの削減**(1要素1バイト、f32 の 1/4)。DeepSeek-V3 が Hopper 上で
+// 得ている FP8 演算のネイティブ実行速度は再現しない。Hopper/Ada 実機が
+// 得られた場合に `select_gemm_path` からベンダー FP8 GEMM へ分岐する余地を
+// 残す設計にしてある。
+// ===========================================================================
+
+/// FP8 のビットレイアウト。OCP 8-bit Floating Point Specification (OFP8) 準拠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8Format {
+    /// 1-4-3。指数バイアス 7、**無限大なし**、NaN は `S.1111.111` のみ、
+    /// 最大正規値 448.0。ダイナミックレンジは狭いが仮数が1bit多く精度が高い。
+    E4M3,
+    /// 1-5-2。指数バイアス 15、IEEE 類似(指数全1で inf/NaN)、
+    /// 最大正規値 57344.0。仮数は少ないがダイナミックレンジが広い。
+    E5M2,
+}
+
+impl Fp8Format {
+    /// このフォーマットで表現できる最大の有限正規値。量子化スケールの
+    /// 基準(`max_abs / fp8_max`)に使う。
+    pub fn max_normal(self) -> f32 {
+        match self {
+            Fp8Format::E4M3 => 448.0,
+            Fp8Format::E5M2 => 57344.0,
+        }
+    }
+}
+
+/// FP8 E4M3 の1バイトを f32 へ復号(OCP OFP8 準拠)。
+pub fn f8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (b >> 3) & 0x0f;
+    let mant = b & 0x07;
+    let val = if exp == 0 {
+        // subnormal: 指数 -6、暗黙ビットなし
+        (mant as f32) * 2f32.powi(-9)
+    } else if exp == 0x0f && mant == 0x07 {
+        return f32::NAN; // E4M3 の唯一の NaN、無限大は無い
+    } else {
+        (1.0 + (mant as f32) / 8.0) * 2f32.powi(exp as i32 - 7)
+    };
+    sign * val
+}
+
+/// FP8 E5M2 の1バイトを f32 へ復号(OCP OFP8 準拠、IEEE 類似)。
+pub fn f8_e5m2_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (b >> 2) & 0x1f;
+    let mant = b & 0x03;
+    if exp == 0x1f {
+        return if mant == 0 { sign * f32::INFINITY } else { f32::NAN };
+    }
+    let val = if exp == 0 {
+        (mant as f32) * 2f32.powi(-16)
+    } else {
+        (1.0 + (mant as f32) / 4.0) * 2f32.powi(exp as i32 - 15)
+    };
+    sign * val
+}
+
+fn f8_to_f32(b: u8, fmt: Fp8Format) -> f32 {
+    match fmt {
+        Fp8Format::E4M3 => f8_e4m3_to_f32(b),
+        Fp8Format::E5M2 => f8_e5m2_to_f32(b),
+    }
+}
+
+/// 全 256 コードのうち `v` に最も近い有限 FP8 コードを返す(総当たり)。
+/// 量子化は一度きりの前処理のため、非一様な丸めをコード表の線形探索で
+/// 正確に行う(対称クランプの `launch_quantize_kernel` は流用できない)。
+/// NaN / ±inf コードは候補から除外する。
+fn f8_nearest(v: f32, fmt: Fp8Format) -> u8 {
+    if v == 0.0 {
+        return 0; // 符号付きゼロは +0 に丸める
+    }
+    let mut best = 0u8;
+    let mut best_err = f32::INFINITY;
+    for code in 0u16..256 {
+        let code = code as u8;
+        let d = f8_to_f32(code, fmt);
+        if !d.is_finite() {
+            continue;
+        }
+        let err = (d - v).abs();
+        if err < best_err {
+            best_err = err;
+            best = code;
+        }
+    }
+    best
+}
+
+/// FP8 量子化済みテンソル(グループ単位スケール + 1バイト/値の FP8 コード)。
+/// `dequant = f8_to_f32(byte, format) * scale`。
+#[derive(Debug, Clone)]
+pub struct QuantizedFp8Tensor {
+    pub data: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub group_size: usize,
+    pub len: usize,
+    pub format: Fp8Format,
+}
+
+fn quantize_fp8(
+    device: &dyn GpuDevice,
+    input: &[f32],
+    group_size: usize,
+    format: Fp8Format,
+) -> Result<QuantizedFp8Tensor> {
+    validate_quantize_args(input, group_size)?;
+    // スケール計算は既存カーネルと同じくデバイス経由の実カーネル
+    // ディスパッチ(`x/scale` を f32 バッファへ)で行い、非一様な FP8 丸めの
+    // みホスト側で行う——INT4 のニブルパッキングをホスト側で行うのと同じ
+    // 役割分担。
+    let scales = group_scales(input, group_size, format.max_normal());
+    let scaled = launch_scale_kernel(device, input, &scales, group_size)?;
+    let data: Vec<u8> = scaled
+        .par_iter()
+        .map(|&x| f8_nearest(x, format))
+        .collect();
+    Ok(QuantizedFp8Tensor {
+        data,
+        scales,
+        group_size,
+        len: input.len(),
+        format,
+    })
+}
+
+/// E4M3 でグループ単位 FP8 量子化する。ダイナミックレンジが狭いぶん、
+/// スケール正規化後の値が [-448, 448] に収まる重み向き(通常の LLM の重み)。
+pub fn quantize_fp8_e4m3(
+    device: &dyn GpuDevice,
+    input: &[f32],
+    group_size: usize,
+) -> Result<QuantizedFp8Tensor> {
+    quantize_fp8(device, input, group_size, Fp8Format::E4M3)
+}
+
+/// E5M2 でグループ単位 FP8 量子化する。仮数は少ないがレンジが広く、
+/// 外れ値の多い活性化・勾配向き。
+pub fn quantize_fp8_e5m2(
+    device: &dyn GpuDevice,
+    input: &[f32],
+    group_size: usize,
+) -> Result<QuantizedFp8Tensor> {
+    quantize_fp8(device, input, group_size, Fp8Format::E5M2)
+}
+
+/// [`quantize_fp8_e4m3`] / [`quantize_fp8_e5m2`] の逆変換(ホスト側)。
+pub fn dequantize_fp8(t: &QuantizedFp8Tensor) -> Vec<f32> {
+    (0..t.len)
+        .map(|i| f8_to_f32(t.data[i], t.format) * t.scales[i / t.group_size])
+        .collect()
+}
+
+/// `out[i] = in[i] / scales[i / group_size]`(スケール0のグループは0)を
+/// デバイスカーネルとして起動し、f32 バッファで返す共通部。FP8 量子化の
+/// 前段(非一様丸めの直前)に使う。
+fn launch_scale_kernel(
+    device: &dyn GpuDevice,
+    input: &[f32],
+    scales: &[f32],
+    group_size: usize,
+) -> Result<Vec<f32>> {
+    let len = input.len();
+    let mut out = vec![0f32; len];
+    let din = ScopedAlloc::new(device, std::mem::size_of_val(input))?;
+    let dscales = ScopedAlloc::new(device, std::mem::size_of_val(scales))?;
+    let dout = ScopedAlloc::new(device, std::mem::size_of_val(&out[..]))?;
+
+    device.memcpy_h2d(din.ptr(), f32_to_bytes(input))?;
+    device.memcpy_h2d(dscales.ptr(), f32_to_bytes(scales))?;
+
+    let kernel = CompiledKernel::native("fp8_prescale", move |ctx: ThreadCtx, args: &[ResolvedArg]| {
+        let idx = ctx.global_id_x() as usize;
+        let len = args[3].as_usize().unwrap();
+        if idx >= len {
+            return;
+        }
+        let group_size = args[4].as_usize().unwrap();
+        let (in_ptr, _) = args[0].as_ptr().unwrap();
+        let (scales_ptr, _) = args[1].as_ptr().unwrap();
+        let (out_ptr, _) = args[2].as_ptr().unwrap();
+        unsafe {
+            let x = (in_ptr as *const f32).add(idx).read();
+            let scale = (scales_ptr as *const f32).add(idx / group_size).read();
+            let y = if scale == 0.0 { 0.0 } else { x / scale };
+            (out_ptr as *mut f32).add(idx).write(y);
+        }
+    });
+
+    let cfg = LaunchConfig::linear(len as u32, 256);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(din.ptr()),
+            KernelArg::Ptr(dscales.ptr()),
+            KernelArg::Ptr(dout.ptr()),
+            KernelArg::Usize(len),
+            KernelArg::Usize(group_size),
+        ],
+    )?;
+    device.synchronize()?;
+
+    device.memcpy_d2h(f32_from_bytes_mut(&mut out), dout.ptr())?;
+    Ok(out)
+}
+
+/// FP8 量子化済み重み `B`(`k`×`n`、行優先、非転置)を使った GEMM。
+/// `C = A(m×k) · dequant(B)(k×n)`。**FP8 演算カーネルの実体**——
+/// 上記の正直な開示のとおり、この開発機では B を f32 へ復元してから
+/// f32 で積和するソフトウェア実装(利益は重みメモリ 1/4)。
+pub fn sgemm_fp8_weight(
+    device: &dyn GpuDevice,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &QuantizedFp8Tensor,
+) -> Result<Vec<f32>> {
+    if a.len() != m * k {
+        anyhow::bail!("sgemm_fp8_weight: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    if b.len != k * n {
+        anyhow::bail!("sgemm_fp8_weight: b.len={} != k*n={}", b.len, k * n);
+    }
+    let b_deq = dequantize_fp8(b);
+    let mut c = vec![0f32; m * n];
+    sgemm(device, m, k, n, 1.0, a, &b_deq, 0.0, &mut c, None)?;
+    Ok(c)
+}
+
 /// AWQ（Activation-aware Weight Quantization、[Lin et al.](https://arxiv.org/abs/2306.00978)）
 /// 風のINT4量子化。既存の`quantize_int4`は全チャネルを均等に量子化するため、
 /// 重み自体は小さくても対応する活性化の振幅が大きい「重要チャネル」ほど、
@@ -1521,6 +1770,77 @@ mod tests {
         let t = quantize_int6(device.as_ref(), &input, 4).unwrap();
         assert_eq!(t.scales, vec![0.0, 0.0]);
         assert_eq!(dequantize_int6(&t), input);
+    }
+
+    #[test]
+    fn fp8_decoders_match_known_ocp_values() {
+        // E4M3: 0x00=+0, 0x38 = exp7 mant0 = 1.0*2^0 = 1.0, 0x7E = 最大正規 448.
+        assert_eq!(f8_e4m3_to_f32(0x00), 0.0);
+        assert!((f8_e4m3_to_f32(0x38) - 1.0).abs() < 1e-6);
+        assert!((f8_e4m3_to_f32(0x7e) - 448.0).abs() < 1e-3);
+        assert!(f8_e4m3_to_f32(0x7f).is_nan()); // E4M3 唯一の NaN
+        assert!(f8_e4m3_to_f32(0xfe) + 448.0 < 1e-3); // 符号ビット
+        // E5M2: 0x3c = exp15 mant0 = 1.0, 0x7b = 最大正規 57344, 0x7c = +inf.
+        assert!((f8_e5m2_to_f32(0x3c) - 1.0).abs() < 1e-6);
+        assert!((f8_e5m2_to_f32(0x7b) - 57344.0).abs() < 1.0);
+        assert_eq!(f8_e5m2_to_f32(0x7c), f32::INFINITY);
+        assert!(f8_e5m2_to_f32(0x7d).is_nan());
+    }
+
+    #[test]
+    fn quantize_fp8_e4m3_roundtrip_error_shrinks_with_smaller_dynamic_range() {
+        let device = cpu_device();
+        // なだらかな重み分布(外れ値なし)。E4M3 は仮数が多く小レンジで精度が高い。
+        let input: Vec<f32> = (0..64).map(|i| ((i as f32 - 32.0) * 0.05).tanh()).collect();
+        let g = 64;
+        let e4 = quantize_fp8_e4m3(device.as_ref(), &input, g).unwrap();
+        let e5 = quantize_fp8_e5m2(device.as_ref(), &input, g).unwrap();
+        let err4: f32 = input.iter().zip(dequantize_fp8(&e4)).map(|(x, r)| (x - r).abs()).sum();
+        let err5: f32 = input.iter().zip(dequantize_fp8(&e5)).map(|(x, r)| (x - r).abs()).sum();
+        assert!(
+            err4 < err5,
+            "E4M3 total err {err4} should beat E5M2 {err5} on a narrow-range weight block"
+        );
+        // どちらも f32 の 1/4 サイズ。
+        assert_eq!(e4.data.len(), input.len());
+    }
+
+    #[test]
+    fn quantize_fp8_all_zero_group_stays_zero() {
+        let device = cpu_device();
+        let input = vec![0.0f32; 8];
+        let t = quantize_fp8_e4m3(device.as_ref(), &input, 4).unwrap();
+        assert_eq!(t.scales, vec![0.0, 0.0]);
+        assert_eq!(dequantize_fp8(&t), input);
+    }
+
+    #[test]
+    fn sgemm_fp8_weight_matches_f32_sgemm_within_fp8_tolerance() {
+        let device = cpu_device();
+        let (m, k, n) = (3usize, 4usize, 2usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.37).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.53).cos() * 0.8).collect();
+
+        let mut c_ref = vec![0f32; m * n];
+        sgemm(device.as_ref(), m, k, n, 1.0, &a, &b, 0.0, &mut c_ref, None).unwrap();
+
+        let bq = quantize_fp8_e4m3(device.as_ref(), &b, k * n).unwrap();
+        let c_fp8 = sgemm_fp8_weight(device.as_ref(), m, k, n, &a, &bq).unwrap();
+
+        for (i, (&r, &q)) in c_ref.iter().zip(c_fp8.iter()).enumerate() {
+            // FP8 E4M3 は相対 ~2^-3。k=4 の積和なので絶対誤差もそれなり。
+            assert!(
+                (r - q).abs() <= 0.15 * r.abs().max(1.0),
+                "idx {i}: f32={r}, fp8-weight={q}"
+            );
+        }
+    }
+
+    #[test]
+    fn sgemm_fp8_weight_rejects_shape_mismatch() {
+        let device = cpu_device();
+        let bq = quantize_fp8_e5m2(device.as_ref(), &[1.0, 2.0, 3.0, 4.0], 4).unwrap();
+        assert!(sgemm_fp8_weight(device.as_ref(), 2, 3, 3, &[0.0; 6], &bq).is_err());
     }
 
     #[test]
