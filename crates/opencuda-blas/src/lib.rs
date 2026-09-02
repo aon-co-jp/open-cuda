@@ -115,6 +115,45 @@ pub enum GemmPath {
     /// `DirectXDevice`上で`matmul.dxil`をディスパッチする。
     DirectXGeneric,
     CpuNaive,      // CPU      (実装済み、examples/matmul を移植)
+    /// ベンダー FP8 Tensor Core GEMM(NVIDIA Hopper/Ada 以降)。
+    /// `device.supports_fp8_tensor_core()` が `true` のときに
+    /// `select_fp8_gemm_path` が返す。**現状スタブ**——
+    /// `sgemm_fp8_weight_vendor` は「Hopper/Ada 実機が必要」という
+    /// 明示エラーを返し、`sgemm_fp8_weight` はソフトウェア dequant 経路へ
+    /// フォールバックする(AVX-512 経路と同じ「コードは用意、機能フラグで
+    /// 有効化」の方針)。
+    Fp8Tensor,
+}
+
+/// FP8 量子化済み重みの GEMM をどの経路で実行するかを選ぶ。
+/// `device.supports_fp8_tensor_core()`(Hopper/Ada 以降でのみ true)なら
+/// [`GemmPath::Fp8Tensor`]、そうでなければ通常の [`select_gemm_path`]
+/// (実質ソフトウェア dequant + f32 GEMM)。
+pub fn select_fp8_gemm_path(device: &dyn GpuDevice) -> GemmPath {
+    if device.supports_fp8_tensor_core() {
+        GemmPath::Fp8Tensor
+    } else {
+        select_gemm_path(device)
+    }
+}
+
+/// ベンダー FP8 Tensor Core GEMM のスタブ。Hopper/Ada 実機が本開発環境に
+/// 無いため未実装——常に明示エラーを返す。呼び出し側
+/// ([`sgemm_fp8_weight`])はこのエラーを受けてソフトウェア経路へ
+/// フォールバックする。
+fn sgemm_fp8_weight_vendor(
+    _device: &dyn GpuDevice,
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _a: &[f32],
+    _b: &QuantizedFp8Tensor,
+) -> Result<Vec<f32>> {
+    anyhow::bail!(
+        "sgemm_fp8_weight: GemmPath::Fp8Tensor selected (device.supports_fp8_tensor_core()==true) \
+         but the native FP8 Tensor Core GEMM requires NVIDIA Hopper (SM90) / Ada Lovelace (SM89) \
+         hardware and a cuBLASLt FP8 path that is not implemented in this build"
+    )
 }
 
 /// デバイス上に確保したメモリを、スコープを抜けるときに必ず解放するための
@@ -1428,6 +1467,16 @@ pub fn sgemm_fp8_weight(
     if b.len != k * n {
         anyhow::bail!("sgemm_fp8_weight: b.len={} != k*n={}", b.len, k * n);
     }
+    // Hopper/Ada 実機なら本来ここでベンダー FP8 GEMM へ分岐する。
+    // 現状スタブはエラーを返すので、warn を出してソフトウェア経路へ落とす。
+    if matches!(select_fp8_gemm_path(device), GemmPath::Fp8Tensor) {
+        match sgemm_fp8_weight_vendor(device, m, k, n, a, b) {
+            Ok(c) => return Ok(c),
+            Err(e) => tracing::warn!(
+                "sgemm_fp8_weight: vendor FP8 path unavailable ({e}); falling back to software dequant"
+            ),
+        }
+    }
     let b_deq = dequantize_fp8(b);
     let mut c = vec![0f32; m * n];
     sgemm(device, m, k, n, 1.0, a, &b_deq, 0.0, &mut c, None)?;
@@ -1834,6 +1883,69 @@ mod tests {
                 "idx {i}: f32={r}, fp8-weight={q}"
             );
         }
+    }
+
+    /// FP8 Tensor Core を持つと自己申告するデバイスのラッパー。実演算は
+    /// 内側の `CpuDevice` へ委譲する(スタブ経路→ソフトウェアフォール
+    /// バックの動作を検証するため)。
+    struct Fp8CapableDevice(Arc<CpuDevice>);
+    impl opencuda_core::GpuDevice for Fp8CapableDevice {
+        fn info(&self) -> &opencuda_core::DeviceInfo {
+            self.0.info()
+        }
+        fn alloc(&self, bytes: usize) -> Result<opencuda_core::DevicePtr> {
+            self.0.alloc(bytes)
+        }
+        fn free(&self, ptr: opencuda_core::DevicePtr) -> Result<()> {
+            self.0.free(ptr)
+        }
+        fn memcpy_h2d(&self, dst: opencuda_core::DevicePtr, src: &[u8]) -> Result<()> {
+            self.0.memcpy_h2d(dst, src)
+        }
+        fn memcpy_d2h(&self, dst: &mut [u8], src: opencuda_core::DevicePtr) -> Result<()> {
+            self.0.memcpy_d2h(dst, src)
+        }
+        fn memcpy_d2d(
+            &self,
+            dst: opencuda_core::DevicePtr,
+            src: opencuda_core::DevicePtr,
+            bytes: usize,
+        ) -> Result<()> {
+            self.0.memcpy_d2d(dst, src, bytes)
+        }
+        fn launch_kernel(
+            &self,
+            kernel: &opencuda_core::CompiledKernel,
+            cfg: &opencuda_core::LaunchConfig,
+            args: &[opencuda_core::KernelArg],
+        ) -> Result<()> {
+            self.0.launch_kernel(kernel, cfg, args)
+        }
+        fn synchronize(&self) -> Result<()> {
+            self.0.synchronize()
+        }
+        fn supports_fp8_tensor_core(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn select_fp8_gemm_path_picks_vendor_path_only_when_hardware_reports_fp8() {
+        let cpu = cpu_device();
+        assert_eq!(select_fp8_gemm_path(cpu.as_ref()), select_gemm_path(cpu.as_ref()));
+
+        let fp8_dev = Fp8CapableDevice(cpu.clone());
+        assert_eq!(select_fp8_gemm_path(&fp8_dev), GemmPath::Fp8Tensor);
+
+        // Fp8Tensor が選ばれてもスタブはエラーを返し、sgemm_fp8_weight は
+        // ソフトウェア dequant 経路へフォールバックして正しい結果を出す。
+        let (m, k, n) = (2usize, 4usize, 3usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.3).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.4).cos() * 0.7).collect();
+        let bq = quantize_fp8_e4m3(cpu.as_ref(), &b, k * n).unwrap();
+        let c_soft = sgemm_fp8_weight(cpu.as_ref(), m, k, n, &a, &bq).unwrap();
+        let c_fp8dev = sgemm_fp8_weight(&fp8_dev, m, k, n, &a, &bq).unwrap();
+        assert_eq!(c_soft, c_fp8dev, "vendor stub must fall back to the same software path");
     }
 
     #[test]

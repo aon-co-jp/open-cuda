@@ -129,4 +129,17 @@ pub trait GpuDevice: Send + Sync {
     fn supports_dxil(&self) -> bool {
         false
     }
+
+    /// このデバイスがネイティブ FP8(E4M3/E5M2)Tensor Core 演算を
+    /// 実行できるかどうか。NVIDIA では Hopper(H100、SM90)/ Ada
+    /// Lovelace(RTX 40、SM89)以降でのみ true。デフォルトは `false`
+    /// ——`opencuda-blas` の `select_gemm_path` が、FP8 量子化済み重みの
+    /// GEMM をベンダー FP8 経路(`GemmPath::Fp8Tensor`)へ振るべきか、
+    /// ソフトウェア dequant 経路へフォールバックすべきかを判断するための
+    /// 能力フラグ。現状 `true` を返す実バックエンドは無い(Hopper/Ada
+    /// 実機が本開発環境に無く未検証、AVX-512 経路と同じ「コードは用意して
+    /// 機能フラグで有効化」の方針)。
+    fn supports_fp8_tensor_core(&self) -> bool {
+        false
+    }
 }
