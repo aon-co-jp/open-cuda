@@ -228,6 +228,48 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
 なし)。(2) より高性能な統合GPU(Adreno等)でのDirectX/Vulkan経路
 再実測は、このマシンにその種のGPUが無いため引き続き未検証。
 
+## HANDOFF追記(2026-09-02、safetensorsローダーを F16/BF16/FP8(E4M3/E5M2)対応へ拡張 — 対話FT済みGPT-2互換モデルのロードを可能に / Follow-up: safetensors loader now converts F16/BF16/FP8 to f32)
+
+`GptModel::load` の `tensor_f32` を、従来の F32 のみから
+**F16・BF16(`half`クレート委譲)・FP8 E4M3・FP8 E5M2(OCP仕様準拠の
+自前デコーダ)を読み込み時に f32 へ変換**する形へ拡張した(コミット
+`9c4ff39`、`crates/open-cuda-llm/src/lib.rs` + `Cargo.toml` に
+`half = { workspace = true }` 追加)。目的は `aruaru-llm` から
+対話ファインチューニング済み GPT-2 互換モデル(DialoGPT-small 等、
+F16 配布)を実際にロードでき、`open-english` のチャット品質を上げること
+——このスライスは open-cuda → aruaru-llm(`model_catalog` に
+`dialogpt-small` + `tokenizer_hf_repo`)→ open-english にまたがる。
+
+- **FP8 デコーダ(自前)**: E4M3 = 1-4-3、バイアス7、**無限大なし**、
+  NaN は `S.1111.111` のみ、最大正規値 448。E5M2 = 1-5-2、バイアス15、
+  IEEE 類似(exp=11111 → inf/NaN)。「BF8」は E5M2 のベンダー名、
+  「FP8」/「HF8」は E4M3。safetensors が定義するのは
+  `Dtype::F8_E4M3` / `Dtype::F8_E5M2` の2つ。
+- **推論経路は F32 のまま**——半精度/FP8 の演算カーネルではなく
+  「配布フォーマットの拡張」。GT730 に FP8 Tensor Core が無い件
+  (2026-08-08 HANDOFF)とは別軸の話。
+- 対応外 dtype(INT8/INT4 等の整数量子化)は「このローダーは F32/F16/
+  BF16/F8_E4M3/F8_E5M2 を f32 へ変換する」と案内する正直なエラー。
+- **検証**: 合成 F16/BF16/F8_E4M3/F8_E5M2 の safetensors ロード+生成
+  テスト、FP8 デコーダの既知値テスト(`#[allow(clippy::unusual_byte_
+  groupings)]`)、対応外 dtype 拒否テスト、実 DialoGPT-small(F16、
+  335MB、gitignore 済み `models/` へ DL)の `--ignored` 実機 E2E
+  (`GptModel::load` でロード→コヒーレントな対話生成)。
+  `cargo test -p open-cuda-llm --release -- --test-threads=1` **41件全green**、
+  `cargo clippy -p open-cuda-llm --release --all-targets -- -D warnings`
+  **警告0件**(この過程で判明した既存の `explicit_counter_loop`
+  〈`generate_speculative`内、2026-08-17コミット由来、今回の変更とは
+  無関係〉も併せて修正)。`Cargo.lock` はこのリポジトリでは gitignore
+  対象のためコミットに含めない。
+- **English summary**: `GptModel::load`'s `tensor_f32` now accepts
+  F32 / F16 / BF16 (via `half`) / FP8 E4M3 / FP8 E5M2 (hand-rolled
+  OCP-spec decoders) and converts them to f32 at load time so that
+  dialogue-fine-tuned GPT-2-compatible models (DialoGPT-small, F16) and
+  FP8-distributed models load. Inference stays F32 — this is a
+  distribution-format extension, not FP8 kernels. Unsupported dtypes
+  (INT8/INT4) get an honest error. 41 tests green, clippy clean, real
+  DialoGPT-small F16 E2E verified (`--ignored`).
+
 ## HANDOFF追記(2026-09-01(続き2)、Model Folding: Attentionサブ層を丸ごとスキップする軽量パスを`DecoderLayer`へ追加 / Follow-up: added a real attention-skip fast path to `DecoderLayer`)
 
 直前エントリの残課題(1)「Attentionサブ層を完全にスキップする軽量パス」を
