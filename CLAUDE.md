@@ -228,6 +228,66 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
 なし)。(2) より高性能な統合GPU(Adreno等)でのDirectX/Vulkan経路
 再実測は、このマシンにその種のGPUが無いため引き続き未検証。
 
+## HANDOFF追記(2026-09-02(続き2)、AWQ(interleave INT4)逆量子化ロード + Hopper/Ada ベンダー FP8 GEMM 分岐(コンパイルのみ) / Follow-up: AWQ dequant load + Hopper/Ada vendor FP8 GEMM branch, compile-only)
+
+`aruaru-db` 側の次フェーズ一括作業と並行して、直前エントリ「残課題」の
+2件(AWQ interleave 逆量子化ロード、Hopper/Ada ベンダー FP8 GEMM 分岐)を
+実装した。ユーザー指示「ビルドまでで記録」に従い `cargo test` /
+`cargo build --workspace --release` / `cargo clippy` の成功までを検証範囲
+とする(Hopper/Ada 実機はこの開発機に無く、FP8 ベンダー経路の実行検証は
+原理的に不可能)。
+
+### AWQ 逆量子化ロード(`open-cuda-llm`)
+- `load_conv1d_awq` を新設。AutoAWQ / vLLM 形式:
+  - `qweight` : `I32 [in_dim, out_dim / pack]`(GPTQ の `[in/pack, out]` と
+    転置・パック方向が異なる)。
+  - `qzeros`  : `I32 [in_dim / group_size, out_dim / pack]`。
+  - `scales`  : `F16/F32 [in_dim / group_size, out_dim]`。
+  - **ニブル並びが interleave**: 論理列 `c` はビット位置
+    `AWQ_ORDER[c] * bits`(4bit の `AWQ_ORDER = [0,2,4,6,1,3,5,7]`)。
+  - zero-point は実値をそのまま格納(GPTQ の `+1` バンプ無し)。
+  - `w[i,o] = (q - z) * scale`。`bits != 4` / `desc_act` は正直なエラー。
+- `load_conv1d_maybe_quant` が `quant_method == "awq"`(大小無視)で
+  `load_conv1d_awq` へ分岐。`load_conv1d_gptq` は従来どおり `awq` を拒否
+  (`load_conv1d_gptq_rejects_awq_method` は維持)。
+- テスト: `load_conv1d_awq_dequantizes_a_synthetic_interleaved_4bit_tensor_exactly`
+  (合成 interleaved 4bit テンソルを厳密一致で逆量子化、
+  `load_conv1d_maybe_quant` の分岐も確認)。
+- `cargo test -p open-cuda-llm --release -- --test-threads=1`
+  **46 passed / 7 ignored**(前回45→、回帰無し)、
+  `cargo clippy -p open-cuda-llm --release --all-targets -- -D warnings`
+  警告0件。
+
+### Hopper/Ada ベンダー FP8 GEMM 分岐(`opencuda-core` + `opencuda-blas`)
+- `GpuDevice::supports_fp8_tensor_core()`(既定 `false`)を追加。NVIDIA では
+  Hopper(SM90)/ Ada(SM89)以降でのみ `true` になる想定の能力フラグ
+  (`supports_spirv` / `supports_dxil` と同じ設計)。
+- `GemmPath::Fp8Tensor` + `select_fp8_gemm_path(device)`:
+  `supports_fp8_tensor_core()` が `true` のときだけ `Fp8Tensor` を返し、
+  そうでなければ通常の `select_gemm_path` へ委譲。
+- `sgemm_fp8_weight_vendor` は「Hopper(SM90)/ Ada(SM89)ハードウェアと
+  cuBLASLt FP8 パスが必要」という明示エラーを返すスタブ。
+  `sgemm_fp8_weight` は `Fp8Tensor` が選ばれても `tracing::warn!` を出して
+  **既存のソフトウェア dequant + f32 GEMM 経路へフォールバック**する
+  (AVX-512 経路と同じ「コードは用意、機能フラグで有効化」の方針、
+  既存の全呼び出し元〈`Linear::forward` 等〉の挙動は不変)。
+- テスト: `select_fp8_gemm_path_picks_vendor_path_only_when_hardware_reports_fp8`
+  (`Fp8CapableDevice` ラッパーで能力フラグを `true` に偽装 → `Fp8Tensor`
+  選択 → スタブ→ソフトウェアフォールバックが CPU デバイスと同一結果を
+  出すことを検証)。
+- `cargo test -p opencuda-blas --release --lib` **43 passed / 1 ignored**
+  (前回42→)、`cargo clippy -p opencuda-blas -p opencuda-core --release
+  --all-targets -- -D warnings` 警告0件、`cargo build --workspace
+  --release` 成功。
+
+### 残課題
+- Hopper/Ada 実機での `sgemm_fp8_weight_vendor` の実装(cuBLASLt FP8、
+  `GemmPath::Fp8Tensor` の中身)。実機が入手できた場合にのみ着手。
+- AWQ の実配布モデル(実 safetensors)での E2E ロード検証は未実施
+  (合成テンソルの厳密一致まで)。
+- GPTQ / AWQ を逆量子化せず INT4 のまま GEMM する専用カーネル(現状は
+  いずれも f32 へ展開)。
+
 ## HANDOFF追記(2026-09-02(続き)、FP8(E4M3/E5M2)量子化+演算パス、および tensor_f32 の全数値dtype対応 / Follow-up: FP8 quantization + compute path, plus full numeric-dtype loader)
 
 直前エントリ(F16/BF16/FP8 → f32 の**読み込み時変換**)に対しユーザーから
