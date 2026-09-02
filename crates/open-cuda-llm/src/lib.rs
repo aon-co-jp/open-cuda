@@ -109,20 +109,101 @@ impl GPT2Config {
     }
 }
 
+/// OCP 8ビット浮動小数点 **E4M3**(1-4-3、指数バイアス7、無限大なし、
+/// `S.1111.111`のみNaN、最大正規値448)を`f32`へデコードする。
+/// DeepSeek-V3等のFP8配布重みを`GptModel::load`が読めるようにするため
+/// (2026-09-01、ユーザー指示)。ロード時に1回だけ実行されるため
+/// テーブル化はしていない(推論経路はF32のまま)。
+fn f8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (b >> 3) & 0x0f;
+    let mant = b & 0x07;
+    let val = if exp == 0 {
+        // 非正規化数(0を含む): mant/8 * 2^(1-7)
+        (mant as f32) * 2f32.powi(-9)
+    } else if exp == 0x0f && mant == 0x07 {
+        f32::NAN
+    } else {
+        (1.0 + (mant as f32) / 8.0) * 2f32.powi(exp as i32 - 7)
+    };
+    sign * val
+}
+
+/// OCP 8ビット浮動小数点 **E5M2**(1-5-2、指数バイアス15、IEEE類似で
+/// `exp=11111`のとき`mant==0`→±∞・それ以外→NaN)を`f32`へデコードする。
+fn f8_e5m2_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (b >> 2) & 0x1f;
+    let mant = b & 0x03;
+    let val = if exp == 0 {
+        (mant as f32) * 2f32.powi(-16) // mant/4 * 2^(1-15)
+    } else if exp == 0x1f {
+        if mant == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + (mant as f32) / 4.0) * 2f32.powi(exp as i32 - 15)
+    };
+    sign * val
+}
+
+/// safetensorsのテンソルを`Vec<f32>`として読み出す。
+///
+/// **2026-09-01拡張**: 従来はF32のみ受理していたが、対話ファイン
+/// チューニング済みのGPT-2互換モデル(`microsoft/DialoGPT-small`等)は
+/// **F16(半精度)**、近年のモデルは**BF16**、DeepSeek-V3等は**FP8**
+/// (E4M3/E5M2)でsafetensorsを配布することが多く、`aruaru-llm`の
+/// モデルカタログへ追加できなかった(`aruaru-llm/CLAUDE.md`
+/// 2026-08-26エントリ参照)。この関数でロード時にF32へ変換する
+/// (推論経路自体は引き続きF32のみ——半精度/FP8の演算カーネルを持つ
+/// わけではなく、「対応する配布フォーマットの拡張」)。F16/BF16の変換は
+/// `half`クレート(既存の依存)のIEEE準拠実装、FP8は上記の自前デコーダ。
 fn tensor_f32(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>> {
     let view = tensors.tensor(name).with_context(|| format!("open-cuda-llm: missing tensor '{name}'"))?;
-    anyhow::ensure!(
-        view.dtype() == safetensors::Dtype::F32,
-        "open-cuda-llm: tensor '{name}' has unexpected dtype {:?} (expected F32)",
-        view.dtype()
-    );
     let bytes = view.data();
-    anyhow::ensure!(bytes.len() % 4 == 0, "open-cuda-llm: tensor '{name}' byte length not a multiple of 4");
-    let mut out = vec![0.0f32; bytes.len() / 4];
-    for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-        *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    match view.dtype() {
+        safetensors::Dtype::F32 => {
+            anyhow::ensure!(bytes.len() % 4 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 4 (F32)", bytes.len());
+            let mut out = vec![0.0f32; bytes.len() / 4];
+            for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            Ok(out)
+        }
+        safetensors::Dtype::F16 => {
+            anyhow::ensure!(bytes.len() % 2 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 2 (F16)", bytes.len());
+            let mut out = vec![0.0f32; bytes.len() / 2];
+            for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                *dst = half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+            }
+            Ok(out)
+        }
+        safetensors::Dtype::BF16 => {
+            anyhow::ensure!(bytes.len() % 2 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 2 (BF16)", bytes.len());
+            let mut out = vec![0.0f32; bytes.len() / 2];
+            for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                *dst = half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+            }
+            Ok(out)
+        }
+        safetensors::Dtype::F8_E4M3 => {
+            let mut out = vec![0.0f32; bytes.len()];
+            for (dst, &b) in out.iter_mut().zip(bytes.iter()) {
+                *dst = f8_e4m3_to_f32(b);
+            }
+            Ok(out)
+        }
+        safetensors::Dtype::F8_E5M2 => {
+            let mut out = vec![0.0f32; bytes.len()];
+            for (dst, &b) in out.iter_mut().zip(bytes.iter()) {
+                *dst = f8_e5m2_to_f32(b);
+            }
+            Ok(out)
+        }
+        other => anyhow::bail!(
+            "open-cuda-llm: tensor '{name}' has unsupported dtype {other:?} \
+             (this loader converts F32 / F16 / BF16 / F8_E4M3 / F8_E5M2 to f32; \
+             integer-quantized formats like INT8/INT4 are not supported)"
+        ),
     }
-    Ok(out)
 }
 
 /// `[out_dim, in_dim]`(行優先)を`[in_dim, out_dim]`へ転置する
@@ -2465,8 +2546,36 @@ mod tests {
     /// 回帰テスト——`GptModel::load`が両方の規約を吸収できることを
     /// 検証する)。
     fn build_and_load_synthetic_model(dir_suffix: &str, key_prefix: &str) -> GptModel {
+        build_and_load_synthetic_model_dtype(dir_suffix, key_prefix, safetensors::tensor::Dtype::F32)
+    }
+
+    /// **2026-09-01新設**: 合成safetensorsを任意のfloat dtype(F32/F16/
+    /// BF16/F8_E4M3/F8_E5M2)で書き出して`GptModel::load`できることを
+    /// 検証する。`tensor_f32`の半精度/FP8→f32変換経路の回帰テスト用。
+    fn build_and_load_synthetic_model_dtype(dir_suffix: &str, key_prefix: &str, dtype: safetensors::tensor::Dtype) -> GptModel {
         use safetensors::tensor::{Dtype, TensorView};
         use std::collections::HashMap;
+
+        // FP8はround-to-nearestエンコーダを持たないので、256コードを
+        // 総当たりして最近傍を選ぶ(テストフィクスチャ専用、要素数が
+        // 小さいので十分速い)。
+        let f8_nearest = |v: f32, decode: fn(u8) -> f32| -> u8 {
+            (0u16..256)
+                .map(|c| c as u8)
+                .filter(|&c| decode(c).is_finite())
+                .min_by(|&a, &b| (decode(a) - v).abs().partial_cmp(&(decode(b) - v).abs()).unwrap())
+                .unwrap()
+        };
+        let encode = |v: f32| -> Vec<u8> {
+            match dtype {
+                Dtype::F32 => v.to_le_bytes().to_vec(),
+                Dtype::F16 => half::f16::from_f32(v).to_le_bytes().to_vec(),
+                Dtype::BF16 => half::bf16::from_f32(v).to_le_bytes().to_vec(),
+                Dtype::F8_E4M3 => vec![f8_nearest(v, f8_e4m3_to_f32)],
+                Dtype::F8_E5M2 => vec![f8_nearest(v, f8_e5m2_to_f32)],
+                other => panic!("test fixture: unsupported dtype {other:?}"),
+            }
+        };
 
         let vocab = 37usize;
         let hidden = 8usize;
@@ -2482,7 +2591,7 @@ mod tests {
         let mut push = |name: String, shape: Vec<usize>, rng: &mut SplitMix64| {
             let len: usize = shape.iter().product();
             let data = random_vec(rng, len, 0.1);
-            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let bytes: Vec<u8> = data.iter().flat_map(|v| encode(*v)).collect();
             buffers.push((name, shape, bytes));
         };
         push(format!("{key_prefix}wte.weight"), vec![vocab, hidden], &mut rng);
@@ -2507,7 +2616,7 @@ mod tests {
 
         let mut views: HashMap<String, TensorView> = HashMap::new();
         for (name, shape, bytes) in &buffers {
-            views.insert(name.clone(), TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap());
+            views.insert(name.clone(), TensorView::new(dtype, shape.clone(), bytes).unwrap());
         }
         let serialized = safetensors::serialize(&views, &None).unwrap();
 
@@ -2551,6 +2660,87 @@ mod tests {
     #[test]
     fn load_parses_transformer_prefixed_safetensors_like_distilgpt2() {
         build_and_load_synthetic_model("transformer-prefix", "transformer.");
+    }
+
+    /// **2026-09-01新設**: `microsoft/DialoGPT-small`等の**F16**配布重みを
+    /// `GptModel::load`が読めることの回帰テスト(`aruaru-llm`側でF16の
+    /// ためカタログ追加を見送っていた——`aruaru-llm/CLAUDE.md`
+    /// 2026-08-26エントリ)。合成F16 safetensorsをロード→生成まで通す。
+    #[test]
+    fn load_parses_f16_safetensors_like_dialogpt() {
+        build_and_load_synthetic_model_dtype("f16", "transformer.", safetensors::tensor::Dtype::F16);
+    }
+
+    /// **2026-09-01新設**: BF16配布重み(近年の多くのモデル)を読めること。
+    #[test]
+    fn load_parses_bf16_safetensors() {
+        build_and_load_synthetic_model_dtype("bf16", "", safetensors::tensor::Dtype::BF16);
+    }
+
+    /// **2026-09-01新設**: FP8 E4M3(いわゆる"FP8"/"HF8"、DeepSeek-V3等)
+    /// 配布重みを読めること。
+    #[test]
+    fn load_parses_f8_e4m3_safetensors() {
+        build_and_load_synthetic_model_dtype("f8e4m3", "", safetensors::tensor::Dtype::F8_E4M3);
+    }
+
+    /// **2026-09-01新設**: FP8 E5M2(いわゆる"BF8"、指数5ビットで範囲重視)
+    /// 配布重みを読めること。
+    #[test]
+    fn load_parses_f8_e5m2_safetensors() {
+        build_and_load_synthetic_model_dtype("f8e5m2", "transformer.", safetensors::tensor::Dtype::F8_E5M2);
+    }
+
+    /// **2026-09-01新設**: FP8デコーダが既知の代表値を正しく復元すること
+    /// (OCP FP8仕様: E4M3はバイアス7・無限大なし・最大正規値448、
+    /// E5M2はバイアス15・IEEE類似)。
+    #[test]
+    // ビットリテラルは FP8 のフィールド境界(符号1・指数4or5・仮数3or2)で
+    // 区切っており等幅グルーピングにはできない(可読性のため意図的)。
+    #[allow(clippy::unusual_byte_groupings)]
+    fn fp8_decoders_match_known_values() {
+        // E4M3: 0, +1(S=0 E=0111 M=000), -2(S=1 E=1000 M=000), 最大正規値448
+        assert_eq!(f8_e4m3_to_f32(0x00), 0.0);
+        assert_eq!(f8_e4m3_to_f32(0b0_0111_000), 1.0);
+        assert_eq!(f8_e4m3_to_f32(0b1_1000_000), -2.0);
+        assert_eq!(f8_e4m3_to_f32(0b0_1111_110), 448.0);
+        assert!(f8_e4m3_to_f32(0b0_1111_111).is_nan(), "E4M3 S.1111.111 must be NaN");
+        assert!(f8_e4m3_to_f32(0x08).is_finite(), "E4M3 has no infinities");
+        // E5M2: 0, +1(E=01111 M=00), -0.5(E=01110 M=00), +inf(E=11111 M=00)
+        assert_eq!(f8_e5m2_to_f32(0x00), 0.0);
+        assert_eq!(f8_e5m2_to_f32(0b0_01111_00), 1.0);
+        assert_eq!(f8_e5m2_to_f32(0b0_01110_00), 0.5);
+        assert_eq!(f8_e5m2_to_f32(0b0_11111_00), f32::INFINITY);
+        assert!(f8_e5m2_to_f32(0b0_11111_01).is_nan(), "E5M2 exp=11111 mant!=0 must be NaN");
+        // 半精度→f32はhalfクレート委譲なので代表値のみ軽く確認
+        assert_eq!(half::f16::from_le_bytes([0x00, 0x3c]).to_f32(), 1.0); // 0x3C00 = 1.0
+        assert_eq!(half::bf16::from_le_bytes([0x80, 0x3f]).to_f32(), 1.0); // 0x3F80 = 1.0
+    }
+
+    /// **2026-09-01新設**: 対応外のdtype(整数量子化等)は、黙って
+    /// 壊れた値を返さず、対応形式を案内する正直なエラーを返すこと。
+    #[test]
+    fn load_rejects_unsupported_dtype_with_clear_error() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use std::collections::HashMap;
+        let mut views: HashMap<String, TensorView> = HashMap::new();
+        let bytes = vec![0u8; 8];
+        views.insert("transformer.wte.weight".to_string(), TensorView::new(Dtype::I8, vec![2, 4], &bytes).unwrap());
+        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let dir = std::env::temp_dir().join(format!("open-cuda-llm-bad-dtype-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), serialized).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"vocab_size":2,"n_embd":4,"n_layer":1,"n_head":2,"n_positions":8,"layer_norm_epsilon":1e-5}"#,
+        )
+        .unwrap();
+        let err = match GptModel::load(&dir) {
+            Ok(_) => panic!("expected load to fail for I8 dtype"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unsupported dtype"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 実GPT-2(124M、`openai-community/gpt2`のsafetensors)がこのマシンに
@@ -2602,6 +2792,61 @@ mod tests {
         eprintln!("random-init weights greedy continuation: {random_text:?} (token ids: {random_out:?})");
 
         assert_ne!(real_out, random_out, "real GPT-2 weights should produce different greedy output than random init for the same prompt");
+    }
+
+    /// **2026-09-01新設**: 実**F16**配布重み(`microsoft/DialoGPT-small`、
+    /// 117M、GPT-2アーキテクチャそのまま、Reddit対話でファイン
+    /// チューニング済み、MIT)を`GptModel::load`が読めることの実機E2E。
+    /// `aruaru-llm`側でこのモデルはF16のためカタログ追加を見送っていた
+    /// (`aruaru-llm/CLAUDE.md` 2026-08-26エントリ)——今回`tensor_f32`が
+    /// F16→f32変換に対応したことで解消できるはずなので実重みで裏取りする。
+    /// `models/dialogpt-small/`(`.gitignore`対象、`config.json` +
+    /// `model.safetensors`〈F16, 335MB〉+ `tokenizer.json`〈gpt2から流用、
+    /// vocab_size 50257が一致〉)が置かれている場合のみ実行、`--ignored`。
+    #[test]
+    #[ignore]
+    fn real_f16_dialogpt_small_weights_load_and_generate() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/dialogpt-small");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("skipping: DialoGPT-small (F16) not present at {dir:?}");
+            return;
+        }
+
+        // F16重みが panic せずロードできること(修正前はここで
+        // 'tensor ... has unexpected dtype F16 (expected F32)' で失敗していた)。
+        let model = GptModel::load(&dir).unwrap();
+        assert_eq!(model.config().vocab_size, 50257);
+        assert_eq!(model.config().hidden_size, 768);
+        assert_eq!(model.config().num_layers, 12);
+        assert_eq!(model.config().num_heads, 12);
+
+        let tokenizer = GptTokenizer::load(&dir).unwrap();
+        let prompt_ids = tokenizer.encode("Hello, how are you today?").unwrap();
+        assert!(!prompt_ids.is_empty());
+
+        let device = device();
+        let out = model
+            .generate_with_repetition_penalty(&device, &prompt_ids, 20, 1.3)
+            .unwrap();
+        let text = tokenizer.decode(&out).unwrap();
+        eprintln!("DialoGPT-small (F16) greedy+rep-penalty continuation: {text:?}");
+        assert_eq!(out.len(), 20);
+
+        // F16重みが実際に効いていることの最低限の裏取り: 同一形状の
+        // ランダム初期化と生成結果が異なること。
+        let random_config = GptConfig {
+            vocab_size: model.config().vocab_size,
+            hidden_size: model.config().hidden_size,
+            num_layers: model.config().num_layers,
+            num_heads: model.config().num_heads,
+            intermediate_size: model.config().intermediate_size,
+            max_seq_len: model.config().max_seq_len,
+            layer_norm_eps: model.config().layer_norm_eps,
+        };
+        let random_out = GptModel::load_random(random_config, 7)
+            .generate_with_repetition_penalty(&device, &prompt_ids, 20, 1.3)
+            .unwrap();
+        assert_ne!(out, random_out, "F16 DialoGPT weights should produce different output than random init");
     }
 
     /// **2026-08-17新設**: `generate_speculative`を実重み(ターゲット
