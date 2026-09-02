@@ -198,10 +198,56 @@ fn tensor_f32(tensors: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>
             }
             Ok(out)
         }
+        safetensors::Dtype::F64 => {
+            anyhow::ensure!(bytes.len() % 8 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 8 (F64)", bytes.len());
+            let mut out = vec![0.0f32; bytes.len() / 8];
+            for (dst, c) in out.iter_mut().zip(bytes.chunks_exact(8)) {
+                *dst = f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32;
+            }
+            Ok(out)
+        }
+        // ---- 整数・真偽値 dtype ----
+        // 「そのままの数値を f32 へキャスト」する(スケール/ゼロ点を伴う
+        // GPTQ/AWQ 形式の *パック済み* 量子化——別テンソルの scales/zeros を
+        // 必要とし、単一テンソルの dtype だけでは復元できない——とは別物。
+        // 生の整数テンソル(埋め込みインデックス、スケール1想定の int8 重み等)
+        // はこれで読める。パック済み量子化への自動対応は範囲外(呼び出し側で
+        // scales/zeros を渡して逆量子化する必要があり、その配線は別の増分)。
+        safetensors::Dtype::BOOL | safetensors::Dtype::U8 => {
+            Ok(bytes.iter().map(|&b| b as f32).collect())
+        }
+        safetensors::Dtype::I8 => {
+            Ok(bytes.iter().map(|&b| b as i8 as f32).collect())
+        }
+        safetensors::Dtype::I16 => {
+            anyhow::ensure!(bytes.len() % 2 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 2 (I16)", bytes.len());
+            Ok(bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32).collect())
+        }
+        safetensors::Dtype::U16 => {
+            anyhow::ensure!(bytes.len() % 2 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 2 (U16)", bytes.len());
+            Ok(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as f32).collect())
+        }
+        safetensors::Dtype::I32 => {
+            anyhow::ensure!(bytes.len() % 4 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 4 (I32)", bytes.len());
+            Ok(bytes.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32).collect())
+        }
+        safetensors::Dtype::U32 => {
+            anyhow::ensure!(bytes.len() % 4 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 4 (U32)", bytes.len());
+            Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32).collect())
+        }
+        safetensors::Dtype::I64 => {
+            anyhow::ensure!(bytes.len() % 8 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 8 (I64)", bytes.len());
+            Ok(bytes.chunks_exact(8).map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32).collect())
+        }
+        safetensors::Dtype::U64 => {
+            anyhow::ensure!(bytes.len() % 8 == 0, "open-cuda-llm: tensor '{name}' byte length {} not a multiple of 8 (U64)", bytes.len());
+            Ok(bytes.chunks_exact(8).map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32).collect())
+        }
         other => anyhow::bail!(
-            "open-cuda-llm: tensor '{name}' has unsupported dtype {other:?} \
-             (this loader converts F32 / F16 / BF16 / F8_E4M3 / F8_E5M2 to f32; \
-             integer-quantized formats like INT8/INT4 are not supported)"
+            "open-cuda-llm: tensor '{name}' has unrecognised safetensors dtype {other:?} \
+             (this loader converts every standard numeric dtype — F64/F32/F16/BF16/\
+             F8_E4M3/F8_E5M2 and BOOL/U8..U64/I8..I64 — to f32; a genuinely new \
+             dtype was encountered)"
         ),
     }
 }
@@ -233,7 +279,7 @@ fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
         out_dim
     );
     let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
-    Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None })
+    Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
 }
 
 // **2026-08-04変更**: GPT-2はQ/K/Vを1本の`c_attn`(`[hidden, 3*hidden]`)へ
@@ -308,6 +354,17 @@ struct Linear {
     /// ことはできず、「密GEMMだけGPUへ、それ以外はCPU(open-cpu SIMD)で」
     /// というハイブリッド構成にしてある。
     dxil_offload: Option<DxilMatmulOffload>,
+    /// **2026-09-02新設**: この`Linear`の重みを FP8(E4M3/E5M2)量子化して
+    /// 保持し、`forward`で `opencuda_blas::sgemm_fp8_weight`(dequant-on-the-fly
+    /// GEMM)を通す。`GptModel::enable_fp8_weights`経由で全`Linear`へ
+    /// 一括設定する。未設定(`None`)なら従来どおり f32 の`weight_t`で
+    /// `sgemm`——既存挙動を変えない後方互換デフォルト。
+    ///
+    /// **正直な開示**: この開発機(GT730)に FP8 Tensor Core は無いため、
+    /// これは「FP8 表現の重みを f32 へ復元してから f32 で積和する」
+    /// ソフトウェア実装。利益は重みメモリ(1要素1バイト、f32 の 1/4)で
+    /// あり演算速度ではない(`opencuda-blas` の同名関数の doc 参照)。
+    fp8_weight: Option<opencuda_blas::QuantizedFp8Tensor>,
 }
 
 /// [`GptModel::set_matmul_dxil_offload`]で配線される、密GEMM専用の
@@ -354,7 +411,7 @@ impl std::fmt::Debug for DxilMatmulOffload {
 impl Linear {
     fn random(rng: &mut SplitMix64, in_dim: usize, out_dim: usize) -> Self {
         let scale = 1.0 / (in_dim as f32).sqrt();
-        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None, dxil_offload: None }
+        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None }
     }
 
     /// **2026-09-01新設**: 明示的な重み・バイアスから構築する
@@ -363,7 +420,7 @@ impl Linear {
     fn from_weights(weight_t: Vec<f32>, bias: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
         debug_assert_eq!(weight_t.len(), in_dim * out_dim);
         debug_assert_eq!(bias.len(), out_dim);
-        Self { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None }
+        Self { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None }
     }
 
     /// **2026-09-01新設**: 全出力を常にゼロにする`Linear`(=このLinearの
@@ -401,6 +458,17 @@ impl Linear {
             }
             return Ok(out);
         }
+        // FP8 量子化済み重みが配線されていれば dequant-on-the-fly GEMM を通す。
+        if let Some(q) = &self.fp8_weight {
+            let result = opencuda_blas::sgemm_fp8_weight(device, seq_len, self.in_dim, self.out_dim, x, q)?;
+            out.copy_from_slice(&result);
+            for row in 0..seq_len {
+                for c in 0..self.out_dim {
+                    out[row * self.out_dim + c] += self.bias[c];
+                }
+            }
+            return Ok(out);
+        }
         let spirv = self.spirv_matmul.as_deref().map(|v| v.as_slice());
         opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, spirv)?;
         for row in 0..seq_len {
@@ -409,6 +477,23 @@ impl Linear {
             }
         }
         Ok(out)
+    }
+
+    /// この`Linear`の重みを FP8 量子化して`fp8_weight`へ格納する。
+    /// `weight_t`(f32)はそのまま残す(DXIL/常駐経路が必要とする場合や、
+    /// 量子化前後の比較検証のため)——真のメモリ削減が必要なら呼び出し側で
+    /// クリアする。
+    fn quantize_to_fp8(&mut self, device: &dyn GpuDevice, format: opencuda_blas::Fp8Format) -> Result<()> {
+        // 転置レイアウト(in_dim×out_dim, 行優先)の各行(= 出力チャネル方向で
+        // なく入力チャネル 1 本ぶん)をグループにする。out_dim を group_size に
+        // すると重みの1行が1スケールを共有する。
+        let group = self.out_dim.max(1);
+        let q = match format {
+            opencuda_blas::Fp8Format::E4M3 => opencuda_blas::quantize_fp8_e4m3(device, &self.weight_t, group)?,
+            opencuda_blas::Fp8Format::E5M2 => opencuda_blas::quantize_fp8_e5m2(device, &self.weight_t, group)?,
+        };
+        self.fp8_weight = Some(q);
+        Ok(())
     }
 }
 
@@ -1183,6 +1268,7 @@ impl GptModel {
             out_dim: config.vocab_size,
             spirv_matmul: None,
             dxil_offload: None,
+            fp8_weight: None,
         };
 
         Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None, dxil_resident_weights: None })
@@ -1215,6 +1301,36 @@ impl GptModel {
             layer.output.spirv_matmul = Some(spirv.clone());
         }
         self.lm_head.spirv_matmul = Some(spirv);
+    }
+
+    /// **2026-09-02新設**: このモデル内の全`Linear`(各レイヤーのQKV融合/
+    /// attn_out/intermediate/output + `lm_head`)の重みを FP8(`format` =
+    /// `Fp8Format::E4M3` または `E5M2`)量子化して保持させ、`forward`が
+    /// `opencuda_blas::sgemm_fp8_weight`(dequant-on-the-fly GEMM)を通る
+    /// ようにする。**opt-in**——呼ばなければ従来どおり f32 の重みで動く。
+    ///
+    /// **正直な開示**: この開発機(GT730)に FP8 Tensor Core は無いため、
+    /// これは「FP8 表現の重みを f32 へ復元してから f32 で積和する」
+    /// ソフトウェア実装。得られる利益は**重みメモリの削減(1要素1バイト、
+    /// f32 の 1/4)**であり演算速度ではない。生成品質は FP8 の量子化誤差
+    /// (E4M3 で相対 ~2^-3)ぶん劣化する——`enable_mla_kv_compression` 等と
+    /// 同じく「配線が正しく動く+メモリを減らせる」ことの実証で、
+    /// 「品質を維持する」とは主張しない。Hopper/Ada 実機が得られれば
+    /// `opencuda-blas::select_gemm_path` からベンダー FP8 GEMM へ分岐する
+    /// 余地を残してある。
+    pub fn enable_fp8_weights(
+        &mut self,
+        device: &dyn GpuDevice,
+        format: opencuda_blas::Fp8Format,
+    ) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.qkv.quantize_to_fp8(device, format)?;
+            layer.attn_out.quantize_to_fp8(device, format)?;
+            layer.intermediate.quantize_to_fp8(device, format)?;
+            layer.output.quantize_to_fp8(device, format)?;
+        }
+        self.lm_head.quantize_to_fp8(device, format)?;
+        Ok(())
     }
 
     /// **2026-08-23新設**: 密GEMM(各レイヤーのQKV融合/attn_out/
@@ -2341,6 +2457,47 @@ mod tests {
         let _ = ByteTokenizer::decode(&generated);
     }
 
+    /// **2026-09-02新設**: `enable_fp8_weights` の配線検証。FP8 量子化した
+    /// 重みで `generate()` が最後まで完走し(FP8 演算カーネル
+    /// `sgemm_fp8_weight` が実際に呼ばれる)、量子化誤差ぶん出力が
+    /// 変わり得るが空にはならず、E4M3 と E5M2 のどちらでも動くこと。
+    #[test]
+    fn fp8_weights_generate_end_to_end_for_both_e4m3_and_e5m2() {
+        let device = device();
+        let prompt = ByteTokenizer::encode("hi");
+        let baseline = {
+            let m = GptModel::load_random(GptConfig::tiny(ByteTokenizer::VOCAB_SIZE), 7);
+            m.generate(&device, &prompt, 10).unwrap()
+        };
+        for fmt in [opencuda_blas::Fp8Format::E4M3, opencuda_blas::Fp8Format::E5M2] {
+            let mut m = GptModel::load_random(GptConfig::tiny(ByteTokenizer::VOCAB_SIZE), 7);
+            m.enable_fp8_weights(device.as_ref(), fmt).unwrap();
+            let out = m.generate(&device, &prompt, 10).unwrap();
+            assert_eq!(out.len(), 10, "{fmt:?}: fp8 generate must still produce all tokens");
+            let _ = ByteTokenizer::decode(&out);
+            // baseline は使うが厳密一致は求めない(FP8 は非可逆量子化)。
+            let _ = &baseline;
+        }
+    }
+
+    /// FP8 量子化→復元の往復が、重みの規模に対して妥当な相対誤差に
+    /// 収まること(E4M3 は narrow-range で E5M2 より精度が高い)。
+    #[test]
+    fn fp8_quantized_linear_weight_roundtrip_error_is_bounded() {
+        let device = device();
+        let mut lin = Linear::random(&mut SplitMix64::new(3), 16, 8);
+        let before = lin.weight_t.clone();
+        lin.quantize_to_fp8(device.as_ref(), opencuda_blas::Fp8Format::E4M3).unwrap();
+        let restored = opencuda_blas::dequantize_fp8(lin.fp8_weight.as_ref().unwrap());
+        let rel: f32 = before
+            .iter()
+            .zip(&restored)
+            .map(|(a, b)| (a - b).abs() / a.abs().max(1e-6))
+            .sum::<f32>()
+            / before.len() as f32;
+        assert!(rel < 0.1, "mean relative FP8 roundtrip error {rel} too large");
+    }
+
     /// **2026-08-17新設**: `generate_speculative`の核心的な正しさの検証
     /// ——ドラフトモデルにターゲットと同一のモデル(同一シード)を使うと、
     /// ドラフトの提案は常にターゲットの貪欲選択と一致する(採用率100%)
@@ -2717,30 +2874,26 @@ mod tests {
         assert_eq!(half::bf16::from_le_bytes([0x80, 0x3f]).to_f32(), 1.0); // 0x3F80 = 1.0
     }
 
-    /// **2026-09-01新設**: 対応外のdtype(整数量子化等)は、黙って
-    /// 壊れた値を返さず、対応形式を案内する正直なエラーを返すこと。
+    /// **2026-09-02更新**: 生の整数 dtype(I8 等)は「対応外エラー」ではなく
+    /// **直接キャストで読める**ようになった(scales/zeros を伴う GPTQ/AWQ の
+    /// パック済み量子化とは別物、という前提でのサポート)。ここでは I8 の
+    /// テンソルが実際に f32 へ変換されてロードが最後まで通ることを確認する。
     #[test]
-    fn load_rejects_unsupported_dtype_with_clear_error() {
+    fn load_parses_i8_safetensors_by_direct_cast() {
         use safetensors::tensor::{Dtype, TensorView};
         use std::collections::HashMap;
         let mut views: HashMap<String, TensorView> = HashMap::new();
-        let bytes = vec![0u8; 8];
-        views.insert("transformer.wte.weight".to_string(), TensorView::new(Dtype::I8, vec![2, 4], &bytes).unwrap());
+        // wte を [2,4] の I8。値は -3..4 の範囲(直接キャストで意味を持つ)。
+        let wte: Vec<u8> = (0..8i32).map(|i| ((i - 3) as i8) as u8).collect();
+        let ones8 = vec![1u8; 8];
+        views.insert("transformer.wte.weight".into(), TensorView::new(Dtype::I8, vec![2, 4], &wte).unwrap());
+        // 残りは合成モデルの最小構成(f32)——ここでは wte だけ I8 で足りる
+        // ように、フルモデルではなく tensor_f32 単体を叩いて確認する。
         let serialized = safetensors::serialize(&views, &None).unwrap();
-        let dir = std::env::temp_dir().join(format!("open-cuda-llm-bad-dtype-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), serialized).unwrap();
-        std::fs::write(
-            dir.join("config.json"),
-            r#"{"vocab_size":2,"n_embd":4,"n_layer":1,"n_head":2,"n_positions":8,"layer_norm_epsilon":1e-5}"#,
-        )
-        .unwrap();
-        let err = match GptModel::load(&dir) {
-            Ok(_) => panic!("expected load to fail for I8 dtype"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("unsupported dtype"), "unexpected error: {err}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
+        let out = tensor_f32(&st, "transformer.wte.weight").unwrap();
+        assert_eq!(out, vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0]);
+        let _ = ones8; // 未使用回避
     }
 
     /// 実GPT-2(124M、`openai-community/gpt2`のsafetensors)がこのマシンに
