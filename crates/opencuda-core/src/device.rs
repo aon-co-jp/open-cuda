@@ -130,14 +130,16 @@ pub trait GpuDevice: Send + Sync {
         false
     }
 
-    /// このデバイスがネイティブ FP8(E4M3/E5M2)Tensor Core 演算を
-    /// 実行できるかどうか。NVIDIA では Hopper(H100、SM90)/ Ada
-    /// Lovelace(RTX 40、SM89)以降でのみ true。デフォルトは `false`
+    /// このデバイスがネイティブ FP8(E4M3/E5M2)行列演算を実行できるか。
+    /// FP8 世代: NVIDIA Hopper(SM90)/ Ada(SM89)/ Blackwell(SM100・
+    /// SM120、RTX 5080/5090 含む)、AMD RDNA4(Radeon AI PRO R9700 等、
+    /// FP8 WMMA)、Intel Arc B/Xe2。移植性の高い経路は Vulkan
+    /// `VK_KHR_shader_float8` + cooperative matrix。デフォルトは `false`
     /// ——`opencuda-blas` の `select_gemm_path` が、FP8 量子化済み重みの
     /// GEMM をベンダー FP8 経路(`GemmPath::Fp8Tensor`)へ振るべきか、
     /// ソフトウェア dequant 経路へフォールバックすべきかを判断するための
-    /// 能力フラグ。現状 `true` を返す実バックエンドは無い(Hopper/Ada
-    /// 実機が本開発環境に無く未検証、AVX-512 経路と同じ「コードは用意して
+    /// 能力フラグ。現状 `true` を返す実バックエンドは無い(FP8 対応 GPU が
+    /// 本開発環境に無く未検証、AVX-512 経路と同じ「コードは用意して
     /// 機能フラグで有効化」の方針)。
     fn supports_fp8_tensor_core(&self) -> bool {
         false

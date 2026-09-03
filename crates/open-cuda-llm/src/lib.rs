@@ -451,8 +451,8 @@ fn load_conv1d_awq(
     );
     let bits = qc.bits as usize;
     let pack = 32 / bits; // 8
-    // 4bit AWQ の interleave 並び。論理列 c は AWQ_ORDER[c] 番目のニブルへ。
-    const AWQ_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    // 4bit AWQ の interleave 並び。論理列 c は AWQ_PACK_ORDER[c] 番目のニブルへ。
+    let awq_order = AWQ_PACK_ORDER;
     let mask: u32 = (1u32 << bits) - 1;
     let group_size: usize = if qc.group_size <= 0 { in_dim } else { qc.group_size as usize };
     let num_groups = in_dim.div_ceil(group_size);
@@ -482,7 +482,7 @@ fn load_conv1d_awq(
         let grp = (i / group_size).min(num_groups - 1);
         for o in 0..out_dim {
             let pcol = o / pack;
-            let shift = AWQ_ORDER[o % pack] * bits;
+            let shift = awq_order[o % pack] * bits;
             let q = (qweight[i * packed_out + pcol] >> shift) & mask;
             let z = (qzeros[grp * packed_out + pcol] >> shift) & mask;
             let scale = scales[grp * out_dim + o];
@@ -497,6 +497,69 @@ fn load_conv1d_awq(
         bias.len()
     );
     Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+}
+
+/// AWQ の interleave 並び(4bit、pack=8)。`load_conv1d_awq` と共有。
+/// 論理列 `c` は 32bit ワード内のニブル位置 `AWQ_ORDER[c]` に格納される。
+pub const AWQ_PACK_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+
+/// AWQ INT4 形式の 3 テンソル `(qweight, qzeros, scales)` を、f32 の
+/// `Conv1D` 重み(`[in_dim, out_dim]` 行優先、`load_conv1d` が返す `weight_t`
+/// と同じレイアウト)から生成する。**`load_conv1d_awq` の厳密な逆**であり、
+/// パック順(`AWQ_PACK_ORDER`)・グループ非対称量子化(`w ≈ (q - z) * scale`)・
+/// テンソル形状(`qweight [in_dim, out_dim/8]`、`qzeros [in/group, out/8]`、
+/// `scales [in/group, out]`)まで一致させる。
+///
+/// これにより「合成テンソルの厳密一致テスト」だけでなく、**実 GPT-2 の
+/// 実重みを AWQ 量子化 → `load_conv1d_awq` で読み戻し → 逆量子化誤差が
+/// AWQ の想定範囲内**、というラウンドトリップ検証ができる。
+/// **正直な開示**: これは本実装のパック規約に対する自己整合性 + 実重みでの
+/// 誤差評価を保証するが、実際の AutoAWQ が書き出したワイヤ形式との
+/// 互換性そのものは、実 AutoAWQ 出力が無いため引き続き検証できていない。
+pub fn quantize_conv1d_awq(
+    weight_t: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<f32>) {
+    let bits = 4usize;
+    let pack = 8usize;
+    let qmax = (1u32 << bits) - 1; // 15
+    let group_size = if group_size == 0 { in_dim } else { group_size };
+    let num_groups = in_dim.div_ceil(group_size);
+    let packed_out = out_dim / pack;
+
+    let mut qweight = vec![0u32; in_dim * packed_out];
+    let mut qzeros = vec![0u32; num_groups * packed_out];
+    let mut scales = vec![0.0f32; num_groups * out_dim];
+
+    for g in 0..num_groups {
+        let row_lo = g * group_size;
+        let row_hi = ((g + 1) * group_size).min(in_dim);
+        for o in 0..out_dim {
+            // グループ g・列 o の値域から非対称スケール/ゼロ点を決める。
+            let mut wmin = f32::INFINITY;
+            let mut wmax = f32::NEG_INFINITY;
+            for i in row_lo..row_hi {
+                let w = weight_t[i * out_dim + o];
+                wmin = wmin.min(w);
+                wmax = wmax.max(w);
+            }
+            let scale = if wmax > wmin { (wmax - wmin) / qmax as f32 } else { 1.0 };
+            let z = (((-wmin) / scale).round() as i64).clamp(0, qmax as i64) as u32;
+            scales[g * out_dim + o] = scale;
+
+            let shift = AWQ_PACK_ORDER[o % pack] * bits;
+            let pcol = o / pack;
+            qzeros[g * packed_out + pcol] |= (z & qmax) << shift;
+            for i in row_lo..row_hi {
+                let w = weight_t[i * out_dim + o];
+                let q = ((w / scale).round() as i64 + z as i64).clamp(0, qmax as i64) as u32;
+                qweight[i * packed_out + pcol] |= (q & qmax) << shift;
+            }
+        }
+    }
+    (qweight, qzeros, scales)
 }
 
 /// `quantization_config` の有無・方式で GPTQ / AWQ 逆量子化ロードか
@@ -3218,7 +3281,7 @@ mod tests {
         use safetensors::tensor::{Dtype, TensorView};
         use std::collections::HashMap;
 
-        const AWQ_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+        let awq_order = super::AWQ_PACK_ORDER;
         let (in_dim, out_dim, bits) = (16usize, 8usize, 4usize);
         let pack = 32 / bits; // 8
         let group_size = 8usize; // 2 グループ
@@ -3241,7 +3304,7 @@ mod tests {
         let mut qweight = vec![0u32; in_dim * packed_out];
         for i in 0..in_dim {
             for o in 0..out_dim {
-                let shift = AWQ_ORDER[o % pack] * bits;
+                let shift = awq_order[o % pack] * bits;
                 qweight[i * packed_out + o / pack] |= (q(i, o) & 0xF) << shift;
             }
         }
@@ -3249,7 +3312,7 @@ mod tests {
         let mut qzeros = vec![0u32; num_groups * packed_out];
         for g in 0..num_groups {
             for o in 0..out_dim {
-                let shift = AWQ_ORDER[o % pack] * bits;
+                let shift = awq_order[o % pack] * bits;
                 qzeros[g * packed_out + o / pack] |= (zero(g, o) & 0xF) << shift;
             }
         }
@@ -3289,6 +3352,81 @@ mod tests {
         // load_conv1d_maybe_quant が quant_method="awq" で AWQ 経路を選ぶこと。
         let lin2 = load_conv1d_maybe_quant(&st, "h.0.attn.c_attn", in_dim, out_dim, Some(&qc)).unwrap();
         assert_eq!(lin2.weight_t, lin.weight_t);
+    }
+
+    /// **2026-09-03新設**: `quantize_conv1d_awq`(AWQ 量子化器)→ safetensors
+    /// 直列化 → `load_conv1d_awq`(逆量子化ロード)のラウンドトリップ。
+    /// **決定的だが「実重みに近い」乱数 f32 の Conv1D 重み**を量子化し、
+    /// 読み戻した `weight_t` が元の値から AWQ 非対称 INT4 の想定誤差
+    /// (グループ幅 ÷ 15 = scale の半分程度)以内であることを確認する。
+    /// これで検証上限は「合成テンソルの厳密一致」から「実重み相当での
+    /// 量子化誤差評価」へ引き上がる(正直な開示: 実 AutoAWQ が書き出した
+    /// ワイヤ形式との互換性そのものは、実出力が無いため引き続き未検証)。
+    #[test]
+    fn awq_quantize_then_load_round_trips_within_int4_error_bounds() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use std::collections::HashMap;
+
+        let (in_dim, out_dim, group_size) = (64usize, 24usize, 16usize);
+        // ざらついた分布の擬似「実重み」(振幅・符号ともばらつく)。
+        let mut w = vec![0.0f32; in_dim * out_dim];
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        for v in w.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let u = (s >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
+            *v = (u - 0.5) * 0.4; // ~[-0.2, 0.2]
+        }
+
+        let (qweight, qzeros, scales) = quantize_conv1d_awq(&w, in_dim, out_dim, group_size);
+        let pack = 8usize;
+        let num_groups = in_dim / group_size;
+        assert_eq!(qweight.len(), in_dim * (out_dim / pack));
+        assert_eq!(qzeros.len(), num_groups * (out_dim / pack));
+        assert_eq!(scales.len(), num_groups * out_dim);
+
+        let to_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let qw_b = to_bytes(&qweight);
+        let qz_b = to_bytes(&qzeros);
+        let sc_b: Vec<u8> = scales.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let mut views: HashMap<String, TensorView> = HashMap::new();
+        views.insert("h.0.mlp.c_fc.qweight".into(), TensorView::new(Dtype::I32, vec![in_dim, out_dim / pack], &qw_b).unwrap());
+        views.insert("h.0.mlp.c_fc.qzeros".into(), TensorView::new(Dtype::I32, vec![num_groups, out_dim / pack], &qz_b).unwrap());
+        views.insert("h.0.mlp.c_fc.scales".into(), TensorView::new(Dtype::F32, vec![num_groups, out_dim], &sc_b).unwrap());
+        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
+
+        let qc = QuantizationConfig {
+            bits: 4,
+            group_size: group_size as i64,
+            quant_method: "awq".into(),
+            desc_act: false,
+            sym_zero_plus_one: true,
+        };
+        let lin = load_conv1d_awq(&st, "h.0.mlp.c_fc", in_dim, out_dim, &qc).unwrap();
+        assert_eq!(lin.weight_t.len(), in_dim * out_dim);
+
+        // グループごとの scale を再計算し、誤差 <= scale * 0.75 を確認。
+        let mut max_rel = 0.0f32;
+        for g in 0..num_groups {
+            for o in 0..out_dim {
+                let scale = scales[g * out_dim + o].max(1e-12);
+                for i in (g * group_size)..((g + 1) * group_size) {
+                    let orig = w[i * out_dim + o];
+                    let got = lin.weight_t[i * out_dim + o];
+                    let err = (orig - got).abs();
+                    assert!(
+                        err <= scale * 0.75,
+                        "g{g} o{o} i{i}: |{orig} - {got}| = {err} > 0.75*scale ({})",
+                        scale * 0.75
+                    );
+                    max_rel = max_rel.max(err / scale);
+                }
+            }
+        }
+        // 非対称 INT4 なら誤差は概ね scale/2 以内に収まる。
+        assert!(max_rel <= 0.6, "worst-case error {max_rel} of a scale is too large for asymmetric INT4");
     }
 
     /// AWQ(パック順が異なる)は `load_conv1d_gptq` からは正直なエラーを返すこと
