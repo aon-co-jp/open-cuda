@@ -168,6 +168,60 @@ incl. RTX 50, AMD RDNA4 incl. Radeon AI PRO R9700, Intel Arc B/Xe2), not
 per-vendor BLAS. Implementation change is doc-only; still only verified on
 one NVIDIA GT 730.
 
+### 2026-09-03(続き)世界中の言語で再調査 → `OmniGPU-Design.md` §11.6 / §12 更新(コード変更なし)
+
+ユーザー指示「OmniGPU-Design.md 等は世界中の言語で Google/GitHub 再調査
+してから再編集して」。英・日・中 + GitHub 中心で再検索し、§11.1〜11.5 /
+§12.1〜12.5 の**設計方針は 1 行も撤回せず**、一次資料の更新のみ反映:
+- **`EmbarkStudios/rust-gpu` は 2025-10-31 にアーカイブ(読み取り専用)**。
+  「単一 Rust ソース → 全 GPU」のメンテ実装は **CubeCL(`tracel-ai/
+  cubecl`)** と **wgpu+`naga`**(WGSL/SPIR-V → SPIR-V/MSL/GLSL/HLSL/DXIL、
+  golden parity SPIR-V 87/87・MSL 91/91)へ移行。§11.4-4 を「naga →
+  CubeCL/naga の 2 択、ただし open-cuda は同じ設計原則なので外部依存を
+  増やさず現状路線」へ更新。
+- **`VK_EXT_shader_float8`(E4M3/E5M2)は出荷ドライバ入り**: NVIDIA
+  2025-06-08(Win 573.38 / Linux 570.123.18)以降、**AMD Adrenalin
+  25.10.2(2025-10-29)以降**。Intel は未確認。→ §11.4-3「FP8 移植性
+  実装先 = SPIR-V + Vulkan 拡張」は理論値 → **実ドライバで動く前提**へ
+  格上げ。`sgemm_fp8_weight_vendor` を実装する GPU が入手できたら
+  cuBLASLt ではなく `VK_EXT_shader_float8` + `VK_KHR_cooperative_matrix`
+  の SPIR-V compute を第一実装とする。
+- **Vulkan 1.4.342** で `VK_QCOM_cooperative_matrix_conversion`(shared
+  memory を介さず coop matrix ロード/ストア)。llama.cpp Vulkan の拡張
+  スタック = `VK_KHR_cooperative_matrix` + `VK_NV_cooperative_matrix2` +
+  `VK_KHR_shader_integer_dot_product` + `VK_KHR_shader_bfloat16`
+  (FOSDEM 2026「Vulkan API for ML — competing with CUDA and ROCm in
+  llama.cpp」)。→ open-cuda の Vulkan GEMM/Attention を tensor-core 相当へ
+  最適化する際の拡張リストの正本。
+- **llama.cpp は 2026-04 にバックエンド非依存のテンソル並列を導入**
+  (ベンダー混在可)。→ §6 マルチGPU の将来拡張は SPIR-V 単一カーネル +
+  デバイス列挙だけで NVIDIA+AMD 混在テンソル並列が組める裏付け。
+- **`dxil-spirv` は 2026-02 に production SM 6.9**(DXBC も `dxbc-spirv`)。
+  → §12.3「open-directx = DXBC/DXIL→SPIR-V フロントエンド」役割再定義の
+  実現性が確定。
+- **WebGPU は W3C Candidate Recommendation Draft(2026-05-21)**。WebLLM は
+  ネイティブ比 ~80%、埋め込みは WebGPU が WASM 比 40〜75×。→ aruaru-llm
+  の「WebGPU/wasm は将来オプション」の裏付け更新。
+- **Intel**: Arc/Xe は Vulkan・SYCL 両方で llama.cpp が動作、Linux の
+  `intel/compute-runtime`(Level Zero)は成熟。→ Intel も Vulkan/SPIR-V の
+  同一経路で扱う(Level Zero は "任意の高速化" 扱い)。
+
+**English**: World-language (EN/JA/ZH) + GitHub re-research; no design
+reversals, only primary-source updates in `OmniGPU-Design.md` §11.6 /
+§12. `EmbarkStudios/rust-gpu` was **archived 2025-10-31** — the
+maintained "single Rust source → every GPU" path is now CubeCL and
+wgpu+`naga`. `VK_EXT_shader_float8` is now in **shipping drivers**:
+NVIDIA (2025-06) and AMD Adrenalin 25.10.2 (2025-10) — so the portable
+FP8-GEMM target (SPIR-V + `VK_EXT_shader_float8` +
+`VK_KHR_cooperative_matrix`) is no longer theoretical. Vulkan 1.4.342
+adds `VK_QCOM_cooperative_matrix_conversion`; llama.cpp's Vulkan ext
+stack is the reference for tensor-core-class GEMM/Attention. llama.cpp
+shipped backend-agnostic tensor parallelism (2026-04, vendor-mix OK).
+`dxil-spirv` reached production SM 6.9 (2026-02) — confirms the
+open-directx "DXBC/DXIL→SPIR-V frontend" role. WebGPU is a W3C Candidate
+Recommendation Draft (2026-05). Intel Arc/Xe runs llama.cpp on both
+Vulkan and SYCL. Doc-only; still one NVIDIA GT 730 for real testing.
+
 ## HANDOFF追記(2026-09-01、`open-cuda-llm`にModel Folding〈層冗長性検出・除去・線形アダプタ置換〉を実装——他アカウントでの再開用メモ、必ず読むこと)
 
 `aruaru-llm`側からの依頼(ユーザー指示「DeepSeekの折りたたみ理論

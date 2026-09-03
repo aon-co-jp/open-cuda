@@ -417,7 +417,11 @@ macOS・Linux・Unix でも機能するよう、世界中の言語で Google/Git
 
 ### 11.1 一次資料調査(2025〜2026、英語)
 
-- **「Rust running on every GPU」**([rust-gpu.github.io, 2025-07-25](https://rust-gpu.github.io/blog/2025/07/25/rust-on-every-gpu/)):
+- **「Rust running on every GPU」**([rust-gpu.github.io, 2025-07-25](https://rust-gpu.github.io/blog/2025/07/25/rust-on-every-gpu/))
+  ——**⚠️ 2025-10-31 に `EmbarkStudios/rust-gpu` はアーカイブ(読み取り専用)化**。
+  デモの結論(単一 Rust ソース → SPIR-V/naga で全ベンダー・全 OS)は
+  概念として有効だが、**メンテされている実装経路は CubeCL と wgpu+naga**
+  へ移った(2026-09 更新、§11.6)。
   **単一の Rust コードベース**を、`rustc_codegen_nvvm`(→ PTX を CPU
   バイナリへ埋め込み、実行時に CUDA ドライバへ)と `rustc_codegen_spirv`
   (→ SPIR-V)でビルド時に GPU バイナリ化し、**CUDA(NVIDIA)/ SPIR-V
@@ -497,6 +501,80 @@ macOS・Linux・Unix でも機能するよう、世界中の言語で Google/Git
   GT 730(Turing 未満)が非対応のため、この機ではコンパイル検証すら
   できない。
 
+### 11.6 2026-09 更新(世界中の言語で Google/GitHub 再調査)
+
+ユーザー指示「世界中の言語で Google/GitHub を再調査してから記録」。
+英・日・中で再検索した結果、§11.1〜11.5 の設計方針は**変更不要**だが、
+以下の一次資料の更新を反映する。
+
+- **`EmbarkStudios/rust-gpu` は 2025-10-31 にアーカイブ(読み取り専用)化**
+  ([rust-gpu ecosystem](https://rust-gpu.github.io/ecosystem/)、
+  [HN 44692876](https://news.ycombinator.com/item?id=44692876))。
+  「単一 Rust ソース → 全 GPU」の**メンテされている実装は
+  [`tracel-ai/cubecl`](https://github.com/tracel-ai/cubecl)**(`#[cube]` →
+  CUDA/HIP/Metal/SPIR-V/WGSL/CPU-SIMD、comptime 特殊化 + autotune +
+  tensor-core 自動経路、Burn の計算バックエンド)と **wgpu+`naga`**。
+  → §11.4-4 の「naga は将来の第一候補」を「**CubeCL と naga の 2 択**、
+  ただし open-cuda は既に同じ設計原則(SPIR-V/DXIL/Native 3 IR + CPU
+  第一級 + 能力交渉)なので外部依存を増やさず現状路線」へ更新。
+- **`VK_EXT_shader_float8`(E4M3/E5M2)は 2026 時点で出荷ドライバ入り**:
+  NVIDIA は 2025-06-08 ドライバ(Windows 573.38 / Linux 570.123.18)以降、
+  **AMD は Adrenalin 25.10.2(2025-10-29)以降**で対応
+  ([VK_EXT_shader_float8 proposal](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_shader_float8.html)、
+  [Khronos SIGGRAPH 2025](https://www.khronos.org/blog/vulkan-continuing-to-forge-ahead-siggraph-2025))。
+  Intel の対応状況は未確認。→ §11.4-3 の「FP8 ベンダー GEMM の移植性
+  実装先 = SPIR-V + Vulkan 拡張」は**もはや理論値ではなく、NVIDIA
+  Ada/Blackwell + AMD RDNA4 の実ドライバで動く前提**として格上げ。
+  `sgemm_fp8_weight_vendor` を実装する GPU が入手できたら、cuBLASLt
+  ではなく **`VK_EXT_shader_float8` + `VK_KHR_cooperative_matrix` の
+  SPIR-V compute** を第一実装とする。
+- **`VK_KHR_cooperative_matrix`(ベンダー中立)** に加え、Vulkan 1.4.342
+  で **`VK_QCOM_cooperative_matrix_conversion`**(shared memory を介さず
+  cooperative matrix をロード/ストア)が追加
+  ([Phoronix](https://www.phoronix.com/news/Vulkan-1.4.342-Released))。
+  llama.cpp の Vulkan バックエンドは `VK_KHR_cooperative_matrix` +
+  `VK_NV_cooperative_matrix2` + `VK_KHR_shader_integer_dot_product` +
+  `VK_KHR_shader_bfloat16` を使う
+  ([FOSDEM 2026: Vulkan API for ML](https://philpax.me/notes/talks/other-people/fosdem-2026/vulkan-api-for-machine-learning-competing-with-cuda-and-rocm-in-llamacpp/))。
+  → open-cuda の Vulkan GEMM/Attention を tensor-core 相当へ最適化する
+  際の拡張リストの正本。
+- **llama.cpp は 2026-04 に「バックエンド非依存のテンソル並列」を導入**
+  (演算単位で複数 GPU へ分割、ベンダーロックイン無し)。
+  → §6「マルチGPU統合」を将来拡張する際、ベンダー混在(NVIDIA+AMD)の
+  テンソル並列は SPIR-V 単一カーネル + デバイス列挙だけで組める、という
+  裏付け。
+- **DXIL→SPIR-V は 2026-02 に production SM 6.9 到達**
+  ([dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv)、
+  [DXC Vulkan interop 2026](https://www.huuphan.com/2026/03/directx-shader-compiler-7-massive.html))。
+  DXBC(SM4/5)も `dxbc-spirv` で扱える。→ §12.3 の「open-directx =
+  DXBC/DXIL→SPIR-V フロントエンド」役割再定義の実現性が確定。
+- **WebGPU は W3C Candidate Recommendation Draft(2026-05-21)**。
+  WebLLM は同一デバイスでネイティブ比 ~80%、埋め込み生成は WebGPU が
+  WASM 比 40〜75×
+  ([WebLLM arXiv:2412.15803](https://arxiv.org/html/2412.15803v2)、
+  [Llamas on the Web arXiv:2605.20706](https://arxiv.org/html/2605.20706v1))。
+  → aruaru-llm の「WebGPU/wasm は将来オプション」(§12.3)の裏付け更新。
+
+- **`naga`(wgpu の翻訳器)** は WGSL/SPIR-V を入力に取り、**SPIR-V /
+  MSL / GLSL / HLSL / DXIL** を出力する(GitHub 調査で golden 出力
+  parity: SPIR-V 87/87・MSL 91/91・HLSL 72/72 等)。→ open-cuda が
+  将来 macOS ネイティブ Metal(MoltenVK を挟まない)や WebGPU へ広げる
+  なら、`SpirV` カーネルを `naga` に通して MSL/WGSL を得るのが最短。
+  新 IR は増やさない(§12.2-1)。
+- **Intel**: `VK_EXT_shader_float8` の対応は未確認だが、Arc/Xe は
+  Vulkan と SYCL の両方で llama.cpp が動く実績があり、Linux の
+  オープンソース compute スタック(`intel/compute-runtime`、Level Zero)
+  は成熟してきている
+  ([Phoronix: Arc compute Q1](https://www.phoronix.com/review/arc-graphics-compute-q1))。
+  → open-cuda は Intel も **Vulkan/SPIR-V の同一経路**で扱えばよい
+  (Level Zero ネイティブ経路は "任意の高速化" 扱い、§12.2-1)。
+
+**結論(誇張しない)**: 設計方針(§11.4)は 1 行も撤回しない。変わったのは
+「rust-gpu が非メンテ → CubeCL/naga が後継」「Vulkan FP8 が理論 → 実
+ドライバ(NVIDIA・AMD)」の 2 点で、いずれも **open-cuda の現状路線
+(SPIR-V 背骨 + Vulkan 拡張で FP8)を強化する方向**。実機検証手段
+(AMD/Intel/Apple/FP8 対応 GPU)がこの開発機に無い点は不変。
+
 ---
 
 ## 12. エコシステム横断の設計見直し(2026-09-03、dream-os / open-directx / open-cuda / aruaru-llm / aruaru-db)
@@ -528,6 +606,15 @@ aruaru-llm・aruaru-db の新規設計・新規実装の見直し)に活かす�
   実運用の LLM 推論に耐えることを示した(将来 aruaru-llm を wasm/WebGPU へ
   広げる際の裏付け)。
 - **MLC-LLM**: ML コンパイル(TVM)で "一度コンパイルしてどこでも実行"。
+
+**2026-09 更新(世界中の言語で再調査、§11.6 と対)**: (1) `rust-gpu` 非
+メンテ化により「単一 Rust ソース → 全 GPU」のメンテ実装は **CubeCL /
+wgpu+naga**。(2) `VK_EXT_shader_float8` が NVIDIA(2025-06)/ AMD
+Adrenalin 25.10.2(2025-10)の**出荷ドライバ**へ。(3) llama.cpp が
+2026-04 に**バックエンド非依存のテンソル並列**(ベンダー混在可)を導入。
+(4) `dxil-spirv` が 2026-02 に **production SM 6.9**。(5) WebGPU が W3C
+**Candidate Recommendation Draft**(2026-05)。→ いずれも §12.2〜12.3 の
+方針を**強化する方向**で、撤回・変更は無い。
 
 ### 12.2 横断的な設計原則(全リポジトリ共通)
 
