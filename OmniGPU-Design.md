@@ -496,3 +496,87 @@ macOS・Linux・Unix でも機能するよう、世界中の言語で Google/Git
 - FP8 の Vulkan 拡張経路(`VK_EXT_shader_float8` + cooperative matrix)は
   GT 730(Turing 未満)が非対応のため、この機ではコンパイル検証すら
   できない。
+
+---
+
+## 12. エコシステム横断の設計見直し(2026-09-03、dream-os / open-directx / open-cuda / aruaru-llm / aruaru-db)
+
+ユーザー指示「§11 の調査を次の作業(dream-os・open-directx・open-cuda・
+aruaru-llm・aruaru-db の新規設計・新規実装の見直し)に活かす」への対応。
+§11 の一次資料に加え、DirectX 互換層 / LLM 推論エンジンの移植性設計を
+追加調査し、**5 リポジトリの役割を「Vulkan + SPIR-V の単一移植性コア」に
+収斂させる方針**をまとめる。実装はこの節の方針に沿って順次進める
+(この節自体はコード変更を含まない設計文書)。
+
+### 12.1 追加の一次資料調査(2025〜2026、英語)
+
+- **vkd3d-proton / DXVK 3.0**([DXIL to SPIR-V, DeepWiki](https://deepwiki.com/HansKristian-Work/vkd3d-proton/4.2-dxil-to-spir-v)、
+  [DXVK 3.0, Phoronix](https://www.phoronix.com/news/DXVK-3.0-Release)):
+  DXVK と vkd3d-proton は**共通の DXBC フロントエンド**を持ち、DXBC(SM4/5)も
+  DXIL(SM6)も外部ライブラリ **`dxil-spirv`** 経由で SPIR-V へ変換する。
+  DXVK 3.0 の `DXBC-SPIRV` は D3D SM5.1+ 向けの **SSA ベースコンパイラ**で、
+  ネイティブ翻訳より**コンパクトな SPIR-V** を吐き、翻訳はワーカースレッドへ
+  オフロードされる。→ **DirectX シェーダを "並行バックエンド" にするのは
+  もう筋が悪い。DXBC/DXIL → SPIR-V → 単一 Vulkan 経路が実証された道。**
+- **llama.cpp のバックエンド行列**([Red Hat Developer, 2026](https://developers.redhat.com/articles/2026/06/15/llamacpp-vs-vllm-choosing-right-local-llm-inference-engine)):
+  Metal(Apple)/ AVX・AVX2・AVX512・AMX(x86)/ RISC-V / CUDA / HIP(AMD)/
+  MUSA / **Vulkan** / SYCL(Intel)。CUDA/Vulkan では int8 活性化量子化も。
+  「互換性重視の推論エンジン(llama.cpp / MLC-LLM)はヘテロな個人デバイスと
+  バックエンドへの互換性に集中する」——aruaru-llm と同じ立ち位置。
+- **「Llamas on the Web」**([arXiv:2605.20706](https://arxiv.org/pdf/2605.20706)):
+  **WebGPU** で省メモリ・性能移植性・多精度の LLM 推論。WebGPU/wgpu が
+  実運用の LLM 推論に耐えることを示した(将来 aruaru-llm を wasm/WebGPU へ
+  広げる際の裏付け)。
+- **MLC-LLM**: ML コンパイル(TVM)で "一度コンパイルしてどこでも実行"。
+
+### 12.2 横断的な設計原則(全リポジトリ共通)
+
+§11 と合わせ、以下を**エコシステム全体の設計哲学**として確定する。
+
+1. **SPIR-V を唯一の実行時 GPU IR にする**。CUDA(PTX)/ HIP / Level Zero /
+   Metal(MSL)は "任意の高速化経路"。並行して別 IR を実行系として持たない
+   (rust-gpu / CubeCL / wgpu / vkd3d-proton すべてこの構造)。
+2. **CPU を第一級バックエンドにして GPU 無し CI を可能にする**
+   (`KernelSource::Native` + `opencuda-cpu`)。
+3. **能力交渉**(`supports_spirv` / `supports_dxil` /
+   `supports_fp8_tensor_core` / 将来 `supports_cooperative_matrix`)で
+   機能を選び、ベンダー ID で実行経路を分岐しない。
+4. **外向き互換を保ちつつ内部を刷新する**(aruaru-db の HLC P-HLC-3 で
+   実証: u64 ワイヤ形式を維持したまま内部を案A へ全面移行)。他リポジトリの
+   大きな設計変更にもこの原則を適用する。
+5. **OS 差は "Vulkan ローダをどう見つけるか" に閉じ込める**
+   (Linux: mesa/proprietary ICD、Windows: `vulkan-1.dll`、macOS/iOS:
+   MoltenVK、その他 Unix: mesa)。OS 依存の実行経路分岐を書かない。
+
+### 12.3 リポジトリ別の見直し方針
+
+| リポジトリ | 現状 | 見直し方針(§11/§12 を活かす) |
+|---|---|---|
+| **open-cuda** | `KernelSource` に `Native` / `SpirV` / `Dxil` の 3 IR。Vulkan・DirectX 両バックエンド実機検証済み(GT 730)。CPU 第一級。能力フラグ 3 種。 | (a) **`Dxil` を "実行 IR" から降格**し、`dxil-spirv` 相当の DXIL→SPIR-V 変換を通して**単一 Vulkan 経路へ寄せる**(DirectX バックエンドは Vulkan が無い Windows 向けの純フォールバックに限定)。(b) **macOS 対応 = MoltenVK 経由 Vulkan の実機検証**(新バックエンドを書かない)。(c) FP8 ベンダー GEMM の実装先を **SPIR-V + `VK_EXT_shader_float8` + `VK_KHR_cooperative_matrix`** に確定(cuBLASLt/hipBLASLt 分岐は書かない)。(d) `naga` を将来の Metal ネイティブ / WebGPU 拡張時の翻訳器候補として記録。 |
+| **open-directx** | DXBC/DXIL ↔ SPIR-V 変換 + Vulkan グラフィックス(独立リポジトリ。open-cuda 内蔵の `opencuda-directx` とは別物、§8.5 の混同注意)。 | **役割を「並行 GPU バックエンド」から「DXBC/DXIL → SPIR-V フロントエンド」へ再定義**。vkd3d-proton/DXVK が実証した通り、DirectX 由来のシェーダ・OS レベルのグラフィックス命令を **SPIR-V へ翻訳して open-cuda の Vulkan 経路へ流す**のが本筋。`dxil-spirv` の設計(共通 DXBC フロントエンド + SSA IR)を参照実装として、翻訳品質・コンパクトさを目標にする。 |
+| **dream-os** | SBM(`sbm_ising`)・マイニング相当(`sha256d_mine`)カーネルは既に SPIR-V(open-cuda 経由)。OS レベルの GPU 利用構想。 | dream-os 固有の GPU 移植性コードは**追加しない**。open-cuda の `GpuDevice` trait + SPIR-V + 能力交渉を**そのまま継承**する。OS レベルのスケジューリング(どのプロセスにどれだけ GPU を割り当てるか)は dream-os の責務だが、実行経路は open-cuda に委譲。東芝 SBM の第3世代アルゴリズム("edge of chaos")は SPIR-V カーネルの改良として取り込める(実行系の変更は不要)。 |
+| **aruaru-llm** | CPU-SIMD(AVX2+FMA3、実測 3.34x)/ Vulkan / DXIL 済み。`ARUARU_LLM_*` env で FP8・MLA 等を opt-in。 | (a) **バックエンド行列を llama.cpp に倣って明示**(CPU-SIMD=済 / Vulkan=済 / DXIL=済 / Metal=MoltenVK 経由で将来 / HIP・SYCL=optional)。(b) `ARUARU_LLM_ENABLE_*` の opt-in 群を、起動時の**能力交渉 → 自動選択**へ寄せる(env は override として残す)。(c) int8 活性化量子化(llama.cpp が CUDA/Vulkan で採用)を `opencuda-blas` の `dot_i8`(VNNI 経路、実装済み・未配線)と繋ぐ検討。(d) WebGPU 経路は「Llamas on the Web」を裏付けに、wasm ターゲットの将来オプションとして記録。 |
+| **aruaru-db** | GPU とは直交。HLC は P-HLC-3 で CockroachDB 準拠のフル精度 2 フィールド + uncertainty interval へ。 | GPU 移植性の直接の対象外。ただし **§12.2-(4)「外向き互換を保ちつつ内部を刷新」は HLC P-HLC-3 が最初の実証例**であり、今後 aruaru-db が pgwire / GraphQL / Raft ワイヤ形式を保ったまま内部を刷新する際の設計原則として明文化する(`docs/CONTROL_PLANE_REDESIGN.md` の宣言的設計と同じ精神)。 |
+
+### 12.4 実装順(この方針を反映する次の作業)
+
+1. **open-cuda**: macOS/MoltenVK の実機検証(Android クロスビルドと同じ手順、
+   §11.3)。→ クロスOS の "検証済み" 欄を Linux/Windows から macOS へ拡張。
+2. **open-cuda**: `dxil-spirv` 相当の DXIL→SPIR-V 経路を調査し、
+   `opencuda-directx` を Vulkan フォールバック専用へ縮退させる設計 PR。
+3. **aruaru-llm**: バックエンド自動選択(能力交渉)+ バックエンド行列の
+   README 明記。
+4. **open-directx**(独立リポ): 役割再定義を CLAUDE.md/README へ明記し、
+   SPIR-V フロントエンド化のロードマップを書く。
+5. **dream-os**: 「GPU 実行系は open-cuda に委譲、dream-os は OS レベルの
+   割り当てのみ」を CLAUDE.md へ明記。
+
+### 12.5 正直な現状・非目標(誇張しない)
+
+- 実機検証は依然 **NVIDIA GT 730(Kepler)1 台のみ**。macOS / AMD / Intel /
+  モバイル / FP8 対応 GPU での検証手段はこの開発機に無い。
+- 本節は**設計方針の確定と一次資料の裏取り**。上記の実装順はまだ着手して
+  いない(次の作業)。
+- 「CUDA 完全互換」は非目標(§9)。目標は「1 つの Rust コードが SPIR-V
+  経由で NVIDIA/AMD/Intel の Vulkan 対応 GPU 上を、Windows/macOS/Linux/
+  Unix で動く」実用的サブセット。
