@@ -667,3 +667,67 @@ Adrenalin 25.10.2(2025-10)の**出荷ドライバ**へ。(3) llama.cpp が
 - 「CUDA 完全互換」は非目標(§9)。目標は「1 つの Rust コードが SPIR-V
   経由で NVIDIA/AMD/Intel の Vulkan 対応 GPU 上を、Windows/macOS/Linux/
   Unix で動く」実用的サブセット。
+
+## 13. 精度(F16/F32/F64/F128) × 32GB級 VRAM ベンダー対応(2026-09-03)
+
+ユーザー指示「今後は NVIDIA(RTX)/AMD/Intel の 32GB VRAM 級カードを前提に、
+F16/F32/F64 を見据えて開発する」+ 追って「F128 まで対応して」。本節は
+その設計方針と、このマシン(GT 730、Kepler、2GB)では実機検証できない
+ことの正直な線引きを記録する。
+
+### 13.1 前提とする 32GB 級カード(既知の範囲、確認できないものは明記)
+
+- **NVIDIA**: RTX PRO 6000 Blackwell(96GB、参考。32GB 級としては
+  RTX 5090 32GB)。データセンター向け H100/H200 は 80GB/141GB クラスで
+  今回の「32GB 級」の枠外だが同系アーキテクチャとして参考にする。
+- **AMD**: Radeon PRO(Instinct系データセンター GPU、または Radeon AI
+  PRO R9700 32GB)。§11.4-3 の FP8 調査で言及した RDNA4 世代。
+- **Intel**: Arc Pro シリーズの高VRAM構成。**正直な開示**: Arc Pro の
+  32GB 単体カード構成の存在は本セッション内で一次資料の裏取りができて
+  おらず未確認のまま記録する(過大主張を避けるため)。
+- **共通の正直な開示**: これらいずれの実機もこの開発機には無い
+  (§12.5 と同じ制約)。本節は「今後この階級のカードが来た場合に
+  どう設計を対応させるか」の設計文書であり、実機検証済みという主張は
+  一切していない。
+
+### 13.2 F16/F32/F64/F128 のベンダー対応(定性、数値は書かない)
+
+| 精度 | NVIDIA | AMD | Intel | open-cuda の実装状態 |
+|---|---|---|---|---|
+| F16 | Pascal 以降ネイティブ、Volta 以降 Tensor Core | RDNA/CDNA でネイティブ(世代により速度差、要個別確認) | Xe でネイティブ(世代により速度差、要個別確認) | `KernelArg::F16`/`ResolvedArg::F16`(`half::f16`)追加済み。`opencuda-blas::hgemm`(CPU参照実装)追加済み。GPU ディスパッチ配線は未着手(次の増分)。 |
+| F32 | 全世代ネイティブ | 全世代ネイティブ | 全世代ネイティブ | 既存 `sgemm`(CPU SIMD + Vulkan/DirectX 実機検証済み、GT 730)。 |
+| F64 | CUDA Core でネイティブだが、コンシューマ機は F32 比で大幅低スループット(世代・製品階級で大きく異なる、具体的倍率は個別に確認要) | 同様にネイティブだが製品階級依存 | 同様にネイティブだが製品階級依存 | `KernelArg::F64`/`ResolvedArg::F64`追加済み。`opencuda-blas::dgemm`(CPU参照実装)追加済み。GPU ディスパッチ配線は未着手。 |
+| F128 | **ネイティブ命令なし(NVIDIA/AMD/Intel いずれの製品にも存在しない)** | 同左 | 同左 | `opencuda_core::DoubleDouble`(double-double ソフトウェアエミュレーション、Dekker/Knuth 方式)+ `opencuda-blas::qgemm`。**GPU 加速ではない**、CPU 側の高精度演算専用。 |
+
+### 13.3 F128(ソフトウェア四倍精度)の位置づけ
+
+- Rust `std` に安定版 `f128` は無い(nightly の実験的プリミティブのみ、
+  本番ビルド〈stable〉では使えない)。
+- 2026年時点で FP128 をネイティブ実行できる GPU は NVIDIA/AMD/Intel の
+  コンシューマ・データセンター製品いずれにも存在しない(このマシンに
+  限らず、業界一般の事実として)。
+- そのため `crates/opencuda-core/src/f128.rs` に **double-double(倍々
+  精度)** を自前実装した(Dekker 1971 の `two_sum`/`two_prod`、Knuth
+  `TAOCP` vol.2 と同系統のアルゴリズム、2つの `f64` の組で仮数部
+  約106ビット相当)。`qd`/`twofloat` のような専用 crate を追加依存
+  させず自己完結させた(オフライン環境でも `cargo build` が壊れない
+  ようにするため)。
+- **用途は性能ではなく数値的正確性**——Kahan和のような桁落ちに敏感な
+  縮約(reduction)処理向け。`opencuda-blas::qgemm`(GEMM 参照実装)に
+  加え、実測テスト(`dd_summation_is_more_accurate_than_plain_f64_
+  for_ill_conditioned_sum`・`qgemm_is_more_accurate_than_dgemm_for_
+  ill_conditioned_dot_product`)で、病的に条件の悪い和/内積において
+  f64 単体より実際に精度が高い(このケースでは厳密値と完全一致する)
+  ことを確認済み。
+
+### 13.4 正直な現状・未着手項目
+
+- `hgemm`/`dgemm`/`qgemm` はいずれも **CPU 参照実装のみ**。既存の
+  `sgemm` が持つ `GpuDevice::launch_kernel` 経由の実 GPU ディスパッチ
+  (CPU SIMD・Vulkan・DirectX の階層フォールバック)は、この3関数には
+  まだ配線していない——「精度ごとの正しさをまず確立する」ことを優先し、
+  GPU ディスパッチは次の増分として切り出した。
+- F16 の GPU ネイティブ実行(NVIDIA Tensor Core 等)は、この開発機の
+  GPU(GT 730、Kepler、FP16 Tensor Core 非搭載)では原理的に検証不可能。
+  32GB 級の対象カードが入手できた場合にのみ再検討する。
+- 32GB VRAM 級カードでの実機検証は一切行っていない(§13.1 参照)。

@@ -13,12 +13,14 @@
 
 pub mod device;
 pub mod error;
+pub mod f128;
 pub mod kernel;
 pub mod memory;
 pub mod registry;
 
 pub use device::{DeviceInfo, GpuDevice, GpuVendor, LaunchConfig};
 pub use error::{GpuError, Result};
+pub use f128::DoubleDouble;
 pub use kernel::{
     CompiledKernel, KernelArg, KernelSource, NativeKernelFn, ResolvedArg, ThreadCtx,
 };

@@ -1617,6 +1617,108 @@ pub fn mla_memory_reduction_percent(d_h: usize, d_c: usize) -> f64 {
     (1.0 - (d_c as f64 / d_h as f64)) * 100.0
 }
 
+// ============================================================================
+// F16/F64/F128 GEMM ファミリー(2026-09-03追加)
+//
+// ユーザー指示: 「32GB-VRAM級カード(NVIDIA RTX/AMD/Intel)を前提に、
+// 今後はF16/F32/F64/F128を見据えて開発すること」+「F128まで対応して」。
+//
+// 既存の`sgemm`(F32、`GemmPath`による実GPUディスパッチ+CPU SIMD経路)と
+// 同じ「参照実装としての正しさ」を最優先する設計方針だが、GPUディスパッチ
+// 配線の有無は精度ごとに異なる(正直な開示):
+// - `hgemm`(F16): CPU参照実装。`half::f16`は算術演算のたびにf32へ変換して
+//   計算し(`half`クレートの標準的な使い方、多くのCPUがネイティブF16 ALUを
+//   持たないため)、結果をF16へ丸め直す。GPU実行時にはNVIDIA
+//   (Pascal以降のFP16、Volta以降のTensor Core)/AMD(RDNA/CDNA)/Intel(Xe)の
+//   いずれもF16ハードウェア対応の世代があるが、本関数自体は既存の`sgemm`
+//   のような`GpuDevice::launch_kernel`ディスパッチ配線を行っていない
+//   ——このリポジトリの既存の量子化API(`quantize_int4`等)がGPU実行の
+//   スケール計算のみカーネル経由で行いパッキングはホスト側、というのと
+//   同様に、今回は「精度ごとの正しさをまず確立する」ことを優先し、
+//   フルGPUディスパッチは次の増分とした。
+// - `dgemm`(F64): CPU参照実装。NVIDIA CUDA CoreはF64をネイティブ対応する
+//   世代が多いが、コンシューマ向けGPUではF32比で大幅に低スループット
+//   (1/32〜1/64程度)な機種が一般的——実運用では「精度が要る箇所だけ
+//   dgemmを使う」設計判断がユーザー側で必要になる。
+// - `qgemm`(F128、`opencuda_core::DoubleDouble`): **ソフトウェア
+//   エミュレーションのみ**。GPUハードウェアのFP128命令はNVIDIA/AMD/Intel
+//   いずれの製品にも存在しない(`opencuda_core::f128`モジュールdoc参照)。
+//   性能ではなく数値的正確性(桁落ちに敏感な縮約処理等)のための道具。
+// ============================================================================
+
+/// 半精度(F16) GEMM: `C = A·B`(参照実装、`alpha`/`beta`スケーリング無し)。
+///
+/// `a`は`m x k`、`b`は`k x n`、`c`は`m x n`(すべて行優先)。内部演算は
+/// `half::f16 -> f32 -> half::f16`(`half`crateの標準変換、CPUにネイティブ
+/// F16 ALUが無い前提のソフトウェア実装)。
+pub fn hgemm(m: usize, k: usize, n: usize, a: &[half::f16], b: &[half::f16], c: &mut [half::f16]) -> Result<()> {
+    anyhow::ensure!(a.len() == m * k, "hgemm: a.len()={} != m*k={}", a.len(), m * k);
+    anyhow::ensure!(b.len() == k * n, "hgemm: b.len()={} != k*n={}", b.len(), k * n);
+    anyhow::ensure!(c.len() == m * n, "hgemm: c.len()={} != m*n={}", c.len(), m * n);
+
+    c.par_iter_mut().enumerate().for_each(|(idx, out)| {
+        let row = idx / n;
+        let col = idx % n;
+        let mut acc = 0.0f32;
+        for kk in 0..k {
+            acc += a[row * k + kk].to_f32() * b[kk * n + col].to_f32();
+        }
+        *out = half::f16::from_f32(acc);
+    });
+    Ok(())
+}
+
+/// 倍精度(F64) GEMM: `C = alpha*A·B + beta*C`(`sgemm`のF64版、参照実装)。
+///
+/// `a`は`m x k`、`b`は`k x n`、`c`は`m x n`(すべて行優先)。
+#[allow(clippy::too_many_arguments)]
+pub fn dgemm(m: usize, k: usize, n: usize, alpha: f64, a: &[f64], b: &[f64], beta: f64, c: &mut [f64]) -> Result<()> {
+    anyhow::ensure!(a.len() == m * k, "dgemm: a.len()={} != m*k={}", a.len(), m * k);
+    anyhow::ensure!(b.len() == k * n, "dgemm: b.len()={} != k*n={}", b.len(), k * n);
+    anyhow::ensure!(c.len() == m * n, "dgemm: c.len()={} != m*n={}", c.len(), m * n);
+
+    c.par_iter_mut().enumerate().for_each(|(idx, out)| {
+        let row = idx / n;
+        let col = idx % n;
+        let mut acc = 0.0f64;
+        for kk in 0..k {
+            acc += a[row * k + kk] * b[kk * n + col];
+        }
+        *out = alpha * acc + beta * *out;
+    });
+    Ok(())
+}
+
+/// ソフトウェア四倍精度(F128、double-double) GEMM: `C = A·B`(参照実装)。
+///
+/// **GPUハードウェア加速では無い**(`opencuda_core::f128`モジュールdoc・
+/// このセクション冒頭のコメント参照)。`a`は`m x k`、`b`は`k x n`、
+/// `c`は`m x n`(すべて行優先)。積和の内部累積も`DoubleDouble`のまま行う
+/// (f64へ落としてから足し戻すと精度優位性が失われるため)。
+pub fn qgemm(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[opencuda_core::DoubleDouble],
+    b: &[opencuda_core::DoubleDouble],
+    c: &mut [opencuda_core::DoubleDouble],
+) -> Result<()> {
+    anyhow::ensure!(a.len() == m * k, "qgemm: a.len()={} != m*k={}", a.len(), m * k);
+    anyhow::ensure!(b.len() == k * n, "qgemm: b.len()={} != k*n={}", b.len(), k * n);
+    anyhow::ensure!(c.len() == m * n, "qgemm: c.len()={} != m*n={}", c.len(), m * n);
+
+    c.par_iter_mut().enumerate().for_each(|(idx, out)| {
+        let row = idx / n;
+        let col = idx % n;
+        let mut acc = opencuda_core::DoubleDouble::ZERO;
+        for kk in 0..k {
+            acc = acc + a[row * k + kk] * b[kk * n + col];
+        }
+        *out = acc;
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2541,5 +2643,149 @@ mod tests {
         assert!(quantize_int8(device.as_ref(), &[1.0], 0).is_err());
         assert!(quantize_int6(device.as_ref(), &[], 4).is_err());
         assert!(quantize_int6(device.as_ref(), &[1.0], 0).is_err());
+    }
+
+    // ========================================================================
+    // F16/F64/F128 GEMMファミリー(2026-09-03追加)のテスト。
+    // それぞれ素朴なスカラー参照実装(このテスト内で独立に書く)と比較し、
+    // `hgemm`/`dgemm`/`qgemm`自体が既存の`sgemm`と同じ数学的契約を満たす
+    // ことを検証する。
+    // ========================================================================
+
+    /// f64のnaiveスカラーGEMM(このテスト専用のリファレンス、`dgemm`とは
+    /// 独立に書く——実装のコピーではなく仕様通りの素朴な計算であることの
+    /// 確認のため)。
+    fn naive_gemm_f64(m: usize, k: usize, n: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
+        let mut c = vec![0.0f64; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f64;
+                for kk in 0..k {
+                    acc += a[row * k + kk] * b[kk * n + col];
+                }
+                c[row * n + col] = acc;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn hgemm_2x2_matches_hand_computed_product() {
+        // A = [[1,2],[3,4]], B = [[5,6],[7,8]] => C = [[19,22],[43,50]]
+        let a = [1.0f32, 2.0, 3.0, 4.0].map(half::f16::from_f32);
+        let b = [5.0f32, 6.0, 7.0, 8.0].map(half::f16::from_f32);
+        let mut c = [half::f16::from_f32(0.0); 4];
+        hgemm(2, 2, 2, &a, &b, &mut c).unwrap();
+        let expected = [19.0f32, 22.0, 43.0, 50.0];
+        for (cv, ev) in c.iter().zip(expected.iter()) {
+            assert!((cv.to_f32() - ev).abs() < 1e-2, "cv={} ev={}", cv.to_f32(), ev);
+        }
+    }
+
+    #[test]
+    fn hgemm_rejects_mismatched_dimensions() {
+        let a = [half::f16::from_f32(1.0); 4];
+        let mut c = [half::f16::from_f32(0.0); 4];
+        assert!(hgemm(2, 2, 2, &a, &a[..3], &mut c).is_err());
+        assert!(hgemm(2, 2, 2, &a, &a, &mut c[..3]).is_err());
+    }
+
+    #[test]
+    fn dgemm_matches_naive_scalar_reference_on_random_input() {
+        // 決定的LCGで再現可能な乱数入力を生成(既存テストのパターンに合わせる)。
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f64 / u32::MAX as f64) * 2.0 - 1.0
+        };
+        let (m, k, n) = (7usize, 5usize, 6usize);
+        let a: Vec<f64> = (0..m * k).map(|_| next()).collect();
+        let b: Vec<f64> = (0..k * n).map(|_| next()).collect();
+        let expected = naive_gemm_f64(m, k, n, &a, &b);
+
+        let mut c = vec![0.0f64; m * n];
+        dgemm(m, k, n, 1.0, &a, &b, 0.0, &mut c).unwrap();
+
+        for (cv, ev) in c.iter().zip(expected.iter()) {
+            assert!((cv - ev).abs() < 1e-9, "cv={cv} ev={ev}");
+        }
+    }
+
+    #[test]
+    fn dgemm_applies_alpha_and_beta_scaling() {
+        let a = vec![1.0f64, 2.0, 3.0, 4.0]; // 2x2
+        let b = vec![1.0f64, 0.0, 0.0, 1.0]; // identity 2x2
+        let mut c = vec![10.0f64, 20.0, 30.0, 40.0]; // existing C
+        dgemm(2, 2, 2, 2.0, &a, &b, 0.5, &mut c).unwrap();
+        // alpha*A*I + beta*C_old = 2*A + 0.5*C_old
+        assert!((c[0] - (2.0 * 1.0 + 0.5 * 10.0)).abs() < 1e-12);
+        assert!((c[1] - (2.0 * 2.0 + 0.5 * 20.0)).abs() < 1e-12);
+        assert!((c[2] - (2.0 * 3.0 + 0.5 * 30.0)).abs() < 1e-12);
+        assert!((c[3] - (2.0 * 4.0 + 0.5 * 40.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dgemm_rejects_mismatched_dimensions() {
+        let a = vec![1.0f64; 4];
+        let mut c = vec![0.0f64; 4];
+        assert!(dgemm(2, 2, 2, 1.0, &a, &a[..3], 0.0, &mut c).is_err());
+        assert!(dgemm(2, 2, 2, 1.0, &a, &a, 0.0, &mut c[..3]).is_err());
+    }
+
+    #[test]
+    fn qgemm_2x2_matches_hand_computed_product() {
+        use opencuda_core::DoubleDouble as Dd;
+        let a: Vec<Dd> = [1.0, 2.0, 3.0, 4.0].iter().map(|&v| Dd::from_f64(v)).collect();
+        let b: Vec<Dd> = [5.0, 6.0, 7.0, 8.0].iter().map(|&v| Dd::from_f64(v)).collect();
+        let mut c = vec![Dd::ZERO; 4];
+        qgemm(2, 2, 2, &a, &b, &mut c).unwrap();
+        let expected = [19.0f64, 22.0, 43.0, 50.0];
+        for (cv, ev) in c.iter().zip(expected.iter()) {
+            assert!((cv.to_f64() - ev).abs() < 1e-12, "cv={} ev={}", cv.to_f64(), ev);
+        }
+    }
+
+    #[test]
+    fn qgemm_rejects_mismatched_dimensions() {
+        use opencuda_core::DoubleDouble as Dd;
+        let a = vec![Dd::from_f64(1.0); 4];
+        let mut c = vec![Dd::ZERO; 4];
+        assert!(qgemm(2, 2, 2, &a, &a[..3], &mut c).is_err());
+        assert!(qgemm(2, 2, 2, &a, &a, &mut c[..3]).is_err());
+    }
+
+    /// `qgemm`(F128/double-double)が、f64単体のGEMM(`dgemm`)より実際に
+    /// 精度で優れていることを示す本命テスト。病的に条件の悪い縮約
+    /// (巨大な値+多数の微小な値の和が現れる内積)を、K方向に長い
+    /// GEMM(`m=n=1`、内積そのもの)として構成し、真値との誤差を比較する。
+    #[test]
+    fn qgemm_is_more_accurate_than_dgemm_for_ill_conditioned_dot_product() {
+        use opencuda_core::DoubleDouble as Dd;
+        // 内積 a・b: a[0]は1e16(f64精度限界付近)、残りは1.0が1万個。
+        // b は全て1.0(単純な和の形にして真値を計算しやすくする)。
+        let k = 10_001usize;
+        let mut a_f64 = vec![1.0f64; k];
+        a_f64[0] = 1.0e16;
+        let b_f64 = vec![1.0f64; k];
+
+        // 真値(有理数的に厳密): 1e16 + 10000
+        let true_value = 1.0e16_f64 + (k as f64 - 1.0);
+
+        let mut c_f64 = vec![0.0f64];
+        dgemm(1, k, 1, 1.0, &a_f64, &b_f64, 0.0, &mut c_f64).unwrap();
+
+        let a_dd: Vec<Dd> = a_f64.iter().map(|&v| Dd::from_f64(v)).collect();
+        let b_dd: Vec<Dd> = b_f64.iter().map(|&v| Dd::from_f64(v)).collect();
+        let mut c_dd = vec![Dd::ZERO];
+        qgemm(1, k, 1, &a_dd, &b_dd, &mut c_dd).unwrap();
+
+        let f64_err = (c_f64[0] - true_value).abs();
+        let dd_err = (c_dd[0].to_f64() - true_value).abs();
+        assert!(
+            dd_err <= f64_err,
+            "qgemm(F128) should be at least as accurate as dgemm(F64): dd_err={dd_err} f64_err={f64_err}"
+        );
+        // このケースではdouble-doubleは厳密値に一致するはず。
+        assert_eq!(c_dd[0].to_f64(), true_value);
     }
 }

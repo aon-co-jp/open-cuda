@@ -89,6 +89,116 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-03(続き3)、F16/F32/F64/F128 精度対応 + 32GB級VRAMベンダー方針を設計文書化 / Follow-up: F16/F32/F64/F128 precision support + 32GB-VRAM-class vendor design)
+
+ユーザー指示「今後は NVIDIA(RTX)/AMD/Intel の 32GB VRAM 級カードを前提に
+F16/F32/F64 を見据えて開発する」、続いて「F128 まで対応して」への対応。
+`open-directx`/`aruaru-llm`も同時並行の別セッションが対応中で、本エントリは
+`open-cuda` 固有の実装のみを記す。
+
+### 実装内容
+
+1. **`opencuda-core::kernel`**: `KernelArg`/`ResolvedArg` に `F16(half::f16)`/
+   `F64(f64)`/`F128(DoubleDouble)` を追加(既存の `F32` と非破壊に並存、
+   `as_f16`/`as_f64`/`as_f128` アクセサも追加)。`half` は既に
+   `opencuda-blas`/`open-cuda-llm` の workspace 依存として実績があるため
+   `opencuda-core` の依存に追加しても水増しにはならないと判断した。
+   `KernelArg`が非網羅パターンになった `opencuda-cpu::CpuDevice::
+   launch_kernel` の解決ロジックも修正(F16/F64/F128はまだ`launch_kernel`
+   経由のGPUディスパッチ配線を持たないため、`ResolvedArg`へそのまま
+   引き継ぐだけの分岐を追加)。
+2. **新規 `crates/opencuda-core/src/f128.rs`: `DoubleDouble`(double-double
+   ソフトウェア四倍精度)**。**正直な開示、これが本エントリの核心**:
+   Rust `std` に安定版 `f128` は無い(nightly限定の実験的プリミティブの
+   み)。**FP128 をネイティブ実行できる GPU は NVIDIA/AMD/Intel いずれの
+   製品にも存在しない**(2026年時点、コンシューマ・データセンター問わず)。
+   よって「F128対応」は原理的にGPUハードウェア加速たり得ず、**CPU側の
+   ソフトウェアエミュレーション**として実装した——Dekker(1971)の
+   `two_sum`/`two_prod`、Knuth `TAOCP` vol.2と同系統のアルゴリズムで、
+   2つの`f64`(hi/lo)の組により仮数部約106ビット相当の精度を得る
+   (`qd`/`twofloat`のような専用crateではなく自己完結の自前実装——
+   オフライン環境でも`cargo build`が壊れないようにする既存方針
+   〈`sgemm_vulkan_generic`のspv埋め込み回避と同じ理由〉に従った)。
+   Add/Sub/Neg/Mul/Div の4則演算のみ実装(超越関数は未実装、必要になり次第
+   追加)。用途は性能ではなく**数値的正確性**(Kahan和のような桁落ちに
+   敏感な縮約処理向け)であることをモジュールdocに明記。
+3. **`opencuda-blas`: `hgemm`(F16)/`dgemm`(F64)/`qgemm`(F128)を新設**。
+   いずれも既存の`sgemm`と同じ「行優先・m×k・k×n・m×n」契約の参照実装。
+   **正直な開示**: 3関数とも**CPU参照実装のみ**——既存`sgemm`が持つ
+   `GpuDevice::launch_kernel`経由の実GPUディスパッチ(CPU SIMD→Vulkan→
+   DirectXの階層フォールバック)はまだ配線していない。「精度ごとの
+   正しさをまず確立する」ことを優先し、GPUディスパッチ配線は次の増分と
+   して切り出した(F16のGPUネイティブ実行はこの開発機のGT730〈Kepler、
+   FP16 Tensor Core非搭載〉では原理的に検証不可能なため、32GB級カードが
+   入手できた場合にのみ意味を持つ)。
+4. **`OmniGPU-Design.md`に§13「精度(F16/F32/F64/F128)×32GB級VRAM
+   ベンダー対応」を新設**: 32GB級カードの前提(NVIDIA RTX PRO 6000
+   Blackwell/RTX 5090 32GB、AMD Radeon PRO・Radeon AI PRO R9700、Intel
+   Arc Proは32GB単体構成の存在を今回のセッション内で裏取りできず未確認と
+   明記)、精度×ベンダーの定性対応表、F128がソフトウェアのみである理由、
+   未着手項目(GPUディスパッチ配線・32GB級実機検証)を文書化。
+
+### 検証
+
+- `cargo build -p opencuda-core --release`/`cargo build -p opencuda-blas
+  --release`/`cargo build --workspace --release` **すべて警告0件・成功**。
+- `cargo test -p opencuda-core -p opencuda-blas --release --lib`:
+  **opencuda-core 5件全green**(`f128`モジュールの新規テスト、うち
+  `dd_summation_is_more_accurate_than_plain_f64_for_ill_conditioned_sum`は
+  「1e16に1を1000万回足す」という桁落ちしやすい和で、double-doubleが
+  f64単体より実際に高精度〈このケースでは真値と完全一致〉であることを
+  実測で確認)、**opencuda-blas 51 passed / 1 ignored**(既存の回帰無し、
+  新規`hgemm`/`dgemm`/`qgemm`のテスト9件を含む——`qgemm_is_more_
+  accurate_than_dgemm_for_ill_conditioned_dot_product`が、GEMM経由でも
+  同様にdouble-doubleがf64より高精度であることを内積の形で確認)。
+- `cargo test --workspace --release -- --test-threads=1`: **全クレート
+  40テストスイートすべて`test result: ok`(失敗0件)**、既存の実Vulkan/
+  実D3D12/実GPT-2重みテスト群を含め回帰なし。
+- `cargo clippy -p opencuda-core -p opencuda-blas -p opencuda-cpu
+  --release --all-targets -- -D warnings` **警告0件**(実装過程で
+  `should_implement_trait`〈`add`/`sub`/`neg`/`mul`/`div`という名前の
+  自前メソッドが標準trait名と衝突〉を検出・修正、`add_impl`等の内部名へ
+  リネームして`std::ops::*`実装から呼ぶ形に直した)。
+
+### 正直な残課題(誇張しない)
+
+- `hgemm`/`dgemm`/`qgemm`のいずれも**GPUディスパッチ配線が無い**
+  (CPU参照実装のみ)。既存`sgemm`と同じ階層フォールバック
+  (CPU SIMD/Vulkan/DirectX)への配線は次の増分。
+- **32GB級VRAMカード(NVIDIA/AMD/Intel いずれも)での実機検証は一切
+  行っていない**(この開発機はGT730、2GB、Kepler世代のみ)。F16の
+  GPUネイティブ実行(Tensor Core等)・F64のGPUスループット差も同様に
+  この機では検証不可能。
+- Intel Arc Proの32GB単体カード構成の実在は今回未確認のまま
+  (`OmniGPU-Design.md`§13.1に明記、過大主張を避けるため)。
+- `DoubleDouble`は超越関数(sqrt/exp/log等)未実装(四則演算のみ)。
+
+**English summary**: Added `F16`(`half::f16`)/`F64`/`F128` variants to
+`KernelArg`/`ResolvedArg` (non-breaking, alongside existing `F32`). Added
+a new `opencuda_core::f128::DoubleDouble` — a from-scratch double-double
+(Dekker/Knuth `two_sum`/`two_prod`) software quad-precision type, since
+**no NVIDIA/AMD/Intel GPU (consumer or datacenter) has native FP128
+hardware** and Rust's stable `std` has no `f128` primitive either; this
+is explicitly documented as CPU-side software emulation for numerical
+accuracy (e.g. Kahan-summation-sensitive reductions), not GPU
+acceleration. Added `hgemm`/`dgemm`/`qgemm` reference GEMMs in
+`opencuda-blas` (CPU-only reference implementations, no GPU dispatch
+wiring yet — that's the next increment). Added `OmniGPU-Design.md` §13
+documenting the 32GB-VRAM-class vendor assumption and per-vendor
+precision support qualitatively (honestly flagging what's unverified,
+e.g. whether a 32GB single-card Intel Arc Pro SKU exists). Verification:
+`cargo build --workspace --release` clean; `opencuda-core` 5/5 tests
+pass including a test proving double-double is measurably more accurate
+than plain f64 on an ill-conditioned sum; `opencuda-blas` 51 passed / 1
+ignored (9 new hgemm/dgemm/qgemm tests, no regressions); full workspace
+`cargo test --workspace --release -- --test-threads=1` — all 40 test
+suites `ok`, zero failures; clippy clean on the touched crates. Honestly
+unverified: no 32GB-VRAM-class hardware (NVIDIA/AMD/Intel) exists in
+this environment, so F16 hardware acceleration and F64 GPU throughput
+differences remain unverified (this dev machine only has a GT 730,
+2GB, Kepler, no FP16 Tensor Cores); GPU dispatch wiring for
+hgemm/dgemm/qgemm is not yet implemented (CPU reference only).
+
 ## HANDOFF追記(2026-09-03、AWQ 量子化器 + クロスベンダー×クロスOS 移植性設計 / Follow-up: AWQ quantizer + cross-vendor cross-OS portability design)
 
 ### AWQ 量子化器 `quantize_conv1d_awq`(`open-cuda-llm`)

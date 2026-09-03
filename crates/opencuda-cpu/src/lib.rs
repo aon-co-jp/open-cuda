@@ -175,6 +175,14 @@ impl GpuDevice for CpuDevice {
                     KernelArg::I32(v) => ResolvedArg::I32(*v),
                     KernelArg::F32(v) => ResolvedArg::F32(*v),
                     KernelArg::Usize(v) => ResolvedArg::Usize(*v),
+                    // 2026-09-03追加。F16/F64/F128はまだ`launch_kernel`
+                    // 経由のGPUディスパッチ配線を持たない(`opencuda-blas`の
+                    // `hgemm`/`dgemm`/`qgemm`はCPU参照実装として直接計算する
+                    // ため、この解決経路を通らない)。将来配線する際に
+                    // ここを実装すること。
+                    KernelArg::F16(v) => ResolvedArg::F16(*v),
+                    KernelArg::F64(v) => ResolvedArg::F64(*v),
+                    KernelArg::F128(v) => ResolvedArg::F128(*v),
                 })
             })
             .collect::<Result<_>>()?;

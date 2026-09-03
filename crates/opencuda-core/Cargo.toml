@@ -11,3 +11,8 @@ description = "Core abstractions for OpenCUDA: GpuDevice trait, two-layer memory
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# 2026-09-03追加: `KernelArg`/`ResolvedArg::F16`用(半精度、32GB級カード
+# 世代を見据えたF16/F32/F64/F128対応の一環)。`half`は既に
+# `opencuda-blas`/`open-cuda-llm`のworkspace依存として使われている実績
+# あるクレート(依存の水増しではない)。
+half.workspace = true

@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use crate::f128::DoubleDouble;
 use crate::memory::DevicePtr;
 
 /// カーネルの供給形式。
@@ -55,6 +56,22 @@ pub enum ResolvedArg {
     I32(i32),
     F32(f32),
     Usize(usize),
+    /// 半精度(2026-09-03追加)。NVIDIA(Pascal以降のFP16、Volta以降の
+    /// Tensor Core)/AMD(RDNA/CDNA)/Intel(Xe)いずれも世代によりネイティブ
+    /// FP16演算を持つ——ただしこのGPU一覧の「ネイティブ対応」は本フィールド
+    /// 自体の値ではなく、実行時に`GpuDevice`側の能力フラグで判定する
+    /// (詳細は`OmniGPU-Design.md`の精度/ベンダー対応節を参照)。
+    F16(half::f16),
+    /// 倍精度(2026-09-03追加)。CUDA CoreはF64もネイティブ対応するが、
+    /// コンシューマ向けGPUではF32比で大幅に遅い(1/32〜1/64スループット)
+    /// 機種が多い——用途に応じA/B比較すること。
+    F64(f64),
+    /// ソフトウェアエミュレーション四倍精度(2026-09-03追加)。
+    /// **どのGPUベンダーもFP128ハードウェアを持たない**ため、これは
+    /// CPU側のdouble-double演算専用(`crate::f128::DoubleDouble`参照)。
+    /// GPUカーネル引数として使う想定ではなく、ホスト側の高精度リダクション
+    /// 用に`ResolvedArg`/`KernelArg`の枠組みへ揃えて追加した。
+    F128(DoubleDouble),
 }
 
 // カーネルは1スレッドずつ呼ばれ、各スレッドは自分の担当インデックスだけ触る前提。
@@ -81,6 +98,24 @@ impl ResolvedArg {
             _ => None,
         }
     }
+    pub fn as_f16(&self) -> Option<half::f16> {
+        match self {
+            ResolvedArg::F16(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            ResolvedArg::F64(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_f128(&self) -> Option<DoubleDouble> {
+        match self {
+            ResolvedArg::F128(v) => Some(*v),
+            _ => None,
+        }
+    }
 }
 
 /// カーネルへ渡す引数。スカラとデバイスポインタを区別する。
@@ -91,6 +126,13 @@ pub enum KernelArg {
     I32(i32),
     F32(f32),
     Usize(usize),
+    /// 半精度(2026-09-03追加、`ResolvedArg::F16`と対)。
+    F16(half::f16),
+    /// 倍精度(2026-09-03追加、`ResolvedArg::F64`と対)。
+    F64(f64),
+    /// ソフトウェア四倍精度(2026-09-03追加、`ResolvedArg::F128`と対)。
+    /// GPUハードウェア対応が無いことの開示は`ResolvedArg::F128`参照。
+    F128(DoubleDouble),
 }
 
 impl KernelArg {
@@ -116,6 +158,24 @@ impl KernelArg {
     pub fn as_f32(&self) -> Option<f32> {
         match self {
             KernelArg::F32(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_f16(&self) -> Option<half::f16> {
+        match self {
+            KernelArg::F16(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            KernelArg::F64(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_f128(&self) -> Option<DoubleDouble> {
+        match self {
+            KernelArg::F128(v) => Some(*v),
             _ => None,
         }
     }
