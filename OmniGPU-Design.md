@@ -404,3 +404,95 @@ authors = ["PHI"]
 ```
 
 名前候補: **OmniGPU** / Universal CUDA / OpenCUDA / Aruaru CUDA / CrossFire CUDA
+
+---
+
+## 11. クロスベンダー × クロスOS 移植性設計(2026-09-03、一次資料調査に基づく)
+
+ユーザー指示「NVIDIA・AMD・Intel のどの GPU でも互換性を保ち、Windows・
+macOS・Linux・Unix でも機能するよう、世界中の言語で Google/GitHub を調査
+して最新理論・設計思想を実装へ活かす」への対応。**この節は §8.5 の
+ベンダーマトリクスを OS 軸へ拡張し、2025 年時点の一次資料で裏を取った
+設計判断をまとめる。**
+
+### 11.1 一次資料調査(2025〜2026、英語)
+
+- **「Rust running on every GPU」**([rust-gpu.github.io, 2025-07-25](https://rust-gpu.github.io/blog/2025/07/25/rust-on-every-gpu/)):
+  **単一の Rust コードベース**を、`rustc_codegen_nvvm`(→ PTX を CPU
+  バイナリへ埋め込み、実行時に CUDA ドライバへ)と `rustc_codegen_spirv`
+  (→ SPIR-V)でビルド時に GPU バイナリ化し、**CUDA(NVIDIA)/ SPIR-V
+  (Vulkan = AMD・Intel・NVIDIA・Android)/ Metal(Apple)/ DirectX 12
+  (Windows)/ WebGPU(ブラウザ)/ CPU フォールバック**を賄うデモ。
+  実行時は埋め込んだ SPIR-V を **`naga`** に渡してプラットフォームの
+  シェーディング言語へ翻訳。**「カーネルは素の Rust なので GPU 無しの
+  CI でロジックをテストできる」**——open-cuda が `KernelSource::Native`
+  (Rust クロージャ)+ CPU バックエンドでやっているのと同じ思想。
+- **CubeCL**([tracel-ai/cubecl](https://github.com/tracel-ai/cubecl)、
+  Burn ML フレームワークの計算バックエンド):`#[cube]` 注釈した Rust
+  関数を JIT で **CUDA / HIP(ROCm)/ Metal / SPIR-V / WGSL / CPU-SIMD**
+  へ降ろす。`wgpu`/`cudarc` のような低レベルラッパと Burn のような高レベル
+  フレームワークの**中間層**。2025 年時点の「Rust で書いて全ベンダーで
+  走らせる」の実質的な最先端。
+- **MoltenVK**([KhronosGroup/MoltenVK](https://github.com/KhronosGroup/MoltenVK)):
+  Vulkan 1.4 のほぼ完全なサブセットを **Apple Metal の上に実装**
+  (macOS/iOS/tvOS)。SPIR-V → MSL 変換器を**ランタイムに内蔵**。
+  Compute シェーダ対応。→ **`opencuda-vulkan` は新規コード無しで macOS
+  でも動く**(Vulkan ローダが `libMoltenVK` を ICD として拾えばよい)。
+- **FP8 の移植性**([VK_EXT_shader_float8](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_shader_float8.html)、
+  [VK_KHR_cooperative_matrix](https://docs.vulkan.org/features/latest/features/proposals/VK_KHR_cooperative_matrix.html)):
+  `VK_EXT_shader_float8`(E4M3/E5M2、OCP 準拠)は **`VK_KHR_cooperative_matrix`
+  と組み合わせて ML 用に設計**されている。NVIDIA Turing 以降 / Qualcomm
+  (`VK_QCOM_cooperative_matrix_conversion`)/ AMD で対応が広がる。
+  → §10 残課題の「ベンダー FP8 GEMM」の**移植性の高い実装先は
+  cuBLASLt/hipBLASLt ではなく SPIR-V + これらの Vulkan 拡張**。
+
+### 11.2 open-cuda が既に正しくやっていること
+
+| 設計判断 | 一次資料の裏付け | open-cuda の現状 |
+|---|---|---|
+| **SPIR-V を移植性カーネル IR にする** | rust-gpu / CubeCL / wgpu すべて SPIR-V を中核に置く | `KernelSource::SpirV`、`opencuda-vulkan` が単一コードパスでディスパッチ(§8.5) |
+| **CPU を第一級バックエンドにして GPU 無し CI を可能に** | rust-gpu「カーネルは素の Rust なので GPU 無し CI でテストできる」 | `KernelSource::Native` + `opencuda-cpu`、全 crate のロジックテストが GPU 無しで走る |
+| **ベンダー ID は"報告"に留め、実行経路に分岐を入れない** | wgpu/Vulkan の設計そのもの | `vendor_from_id` は報告用途のみ(§8.5) |
+| **能力フラグで機能を交渉する** | Vulkan の `VkPhysicalDeviceFeatures` 方式 | `supports_spirv` / `supports_dxil` / `supports_fp8_tensor_core`(2026-09-02 追加) |
+
+### 11.3 クロスOS マトリクス(目標と現状)
+
+| OS | GPU 到達手段 | open-cuda の状態 | 必要作業 |
+|---|---|---|---|
+| **Linux** | Vulkan ICD(mesa RADV / ANV / NVIDIA)、`libvulkan.so` | `opencuda-vulkan`(`ash` `loaded` feature)で動く。NVIDIA GT 730 で実機検証済み | AMD/Intel 実機での列挙・実行検証(このマシンに無い) |
+| **Windows** | Vulkan(`vulkan-1.dll`)+ **D3D12/DXIL フォールバック** | Vulkan・DirectX 両方実機検証済み(GT 730) | 統合 GPU 実機での再測 |
+| **macOS / iOS** | **MoltenVK**(Vulkan→Metal、SPIR-V→MSL 内蔵) | **未検証**。`ash` の `loaded` は `libMoltenVK.dylib` を探せる設計なので**コード変更はおそらく不要** | (a) `MoltenVK` を同梱 or Vulkan SDK 依存を明記、(b) 実機 Mac で `vulkan_info` / `matmul_vulkan_real` をクロスビルド・実行(Android で 2026-08-15 にやったのと同じ手順)、(c) Portability Subset(`VK_KHR_portability_subset`)で欠ける機能(一部の `storageBuffer` レイアウト等)をカーネル側で回避 |
+| **その他 Unix**(FreeBSD 等) | mesa Vulkan が動く範囲で Linux と同じ | 未検証 | ベストエフォート(mesa 次第) |
+| **ブラウザ / WASM** | WebGPU | 対象外(§0 の立ち位置。必要なら `wgpu` バックエンドを別 crate で) | — |
+
+### 11.4 設計判断(この調査を実装へ活かす)
+
+1. **Vulkan + SPIR-V を「移植性の背骨」と正式に位置づける**。CUDA(PTX)/
+   ROCm(HIP)/ oneAPI(Level Zero)/ Metal(MSL)は**任意の高速化経路**で
+   あって前提ではない、と §8.5 の結論を OS 軸へ拡張して明文化した(本節)。
+2. **macOS 対応は「新バックエンドを書く」のではなく「MoltenVK 経由の
+   Vulkan を検証する」**。`opencuda-directx` 相当の新規 crate は不要。
+   `README-VULKAN.md` に「macOS では Vulkan SDK / MoltenVK を入れれば
+   `opencuda-vulkan` がそのまま動く(検証待ち)」を追記する。
+3. **FP8 ベンダー GEMM(§10 残課題)の移植性実装先を訂正**:
+   `sgemm_fp8_weight_vendor` の本命は、cuBLASLt/hipBLASLt/oneDNN の
+   ベンダー分岐ではなく、**SPIR-V compute + `VK_EXT_shader_float8` +
+   `VK_KHR_cooperative_matrix`**。能力フラグ `supports_fp8_tensor_core`
+   はそのまま「Vulkan がこの 2 拡張を報告するか」で立てられる。
+   (`device.rs` / blas スタブ文言は 2026-09-03 に更新済み。)
+4. **CubeCL / rust-gpu の採用可否**: どちらも「open-cuda を置き換える」
+   候補になり得るが、open-cuda は既に SPIR-V/DXIL/Native の 3 IR + CPU
+   第一級 + 能力交渉という**同じ設計原則**で動いており、外部依存を
+   増やさず現状路線を進めるのが妥当(§9 の「実用的サブセット」方針)。
+   ただし `naga`(wgpu の SPIR-V↔MSL/WGSL/HLSL 翻訳器)は、将来
+   macOS ネイティブ Metal や WebGPU へ広げる際の**第一候補**として記録。
+
+### 11.5 正直な現状(誇張しない)
+
+- **実機検証は依然 NVIDIA GT 730(Kepler)1 台のみ**。AMD/Intel/Apple/
+  モバイル GPU での実行検証手段はこの開発機に無い。
+- 本節は**設計の明文化と一次資料の裏取り**であり、macOS/AMD/Intel
+  実機で動くことを新たに実証したものではない。
+- FP8 の Vulkan 拡張経路(`VK_EXT_shader_float8` + cooperative matrix)は
+  GT 730(Turing 未満)が非対応のため、この機ではコンパイル検証すら
+  できない。

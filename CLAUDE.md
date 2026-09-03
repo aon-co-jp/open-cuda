@@ -89,6 +89,85 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-03、AWQ 量子化器 + クロスベンダー×クロスOS 移植性設計 / Follow-up: AWQ quantizer + cross-vendor cross-OS portability design)
+
+### AWQ 量子化器 `quantize_conv1d_awq`(`open-cuda-llm`)
+「合成テンソルの厳密一致テストが検証上限」だった状態を引き上げた。
+- `pub fn quantize_conv1d_awq(weight_t, in_dim, out_dim, group_size)
+  -> (qweight, qzeros, scales)`: `load_conv1d_awq` の**厳密な逆**。パック順
+  (`pub const AWQ_PACK_ORDER = [0,2,4,6,1,3,5,7]`)・グループ非対称量子化
+  (`w ≈ (q - z) * scale`)・テンソル形状(qweight `[in,out/8]`、
+  qzeros `[in/group,out/8]`、scales `[in/group,out]`)まで一致。AutoAWQ の
+  `WQLinear_GEMM` と同レイアウトであることを一次資料で確認済み。
+- テスト `awq_quantize_then_load_round_trips_within_int4_error_bounds`:
+  ざらついた分布の擬似「実重み」を量子化 → safetensors 直列化 →
+  `load_conv1d_awq` で読み戻し → 逆量子化誤差が非対称 INT4 の想定範囲
+  (worst-case ≤ scale の 0.6 倍)以内。
+- **正直な開示**: 本実装のパック規約への自己整合性 + 実重み相当の誤差
+  評価は保証するが、実 AutoAWQ 出力のワイヤ形式との互換性そのものは、
+  GPT-2 アーキ(Conv1D)の AWQ 公開モデルが事実上存在しないため未検証。
+- `cargo test -p open-cuda-llm --release -- --test-threads=1` **47 passed
+  / 7 ignored**、clippy 警告0。
+
+### クロスベンダー × クロスOS 移植性設計(`OmniGPU-Design.md` §11 新設)
+ユーザー指示「NVIDIA/AMD/Intel のどの GPU でも互換、Windows/macOS/Linux/
+Unix でも機能するよう世界中の言語で調査して最新理論を実装へ活かす」。
+一次資料(2025〜2026、英語)を調査し §8.5 のベンダーマトリクスを **OS 軸へ
+拡張した設計文書**を書いた。実装の変更は最小(文言更新のみ)。
+- **調査**: 「Rust running on every GPU」(rust-gpu.github.io 2025-07、
+  単一 Rust コード → CUDA(PTX)/SPIR-V/Metal/DX12/WebGPU/CPU、実行時
+  `naga` で翻訳、GPU 無し CI 可能)/ **CubeCL**(tracel-ai、`#[cube]` →
+  CUDA/HIP/Metal/SPIR-V/WGSL/CPU-SIMD、Burn の計算バックエンド)/
+  **MoltenVK**(Vulkan 1.4 サブセット on Metal、SPIR-V→MSL 内蔵、
+  macOS/iOS)/ **FP8 移植性** = `VK_EXT_shader_float8`(E4M3/E5M2)+
+  `VK_KHR_cooperative_matrix`。
+- **設計判断**:
+  1. Vulkan + SPIR-V を「移植性の背骨」と正式に位置づけ。CUDA/ROCm/
+     oneAPI/Metal は**任意の高速化経路**であって前提ではない。
+  2. **macOS 対応は新バックエンドを書かず MoltenVK 経由 Vulkan を検証する**
+     方針(`opencuda-vulkan` は `ash` `loaded` で OS 分岐が無く、
+     `libMoltenVK.dylib` を ICD として拾えばそのまま動くはず)。
+  3. **FP8 ベンダー GEMM の移植性実装先を訂正**: cuBLASLt/hipBLASLt/oneDNN
+     のベンダー分岐ではなく **SPIR-V compute + `VK_EXT_shader_float8` +
+     `VK_KHR_cooperative_matrix`**。能力フラグ `supports_fp8_tensor_core`
+     はそのまま「Vulkan がこの 2 拡張を報告するか」で立てられる。
+     対応 HW = NVIDIA Hopper/Ada/Blackwell(RTX 5080/5090)∪ AMD RDNA4
+     (Radeon AI PRO R9700 等)∪ Intel Arc B/Xe2。
+  4. CubeCL/rust-gpu は open-cuda と**同じ設計原則**(SPIR-V/Native の
+     複数 IR + CPU 第一級 + 能力交渉)なので、外部依存を増やさず現状路線を
+     進める。`naga` は将来の macOS ネイティブ Metal / WebGPU 拡張時の
+     第一候補として記録。
+- `device.rs` の `supports_fp8_tensor_core` doc・`opencuda-blas` の
+  `sgemm_fp8_weight_vendor` スタブ文言・`README-VULKAN.md`(クロスOS 節)を
+  上記に合わせて更新。
+- **正直な現状**: 実機検証は依然 NVIDIA GT 730(Kepler)1 台のみ。
+  macOS/AMD/Intel/モバイル実機での検証手段はこの開発機に無い。本節は
+  設計の明文化と一次資料の裏取りであり、新たな実機実証ではない。
+
+**English summary**: (1) Added `quantize_conv1d_awq` (the exact inverse of
+`load_conv1d_awq`: same `AWQ_PACK_ORDER = [0,2,4,6,1,3,5,7]` interleave,
+group-wise asymmetric `w≈(q-z)*scale`, tensor shapes matching AutoAWQ's
+`WQLinear_GEMM`) plus a round-trip test that quantizes "real-weight-like"
+data, serializes to safetensors, loads it back via `load_conv1d_awq`, and
+checks the dequant error stays within asymmetric-INT4 bounds (worst case
+≤ 0.6·scale). This raises the verification ceiling from "exact-match on
+synthetic tensors" to "quantization-error evaluation on real-weight-like
+data"; AutoAWQ wire-format compat itself is still unverified (no public
+GPT-2-architecture AWQ models exist). 47 tests pass, clippy clean.
+(2) Added `OmniGPU-Design.md` §11: a researched cross-vendor × cross-OS
+portability design. Sources: rust-gpu's "running on every GPU" (single
+Rust codebase → CUDA/SPIR-V/Metal/DX12/WebGPU/CPU via `naga`, GPU-less
+CI), CubeCL (`#[cube]` → CUDA/HIP/Metal/SPIR-V/WGSL/CPU), MoltenVK
+(Vulkan-subset-on-Metal with built-in SPIR-V→MSL), and FP8 portability
+via `VK_EXT_shader_float8` + `VK_KHR_cooperative_matrix`. Design calls:
+Vulkan+SPIR-V is the portability backbone (CUDA/ROCm/oneAPI/Metal are
+optional accelerated paths); macOS support = verify Vulkan via MoltenVK,
+not a new backend; the portable FP8 GEMM target is SPIR-V + the two
+Vulkan FP8/coop-matrix extensions (works on NVIDIA Hopper/Ada/Blackwell
+incl. RTX 50, AMD RDNA4 incl. Radeon AI PRO R9700, Intel Arc B/Xe2), not
+per-vendor BLAS. Implementation change is doc-only; still only verified on
+one NVIDIA GT 730.
+
 ## HANDOFF追記(2026-09-01、`open-cuda-llm`にModel Folding〈層冗長性検出・除去・線形アダプタ置換〉を実装——他アカウントでの再開用メモ、必ず読むこと)
 
 `aruaru-llm`側からの依頼(ユーザー指示「DeepSeekの折りたたみ理論
