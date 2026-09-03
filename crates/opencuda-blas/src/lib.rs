@@ -151,8 +151,9 @@ fn sgemm_fp8_weight_vendor(
 ) -> Result<Vec<f32>> {
     anyhow::bail!(
         "sgemm_fp8_weight: GemmPath::Fp8Tensor selected (device.supports_fp8_tensor_core()==true) \
-         but the native FP8 Tensor Core GEMM requires NVIDIA Hopper (SM90) / Ada Lovelace (SM89) \
-         hardware and a cuBLASLt FP8 path that is not implemented in this build"
+         but a native FP8 GEMM requires FP8-capable hardware (NVIDIA Hopper/Ada/Blackwell incl. \
+         RTX 50, AMD RDNA4 e.g. Radeon AI PRO R9700, Intel Arc B/Xe2) plus a cuBLASLt / hipBLASLt / \
+         oneDNN FP8 (or Vulkan VK_KHR_shader_float8 cooperative-matrix) path that is not implemented in this build"
     )
 }
 

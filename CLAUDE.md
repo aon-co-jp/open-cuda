@@ -281,10 +281,33 @@ DirectX経由(実GPU)で実測することは今回未実施(CPU実行のみで�
   --release` 成功。
 
 ### 残課題
-- Hopper/Ada 実機での `sgemm_fp8_weight_vendor` の実装(cuBLASLt FP8、
-  `GemmPath::Fp8Tensor` の中身)。実機が入手できた場合にのみ着手。
-- AWQ の実配布モデル(実 safetensors)での E2E ロード検証は未実施
-  (合成テンソルの厳密一致まで)。
+- FP8 ネイティブ実行が可能な HW と経路(2026-09-03 調査で明確化):
+  - **NVIDIA**: Hopper(SM90)/ Ada(SM89)/ **Blackwell(SM100・SM120、
+    RTX 5080/5090 含む)** — cuBLASLt FP8。
+  - **AMD**: **RDNA4(Radeon AI PRO R9700 32GB 等)** — FP8 WMMA あり。
+    経路は cuBLASLt ではなく **ROCm の hipBLASLt FP8**。
+  - **Intel**: Arc B シリーズ / Xe2 — oneDNN FP8。
+  - **移植性の高い本命**: **Vulkan `VK_KHR_shader_float8` +
+    `VK_KHR_cooperative_matrix`**(2025 標準化)。RDNA4 / Blackwell /
+    Ada / Hopper / Intel Arc を**単一コードパス**で賄えるため、
+    ベンダー別 BLAS より open-cuda の Vulkan 優先設計に合う。
+  - この開発機(GT 730、Kepler)はいずれにも該当せず、`sgemm_fp8_weight_vendor`
+    の中身の実装・実機検証は不可能。能力フラグ(`supports_fp8_tensor_core`)+
+    スタブ + ソフトウェアフォールバックまでが正直な到達点。
+- **AWQ ラウンドトリップ検証(2026-09-03 実施)**: `quantize_conv1d_awq`
+  (`load_conv1d_awq` の厳密な逆。パック順 `AWQ_PACK_ORDER`・グループ
+  非対称量子化・テンソル形状まで一致)を新設。ざらついた分布の擬似
+  「実重み」を量子化 → safetensors 直列化 → `load_conv1d_awq` で読み戻し →
+  逆量子化誤差が **非対称 INT4 の想定範囲(worst-case ≤ scale の 0.6 倍)**
+  以内、というラウンドトリップテストを追加(`awq_quantize_then_load_
+  round_trips_within_int4_error_bounds`)。**検証上限は「合成テンソルの
+  厳密一致」から「実重み相当の量子化誤差評価」へ引き上がった**。
+  ただし**実 AutoAWQ が書き出したワイヤ形式との互換性そのもの**は、
+  GPT-2 アーキテクチャ(Conv1D)の AWQ 公開モデルが事実上存在しないため
+  引き続き未検証(AutoAWQ の `WQLinear_GEMM` は qweight
+  `(in_features, out_features/8)`・pack order `[0,2,4,6,1,3,5,7]` で
+  本実装と一致する、と一次資料〈AutoAWQ `awq/modules/linear/gemm.py`〉
+  で確認済み)。
 - GPTQ / AWQ を逆量子化せず INT4 のまま GEMM する専用カーネル(現状は
   いずれも f32 へ展開)。
 
