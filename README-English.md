@@ -33,6 +33,18 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> **Recent update (2026-09-03)**: Per user instruction to target
+> 32GB-VRAM-class NVIDIA/AMD/Intel GPUs going forward and support
+> F16/F32/F64/F128, added `F16`/`F64`/`F128` variants to
+> `opencuda-core::KernelArg`/`ResolvedArg` and `hgemm`/`dgemm`/`qgemm`
+> CPU reference GEMMs in `opencuda-blas`. **F128 is a from-scratch
+> software double-double type** (`DoubleDouble`) — no NVIDIA/AMD/Intel
+> GPU has native FP128 hardware, so this exists for type-system
+> consistency and numerical-accuracy use cases only. This dev machine
+> only has a GT 730 (2GB, Kepler), so no 32GB-VRAM-class multi-vendor
+> hardware verification was possible. See [CLAUDE.md](CLAUDE.md) /
+> [OmniGPU-Design.md](OmniGPU-Design.md) §13.
+>
 > **Recent update (2026-08-20)**: Implemented FlexQ-style INT6
 > quantization (`quantize_int6`/`dequantize_int6`/`QuantizedInt6Tensor`
 > in `opencuda-blas`, packing 4 6-bit values into 3 bytes). PuzzleMoE

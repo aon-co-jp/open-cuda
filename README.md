@@ -6,6 +6,19 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/
+> aruaru-llmで、今後32GB VRAM級のNVIDIA/AMD/Intel GPUを想定し、
+> F16/F32/F64、さらにF128まで見据えて開発する」への対応。
+> `opencuda-core::KernelArg`/`ResolvedArg`へF16(`half::f16`)・F64・
+> F128(自前実装のdouble-double型`DoubleDouble`)を追加し、対応する
+> `hgemm`/`dgemm`/`qgemm`(CPUリファレンス実装)を新設。**正直な開示**:
+> F128はGPU上のネイティブハードウェア対応がNVIDIA/AMD/Intelいずれにも
+> 存在しないためソフトウェアエミュレーション(倍々精度)であり、
+> 型システムの一貫性のためだけに用意している。この開発機の実機は
+> GT 730(Kepler、2GB)のみのため、32GB級マルチベンダー実機での検証は
+> 未実施。詳細は[CLAUDE.md](CLAUDE.md)・[OmniGPU-Design.md](OmniGPU-Design.md)
+> §13参照。
+>
 > 📌 **最近の更新(2026-09-01)**: `open-cuda-llm::GptModel`へ
 > Model Folding(層冗長性検出・実際の除去・線形アダプタ置換)を実装
 > した。`analyze_layer_redundancy`/`prune_redundant_layers`
