@@ -16,14 +16,18 @@
 > 合わせた結果)が`true`の場合のみディスパッチする。**意外な発見**:
 > この開発機(NVIDIA GeForce GT 730、Kepler世代)は`shaderFloat64`を
 > 実際にサポートしており、CPU参照実装と1e-9以内で一致する本物のF64
-> GPU計算に成功した。**正直な開示**: いずれも「動く」ことは実証した
-> が、演算速度(f32経路との比較)は未計測。F128(qgemm)はGPUハード
-> ウェアが原理的に存在しないため引き続きCPU参照実装のみ(恒久的な
-> 制約)。実機検証: `cargo run -p hgemm_vulkan_real --release`・
+> GPU計算に成功した。続けて速度実測(`hgemm_dgemm_vulkan_bench.rs`、
+> GPT-2 124M実形状)を行った結果、**このマシンではCPUの方が5〜70倍
+> 速い**(既存の`sgemm`/F32での実測と同じ傾向——Vulkanディスパッチの
+> 固定オーバーヘッドがGPT-2規模の軽いGEMM計算より支配的)。**正直な
+> 開示**: 「動く」ことは実証したが、この環境では既定経路にする根拠は
+> 無い(`real-vulkan`は既定offのopt-inのまま)。F128(qgemm)はGPU
+> ハードウェアが原理的に存在しないため引き続きCPU参照実装のみ
+> (恒久的な制約)。実機検証: `cargo run -p hgemm_vulkan_real --release`・
 > `cargo run -p dgemm_vulkan_real --release`いずれも実機で成功、
-> `cargo test -p opencuda-blas --release`は新規5件を含め全green
+> `cargo test -p opencuda-blas --release`は新規7件を含め全green
 > (回帰なし)。詳細は[CLAUDE.md](CLAUDE.md)の2026-09-05 HANDOFF
-> 追記(続き・続き2)参照。
+> 追記(続き・続き2・続き3)参照。
 >
 > 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/
 > aruaru-llmで、今後32GB VRAM級のNVIDIA/AMD/Intel GPUを想定し、
