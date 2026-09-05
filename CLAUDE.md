@@ -89,6 +89,66 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-05続き3、hgemm/dgemm Vulkan経路の速度実測(結論: CPUの方が大幅に速い) / Follow-up: benchmarked hgemm/dgemm Vulkan speed — CPU wins by a wide margin)
+
+直上2エントリ(hgemm/F16・dgemm/F64のVulkan実装)で「動くことは実証した
+が速度は未計測」と記録していたギャップに対応。新規
+`crates/opencuda-blas/tests/hgemm_dgemm_vulkan_bench.rs`
+(`sgemm_directx_bench.rs`と同じベンチマーク形式、GPT-2 124Mの実際の
+GEMM形状: `seq_len x hidden x {3*hidden, hidden, 4*hidden, vocab}`)で
+実機(NVIDIA GeForce GT 730)にて実測した。
+
+### 実測結果(このマシン、実機、`--nocapture`)
+
+| shape (m,k,n) | hgemm(F16) speedup | dgemm(F64) speedup |
+|---|---|---|
+| (1, 768, 2304) | 0.055x | 0.017x |
+| (1, 768, 768) | 0.062x | 0.045x |
+| (1, 768, 3072) | 0.020x | 0.023x |
+| (1, 3072, 768) | 0.019x | 0.027x |
+| (1, 768, ~50257) | 0.015x | 0.014x |
+| (64, 768, 3072) | 0.189x | 0.192x |
+
+**正直な結論(誇張しない)**: いずれの形状・いずれの精度でも**CPUの方が
+5〜70倍速い**——このマシン(GT730、Kepler世代)ではVulkanディスパッチの
+固定オーバーヘッド(コマンドバッファ記録・`vkQueueSubmit`・フェンス
+待機)が、GPT-2 124M程度の軽いGEMM計算そのものより支配的になる。これは
+既存の`sgemm`(F32)側の実測(2026-08-04〜2026-08-23の各HANDOFF、
+「1トークンデコードはVulkan経由の方がCPUより遅い」)と**完全に整合する
+結果**であり、精度(F16/F64)を変えてもこの傾向は変わらないことが今回
+確認できた。プリフィル相当のバッチ形状(m=64)では相対的に改善する
+(0.19x程度)が、それでもCPUには届かない。
+
+### 結論・今回の位置づけ
+
+`hgemm`/`dgemm`のVulkan配線は「正しく動く」ことを実証する目的では
+達成済みだが、**この開発機ではGPU経路を既定にする根拠は無い**
+(既存の`real-vulkan` featureが既定offのopt-inのままである設計判断と
+整合)。より強力な統合GPU/弱いCPUの組み合わせ、またはプリフィル
+(m>>1)専用の経路として使う場合にのみ有利になる可能性が残るが、
+これは引き続き未検証(このマシンにその種のハードウェアが無いため)。
+
+### 検証
+
+- `cargo test -p opencuda-blas --release --test
+  hgemm_dgemm_vulkan_bench -- --nocapture`: 2件とも実行・実測完了
+  (上記表の数値を実際に確認)。
+- `cargo clippy -p opencuda-blas --release --all-targets --features
+  "opencuda-vulkan/real-vulkan" -- -D warnings`: 警告0件。
+
+**English summary**: Benchmarked the newly-wired `hgemm`(F16)/
+`dgemm`(F64) Vulkan paths against CPU on real GPT-2-124M-shaped GEMMs
+(new `hgemm_dgemm_vulkan_bench.rs`, same format as
+`sgemm_directx_bench.rs`). Real-hardware result (NVIDIA GT 730): **CPU
+is 5-70x faster than Vulkan for both precisions across every shape
+tested** — consistent with the existing F32 (`sgemm`) findings that
+Vulkan's fixed dispatch overhead (command buffer recording,
+`vkQueueSubmit`, fence wait) dominates for GPT-2-124M-scale compute on
+this GPU. Batch-like shapes (m=64) improve relatively (~0.19x) but
+still lose to CPU. Conclusion: the Vulkan wiring is verified correct,
+but there is no basis on this machine to make it the default path —
+consistent with `real-vulkan` staying an opt-in feature.
+
 ## HANDOFF追記(2026-09-05続き2、dgemm(F64)にもVulkan実装を追加・実機検証(意外にも成功) / Follow-up: real Vulkan F64 GEMM for dgemm — this GPU actually supports it)
 
 直上エントリ(hgemm/F16)に続き、dgemm(F64)のGPUディスパッチも実装した。
