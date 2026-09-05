@@ -1719,6 +1719,100 @@ pub fn qgemm(
     Ok(())
 }
 
+// ============================================================================
+// hgemm/dgemm/qgemm の GPU ディスパッチ配線(2026-09-05追加)
+//
+// 2026-09-03時点の正直な残課題「hgemm/dgemm/qgemmはCPU参照実装のみで、
+// sgemmが持つGpuDevice::launch_kernel経由の実GPUディスパッチ(CPU SIMD→
+// Vulkan→DirectXの階層フォールバック)が配線されていない」への対応。
+//
+// **正直な開示、誇張しない**: F16/F64/F128向けのVulkan/DirectXシェーダは
+// 今回も新規に書いていない(既存の`matmul.comp`/`matmul.hlsl`はf32専用の
+// バイト列レイアウトを前提にしており、そのまま流用すると誤った結果を
+// 黙って返しかねないため)。ここで実装したのは「`select_gemm_path`で
+// 経路を選び、`CpuNaive`ならCPU参照実装を呼ぶ、それ以外の経路が選ばれた
+// 場合は`sgemm`のDirectXGeneric未実装スタブや`sgemm_fp8_weight_vendor`と
+// 同じ設計方針で、黙ってCPUへフォールバックしたり誤った結果を返したり
+// せず明示的なエラーを返す」という**ディスパッチ選択ロジックの配線**
+// のみ。これにより、呼び出し側は既存の`sgemm(device, ...)`と同じ
+// パターンでhgemm/dgemm/qgemmも呼べるようになり、将来Vulkan/DirectX側の
+// 専用シェーダを実装する際は`GemmPath::VulkanGeneric`/`DirectXGeneric`
+// 分岐の中身を実装で置き換えるだけで済む。
+// ============================================================================
+
+/// [`hgemm`]のGPUディスパッチ版。`select_gemm_path(device)`で経路を選び、
+/// `GemmPath::CpuNaive`ならホスト側CPU参照実装([`hgemm`])を呼ぶ。
+///
+/// **正直な開示**: `VulkanGeneric`/`DirectXGeneric`/ベンダー専用経路が
+/// 選ばれた場合は、F16専用のGPUシェーダを本クレートが持たないため
+/// 明示的なエラーを返す(黙ってCPUへ落としたり誤った結果を返したりしない)。
+pub fn hgemm_dispatch(
+    device: &dyn GpuDevice,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[half::f16],
+    b: &[half::f16],
+    c: &mut [half::f16],
+) -> Result<()> {
+    match select_gemm_path(device) {
+        GemmPath::CpuNaive => hgemm(m, k, n, a, b, c),
+        other => anyhow::bail!(
+            "hgemm_dispatch: GemmPath::{other:?} was selected but this crate has no F16 GPU \
+             kernel yet (only the CpuNaive reference path is wired) — pass a CPU device, or \
+             implement a Vulkan/DirectX F16 shader and route it here"
+        ),
+    }
+}
+
+/// [`dgemm`]のGPUディスパッチ版。設計・制約は[`hgemm_dispatch`]と同じ
+/// (F64専用のGPUシェーダは本クレートに存在しないため、`CpuNaive`以外の
+/// 経路は明示的なエラー)。
+#[allow(clippy::too_many_arguments)]
+pub fn dgemm_dispatch(
+    device: &dyn GpuDevice,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f64,
+    a: &[f64],
+    b: &[f64],
+    beta: f64,
+    c: &mut [f64],
+) -> Result<()> {
+    match select_gemm_path(device) {
+        GemmPath::CpuNaive => dgemm(m, k, n, alpha, a, b, beta, c),
+        other => anyhow::bail!(
+            "dgemm_dispatch: GemmPath::{other:?} was selected but this crate has no F64 GPU \
+             kernel yet (only the CpuNaive reference path is wired) — pass a CPU device, or \
+             implement a Vulkan/DirectX F64 shader and route it here"
+        ),
+    }
+}
+
+/// [`qgemm`]のGPUディスパッチ版。設計・制約は[`hgemm_dispatch`]と同じ。
+/// **F128はそもそもGPUハードウェアに存在しない**(モジュール冒頭コメント
+/// 参照)ため、`CpuNaive`以外の経路は原理的にも意味を持たず、常に
+/// 明示的なエラーを返す。
+pub fn qgemm_dispatch(
+    device: &dyn GpuDevice,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[opencuda_core::DoubleDouble],
+    b: &[opencuda_core::DoubleDouble],
+    c: &mut [opencuda_core::DoubleDouble],
+) -> Result<()> {
+    match select_gemm_path(device) {
+        GemmPath::CpuNaive => qgemm(m, k, n, a, b, c),
+        other => anyhow::bail!(
+            "qgemm_dispatch: GemmPath::{other:?} was selected, but F128 has no native GPU \
+             hardware on any vendor (NVIDIA/AMD/Intel) — qgemm is CPU-only by design, pass a \
+             CPU device"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2787,5 +2881,129 @@ mod tests {
         );
         // このケースではdouble-doubleは厳密値に一致するはず。
         assert_eq!(c_dd[0].to_f64(), true_value);
+    }
+
+    // ========================================================================
+    // hgemm_dispatch/dgemm_dispatch/qgemm_dispatch(2026-09-05追加)のテスト。
+    // ========================================================================
+
+    /// `supports_spirv()==true`を自己申告するがVulkanは持たない偽装デバイス
+    /// (`Fp8CapableDevice`と同じ「実演算は内側のCpuDeviceへ委譲」パターン)。
+    /// `select_gemm_path`が`GemmPath::VulkanGeneric`を選ぶケースを、実
+    /// Vulkanハードウェアの有無に関わらずこのマシンで検証するために使う。
+    struct SpirvCapableDevice(Arc<CpuDevice>, opencuda_core::DeviceInfo);
+    impl SpirvCapableDevice {
+        fn new(inner: Arc<CpuDevice>) -> Self {
+            // `vendor: Unknown`にすることで`select_gemm_path`のベンダー別
+            // stub分岐(CuBlas/RocBlas/OneMkl)を経由せず、直接
+            // `GemmPath::VulkanGeneric`が選ばれる経路を作る(内側の
+            // `CpuDevice`は`GpuVendor::Cpu`を返し`CpuNaive`になってしまう
+            // ため、テスト用にベンダー情報だけ差し替える)。
+            let mut info = inner.info().clone();
+            info.vendor = opencuda_core::GpuVendor::Unknown;
+            Self(inner, info)
+        }
+    }
+    impl opencuda_core::GpuDevice for SpirvCapableDevice {
+        fn info(&self) -> &opencuda_core::DeviceInfo {
+            &self.1
+        }
+        fn alloc(&self, bytes: usize) -> Result<opencuda_core::DevicePtr> {
+            self.0.alloc(bytes)
+        }
+        fn free(&self, ptr: opencuda_core::DevicePtr) -> Result<()> {
+            self.0.free(ptr)
+        }
+        fn memcpy_h2d(&self, dst: opencuda_core::DevicePtr, src: &[u8]) -> Result<()> {
+            self.0.memcpy_h2d(dst, src)
+        }
+        fn memcpy_d2h(&self, dst: &mut [u8], src: opencuda_core::DevicePtr) -> Result<()> {
+            self.0.memcpy_d2h(dst, src)
+        }
+        fn memcpy_d2d(
+            &self,
+            dst: opencuda_core::DevicePtr,
+            src: opencuda_core::DevicePtr,
+            bytes: usize,
+        ) -> Result<()> {
+            self.0.memcpy_d2d(dst, src, bytes)
+        }
+        fn launch_kernel(
+            &self,
+            kernel: &opencuda_core::CompiledKernel,
+            cfg: &opencuda_core::LaunchConfig,
+            args: &[opencuda_core::KernelArg],
+        ) -> Result<()> {
+            self.0.launch_kernel(kernel, cfg, args)
+        }
+        fn synchronize(&self) -> Result<()> {
+            self.0.synchronize()
+        }
+        fn supports_spirv(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn hgemm_dispatch_on_cpu_device_matches_plain_hgemm() {
+        let device = cpu_device();
+        let a = [1.0f32, 2.0, 3.0, 4.0].map(half::f16::from_f32);
+        let b = [5.0f32, 6.0, 7.0, 8.0].map(half::f16::from_f32);
+        let mut c_dispatch = [half::f16::from_f32(0.0); 4];
+        let mut c_plain = [half::f16::from_f32(0.0); 4];
+        hgemm_dispatch(device.as_ref(), 2, 2, 2, &a, &b, &mut c_dispatch).unwrap();
+        hgemm(2, 2, 2, &a, &b, &mut c_plain).unwrap();
+        assert_eq!(c_dispatch, c_plain);
+    }
+
+    #[test]
+    fn dgemm_dispatch_on_cpu_device_matches_plain_dgemm() {
+        let device = cpu_device();
+        let a = [1.0f64, 2.0, 3.0, 4.0];
+        let b = [5.0f64, 6.0, 7.0, 8.0];
+        let mut c_dispatch = [0.0f64; 4];
+        let mut c_plain = [0.0f64; 4];
+        dgemm_dispatch(device.as_ref(), 2, 2, 2, 1.0, &a, &b, 0.0, &mut c_dispatch).unwrap();
+        dgemm(2, 2, 2, 1.0, &a, &b, 0.0, &mut c_plain).unwrap();
+        assert_eq!(c_dispatch, c_plain);
+    }
+
+    #[test]
+    fn qgemm_dispatch_on_cpu_device_matches_plain_qgemm() {
+        use opencuda_core::DoubleDouble as Dd;
+        let device = cpu_device();
+        let a: Vec<Dd> = [1.0, 2.0, 3.0, 4.0].iter().map(|&v| Dd::from_f64(v)).collect();
+        let b: Vec<Dd> = [5.0, 6.0, 7.0, 8.0].iter().map(|&v| Dd::from_f64(v)).collect();
+        let mut c_dispatch = vec![Dd::ZERO; 4];
+        let mut c_plain = vec![Dd::ZERO; 4];
+        qgemm_dispatch(device.as_ref(), 2, 2, 2, &a, &b, &mut c_dispatch).unwrap();
+        qgemm(2, 2, 2, &a, &b, &mut c_plain).unwrap();
+        for (d, p) in c_dispatch.iter().zip(c_plain.iter()) {
+            assert_eq!(d.to_f64(), p.to_f64());
+        }
+    }
+
+    #[test]
+    fn hgemm_dgemm_qgemm_dispatch_honestly_reject_non_cpu_gemm_paths() {
+        use opencuda_core::DoubleDouble as Dd;
+        // `supports_spirv()==true`だがF16/F64/F128専用のGPUシェーダを本
+        // クレートは持たないため、GemmPath::VulkanGenericが選ばれる状況では
+        // 黙ってCPUへフォールバックしたり誤った結果を返したりせず、明示的な
+        // エラーを返すことを確認する(sgemmが`spirv=None`のとき同じ経路で
+        // エラーを返すのと同じ設計方針)。
+        let device = SpirvCapableDevice::new(cpu_device());
+        assert_eq!(select_gemm_path(&device), GemmPath::VulkanGeneric);
+
+        let a16 = [half::f16::from_f32(1.0); 4];
+        let mut c16 = [half::f16::from_f32(0.0); 4];
+        assert!(hgemm_dispatch(&device, 2, 2, 2, &a16, &a16, &mut c16).is_err());
+
+        let a64 = [1.0f64; 4];
+        let mut c64 = [0.0f64; 4];
+        assert!(dgemm_dispatch(&device, 2, 2, 2, 1.0, &a64, &a64, 0.0, &mut c64).is_err());
+
+        let a128 = vec![Dd::from_f64(1.0); 4];
+        let mut c128 = vec![Dd::ZERO; 4];
+        assert!(qgemm_dispatch(&device, 2, 2, 2, &a128, &a128, &mut c128).is_err());
     }
 }
