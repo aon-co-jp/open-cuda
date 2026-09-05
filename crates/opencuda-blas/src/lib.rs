@@ -555,6 +555,77 @@ pub fn sgemm_vulkan_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize
     Ok(c)
 }
 
+fn f16_to_bytes(v: &[half::f16]) -> &[u8] {
+    // SAFETY: half::f16はrepr(transparent)なu16ラッパーで、2バイト/要素の
+    // 読み取り専用バイト列として見るだけ(f32_to_bytesと同じ最小キャスト
+    // パターン)。
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn f16_from_bytes_mut(v: &mut [half::f16]) -> &mut [u8] {
+    // SAFETY: 同上、可変版。
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v)) }
+}
+
+/// `hgemm`のVulkanディスパッチ版(2026-09-05新設、`GemmPath::VulkanGeneric`の
+/// F16実装)。`sgemm_vulkan_generic`と同じ自己完結パターン
+/// (デバイス上にA/B/C分のバッファを確保し、H2D転送→ディスパッチ→D2H転送
+/// まで内部で完結させる)を踏襲するが、half要素をそのまま4バイト単位の
+/// `matmul`シェーダへ流し込むと2倍の要素数を読み書きしてしまい誤った
+/// 結果になるため、専用の`hgemm.comp`(2 half/uintパッキング、
+/// `examples/hgemm_vulkan_real/shaders/hgemm.comp`のコメント参照)を新設した。
+///
+/// **正直な開示**: 実演算はシェーダ内部で`unpackHalf2x16`によりf32へ
+/// 変換してから行う——このマシン(GT730、Kepler世代)を含む多くの
+/// コンシューマGPUにFP16ネイティブ演算のTensor Coreは無いため、これは
+/// CPU版`hgemm`と同じ「ソフトウェア変換」の域を出ない。メモリ転送量が
+/// f32版の半分になる点(H2D/D2H帯域・VRAM使用量)が主な利点であり、
+/// 演算速度の向上を主張するものではない。
+///
+/// `k`・`n`はいずれも偶数であること(`ensure_hgemm_args`が拒否する制約と
+/// 同じ、パッキングが行境界をまたがないようにするため)。
+pub fn hgemm_vulkan_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize, a: &[half::f16], b: &[half::f16], spirv: &[u8]) -> Result<Vec<half::f16>> {
+    if a.len() != m * k {
+        anyhow::bail!("hgemm_vulkan_generic: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    if b.len() != k * n {
+        anyhow::bail!("hgemm_vulkan_generic: b.len()={} != k*n={}", b.len(), k * n);
+    }
+    if !k.is_multiple_of(2) {
+        anyhow::bail!("hgemm_vulkan_generic: k={k} must be even (F16 packing constraint, see hgemm.comp)");
+    }
+    if !n.is_multiple_of(2) {
+        anyhow::bail!("hgemm_vulkan_generic: n={n} must be even (F16 packing constraint, see hgemm.comp)");
+    }
+
+    let da = ScopedAlloc::new(device, std::mem::size_of_val(a))?;
+    let db = ScopedAlloc::new(device, std::mem::size_of_val(b))?;
+    let dc = ScopedAlloc::new(device, m * n * std::mem::size_of::<half::f16>())?;
+
+    device.memcpy_h2d(da.ptr(), f16_to_bytes(a))?;
+    device.memcpy_h2d(db.ptr(), f16_to_bytes(b))?;
+
+    let kernel = CompiledKernel::spirv("hgemm", "main", spirv);
+    let cfg = LaunchConfig::grid2d(m as u32, (n / 2) as u32, 16, 16);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(da.ptr()),
+            KernelArg::Ptr(db.ptr()),
+            KernelArg::Ptr(dc.ptr()),
+            KernelArg::Usize(m),
+            KernelArg::Usize(k),
+            KernelArg::Usize(n),
+        ],
+    )?;
+    device.synchronize()?;
+
+    let mut c = vec![half::f16::from_f32(0.0); m * n];
+    device.memcpy_d2h(f16_from_bytes_mut(&mut c), dc.ptr())?;
+    Ok(c)
+}
+
 /// 行ごと(row-wise) softmaxを実Vulkan SPIR-Vカーネルで計算する
 /// (2026-08-06新設、CLAUDE.md HANDOFF 2026-08-05「次にすべきこと(1)
 /// softmax専用のSPIR-Vカーネル」への着手)。
@@ -1720,32 +1791,44 @@ pub fn qgemm(
 }
 
 // ============================================================================
-// hgemm/dgemm/qgemm の GPU ディスパッチ配線(2026-09-05追加)
+// hgemm/dgemm/qgemm の GPU ディスパッチ配線(2026-09-05追加、
+// 同日中にF16(hgemm)のみVulkan実装まで到達)
 //
 // 2026-09-03時点の正直な残課題「hgemm/dgemm/qgemmはCPU参照実装のみで、
 // sgemmが持つGpuDevice::launch_kernel経由の実GPUディスパッチ(CPU SIMD→
 // Vulkan→DirectXの階層フォールバック)が配線されていない」への対応。
 //
-// **正直な開示、誇張しない**: F16/F64/F128向けのVulkan/DirectXシェーダは
-// 今回も新規に書いていない(既存の`matmul.comp`/`matmul.hlsl`はf32専用の
-// バイト列レイアウトを前提にしており、そのまま流用すると誤った結果を
-// 黙って返しかねないため)。ここで実装したのは「`select_gemm_path`で
-// 経路を選び、`CpuNaive`ならCPU参照実装を呼ぶ、それ以外の経路が選ばれた
-// 場合は`sgemm`のDirectXGeneric未実装スタブや`sgemm_fp8_weight_vendor`と
-// 同じ設計方針で、黙ってCPUへフォールバックしたり誤った結果を返したり
-// せず明示的なエラーを返す」という**ディスパッチ選択ロジックの配線**
-// のみ。これにより、呼び出し側は既存の`sgemm(device, ...)`と同じ
-// パターンでhgemm/dgemm/qgemmも呼べるようになり、将来Vulkan/DirectX側の
-// 専用シェーダを実装する際は`GemmPath::VulkanGeneric`/`DirectXGeneric`
-// 分岐の中身を実装で置き換えるだけで済む。
+// **現状(2026-09-05更新、誇張しない)**:
+// - **hgemm(F16)**: `GemmPath::VulkanGeneric`向けの専用シェーダ
+//   ([`hgemm_vulkan_generic`]、`examples/hgemm_vulkan_real/shaders/
+//   hgemm.comp`)を実装し、このマシンの実Vulkanハードウェア
+//   (NVIDIA GeForce GT 730)でCPU参照実装と一致することを検証済み。
+//   ただしFP16ネイティブ演算のTensor Coreはこのマシンに無いため、
+//   シェーダ内部の演算自体は`unpackHalf2x16`でf32へ変換してから行う
+//   ソフトウェア実装(利点はメモリ転送量の削減であり演算速度ではない)。
+// - **dgemm(F64)/qgemm(F128)**: 依然CPU参照実装のみ。既存の
+//   `matmul.comp`/`matmul.hlsl`はf32専用のバイト列レイアウトを前提に
+//   しており、そのまま流用すると誤った結果を黙って返しかねないため、
+//   `CpuNaive`以外の経路は「`select_gemm_path`で経路を選び、`CpuNaive`
+//   ならCPU参照実装を呼ぶ、それ以外は`sgemm`のDirectXGeneric未実装
+//   スタブと同じ設計方針で明示的なエラーを返す」という**ディスパッチ
+//   選択ロジックの配線のみ**に留まる。F128はGPUハードウェアが原理的に
+//   存在しないため(モジュール冒頭コメント参照)、この制約は恒久的。
+//   F64専用シェーダを実装する際は`GemmPath::VulkanGeneric`/
+//   `DirectXGeneric`分岐の中身を、hgemmと同じ設計(要素サイズに応じた
+//   専用パッキング形式のシェーダ)で置き換えることになる見込み。
 // ============================================================================
 
 /// [`hgemm`]のGPUディスパッチ版。`select_gemm_path(device)`で経路を選び、
-/// `GemmPath::CpuNaive`ならホスト側CPU参照実装([`hgemm`])を呼ぶ。
+/// `GemmPath::CpuNaive`ならホスト側CPU参照実装([`hgemm`])を呼び、
+/// `GemmPath::VulkanGeneric`かつ`spirv`が`Some`なら[`hgemm_vulkan_generic`]
+/// (2026-09-05新設のF16専用Vulkanカーネル)へディスパッチする。
 ///
-/// **正直な開示**: `VulkanGeneric`/`DirectXGeneric`/ベンダー専用経路が
-/// 選ばれた場合は、F16専用のGPUシェーダを本クレートが持たないため
-/// 明示的なエラーを返す(黙ってCPUへ落としたり誤った結果を返したりしない)。
+/// **正直な開示**: `VulkanGeneric`が選ばれても`spirv`が`None`、または
+/// `DirectXGeneric`/ベンダー専用経路が選ばれた場合は、対応するGPUシェーダを
+/// 本クレートが持たないため明示的なエラーを返す(黙ってCPUへ落としたり
+/// 誤った結果を返したりしない、`sgemm`と同じ設計方針)。
+#[allow(clippy::too_many_arguments)]
 pub fn hgemm_dispatch(
     device: &dyn GpuDevice,
     m: usize,
@@ -1754,13 +1837,27 @@ pub fn hgemm_dispatch(
     a: &[half::f16],
     b: &[half::f16],
     c: &mut [half::f16],
+    spirv: Option<&[u8]>,
 ) -> Result<()> {
     match select_gemm_path(device) {
         GemmPath::CpuNaive => hgemm(m, k, n, a, b, c),
+        GemmPath::VulkanGeneric => {
+            let Some(spirv) = spirv else {
+                anyhow::bail!(
+                    "hgemm_dispatch: GemmPath::VulkanGeneric selected (device.supports_spirv()==true) \
+                     but no spirv bytes were provided; pass the compiled hgemm.spv bytes via the \
+                     `spirv` argument"
+                );
+            };
+            anyhow::ensure!(c.len() == m * n, "hgemm_dispatch: c.len()={} != m*n={}", c.len(), m * n);
+            let result = hgemm_vulkan_generic(device, m, k, n, a, b, spirv)?;
+            c.copy_from_slice(&result);
+            Ok(())
+        }
         other => anyhow::bail!(
             "hgemm_dispatch: GemmPath::{other:?} was selected but this crate has no F16 GPU \
-             kernel yet (only the CpuNaive reference path is wired) — pass a CPU device, or \
-             implement a Vulkan/DirectX F16 shader and route it here"
+             kernel yet (only CpuNaive and VulkanGeneric are wired) — pass a CPU or Vulkan device, or \
+             implement a DirectX F16 shader and route it here"
         ),
     }
 }
@@ -2278,6 +2375,98 @@ mod tests {
         assert_eq!(c_vulkan.len(), c_cpu.len());
         for (i, (&gv, &gc)) in c_vulkan.iter().zip(c_cpu.iter()).enumerate() {
             assert!((gv - gc).abs() < 1e-3, "idx {i}: vulkan={gv}, cpu={gc}");
+        }
+    }
+
+    #[test]
+    fn hgemm_vulkan_generic_matches_cpu_naive_on_real_hardware() {
+        // `sgemm_vulkan_generic_matches_cpu_naive_on_real_hardware`と同じ
+        // パターン(2026-09-05新設、F16 GPUディスパッチ配線)。実Vulkan環境と
+        // 事前コンパイル済みのhgemm.spv(`examples/hgemm_vulkan_real/
+        // shaders/hgemm.spv`、`tools/compile-vulkan-shaders.*`で生成)の
+        // 両方が必要、どちらか欠けている環境ではスキップする。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/hgemm_vulkan_real/shaders/hgemm.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping hgemm_vulkan_generic test: hgemm.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping hgemm_vulkan_generic test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+
+        let m = 8;
+        let k = 6;
+        let n = 4;
+        let a: Vec<half::f16> = (0..m * k).map(|i| half::f16::from_f32((i % 7) as f32 - 3.0)).collect();
+        let b: Vec<half::f16> = (0..k * n).map(|i| half::f16::from_f32((i % 5) as f32 - 2.0)).collect();
+
+        let mut c_cpu = vec![half::f16::from_f32(0.0); m * n];
+        hgemm(m, k, n, &a, &b, &mut c_cpu).unwrap();
+
+        let c_vulkan = hgemm_vulkan_generic(vulkan_device.as_ref(), m, k, n, &a, &b, &spirv).unwrap();
+
+        assert_eq!(c_vulkan.len(), c_cpu.len());
+        for (i, (&gv, &gc)) in c_vulkan.iter().zip(c_cpu.iter()).enumerate() {
+            let diff = (gv.to_f32() - gc.to_f32()).abs();
+            assert!(diff < 5e-2, "idx {i}: vulkan={gv}, cpu={gc} (diff={diff})");
+        }
+    }
+
+    #[test]
+    fn hgemm_dispatch_uses_vulkan_path_and_matches_cpu_on_real_hardware() {
+        // hgemm_dispatchの`GemmPath::VulkanGeneric`分岐(2026-09-05新設)が
+        // 実際に`hgemm_vulkan_generic`へ配線されていることを、`sgemm`の
+        // 自動ディスパッチ経路と同じ形で実機確認する。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/hgemm_vulkan_real/shaders/hgemm.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping hgemm_dispatch real-hardware test: hgemm.spv not compiled at {}: {e}",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping hgemm_dispatch real-hardware test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        assert_eq!(select_gemm_path(vulkan_device.as_ref()), GemmPath::VulkanGeneric);
+
+        let m = 4;
+        let k = 2;
+        let n = 2;
+        let a: Vec<half::f16> = (0..m * k).map(|i| half::f16::from_f32(i as f32)).collect();
+        let b: Vec<half::f16> = (0..k * n).map(|i| half::f16::from_f32(i as f32 + 1.0)).collect();
+
+        let mut c_cpu = vec![half::f16::from_f32(0.0); m * n];
+        hgemm(m, k, n, &a, &b, &mut c_cpu).unwrap();
+
+        let mut c_dispatch = vec![half::f16::from_f32(0.0); m * n];
+        hgemm_dispatch(vulkan_device.as_ref(), m, k, n, &a, &b, &mut c_dispatch, Some(&spirv)).unwrap();
+
+        for (i, (&gd, &gc)) in c_dispatch.iter().zip(c_cpu.iter()).enumerate() {
+            let diff = (gd.to_f32() - gc.to_f32()).abs();
+            assert!(diff < 5e-2, "idx {i}: dispatch={gd}, cpu={gc} (diff={diff})");
         }
     }
 
@@ -2951,7 +3140,7 @@ mod tests {
         let b = [5.0f32, 6.0, 7.0, 8.0].map(half::f16::from_f32);
         let mut c_dispatch = [half::f16::from_f32(0.0); 4];
         let mut c_plain = [half::f16::from_f32(0.0); 4];
-        hgemm_dispatch(device.as_ref(), 2, 2, 2, &a, &b, &mut c_dispatch).unwrap();
+        hgemm_dispatch(device.as_ref(), 2, 2, 2, &a, &b, &mut c_dispatch, None).unwrap();
         hgemm(2, 2, 2, &a, &b, &mut c_plain).unwrap();
         assert_eq!(c_dispatch, c_plain);
     }
@@ -2996,7 +3185,7 @@ mod tests {
 
         let a16 = [half::f16::from_f32(1.0); 4];
         let mut c16 = [half::f16::from_f32(0.0); 4];
-        assert!(hgemm_dispatch(&device, 2, 2, 2, &a16, &a16, &mut c16).is_err());
+        assert!(hgemm_dispatch(&device, 2, 2, 2, &a16, &a16, &mut c16, None).is_err());
 
         let a64 = [1.0f64; 4];
         let mut c64 = [0.0f64; 4];

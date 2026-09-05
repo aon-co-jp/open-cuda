@@ -1,0 +1,18 @@
+[package]
+name = "hgemm_vulkan_real"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+opencuda-core.workspace = true
+opencuda-cpu.workspace = true
+opencuda-blas.workspace = true
+opencuda-vulkan = { workspace = true, features = ["real-vulkan"] }
+half.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "hgemm_vulkan_real"
+path = "src/main.rs"

@@ -24,6 +24,7 @@ members = [
     "examples/raid6_q_parity_vulkan_real",
     "examples/softmax_vulkan_real",
     "examples/sbm_demo",
+    "examples/hgemm_vulkan_real",
 ]
 
 [workspace.package]

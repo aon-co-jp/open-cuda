@@ -89,6 +89,78 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-05続き、hgemm(F16)にVulkan実装を追加・実機検証 / Follow-up: real Vulkan F16 GEMM implementation for hgemm)
+
+直上エントリの正直な残課題「F16/F64/F128専用のVulkan/DirectXシェーダは
+まだ存在しない」のうち、**F16(hgemm)分だけ**実装を進め、実機検証まで
+到達した(F64/F128は引き続き未着手、下記参照)。
+
+### 実装内容
+
+- 新規`examples/hgemm_vulkan_real/shaders/hgemm.comp`: half 2要素を
+  1つのuintへパックしたバッファ(`unpackHalf2x16`/`packHalf2x16`、
+  GLSL 4.20以降でcore、追加のVulkan拡張〈`VK_KHR_16bit_storage`等〉
+  不要)を読み書きするGEMMシェーダ。1スレッドが出力ワード1つ
+  (連続する2列分)をまとめて計算・書き込みすることで、別スレッドが
+  同じワードの別半分を同時に書くデータ競合を避けている
+  (`k`・`n`がいずれも偶数であることを前提、奇数なら`ensure_hgemm_args`/
+  `hgemm_vulkan_generic`が明示的に拒否)。
+- `opencuda-vulkan::real::VulkanDevice`に`ensure_hgemm_args`/
+  `run_hgemm_spirv`を追加、`launch_kernel`のカーネル名分岐に`"hgemm"`
+  を追加(既存の`matmul`/`softmax`等と同じ設計パターン)。
+- `opencuda-blas::hgemm_vulkan_generic(device, m, k, n, a, b, spirv)`
+  ——`sgemm_vulkan_generic`と同じ自己完結パターン(デバイス上に
+  A/B/C分のバッファを確保しH2D→ディスパッチ→D2Hまで内部で完結)。
+  `hgemm_dispatch`の`GemmPath::VulkanGeneric`分岐をこの関数へ実配線
+  (シグネチャに`spirv: Option<&[u8]>`を追加、`sgemm`と同じ
+  「`None`なら明示的エラー」設計)。
+- 新規example crate`hgemm_vulkan_real`(ワークスペースメンバーへ登録、
+  `tools/compile-vulkan-shaders.{sh,ps1,cmd}`にコンパイルエントリ追加)。
+
+### 正直な開示
+
+- **FP16ネイティブ演算のTensor Coreはこのマシン(GT730、Kepler世代)に
+  無い**——シェーダ内部の演算は`unpackHalf2x16`でf32へ変換してから
+  行うソフトウェア実装で、利点はメモリ転送量の削減(f32版の半分)で
+  あり演算速度の向上ではない(CPU版`hgemm`と同じ「ソフトウェア変換」の
+  域を出ない)。
+- **F64(dgemm)/F128(qgemm)は引き続きCPU参照実装のみ**——今回は
+  F16のみに範囲を絞った(パッキング設計〈2要素/uint〉がF16に特有の
+  ものであり、F64は4バイト/要素で`matmul.comp`に近いレイアウトに
+  なるはずだが、専用シェーダの新規実装は次回の増分として残す)。
+- 32GB級VRAMカード(NVIDIA/AMD/Intel いずれも)での実機検証は今回も
+  未実施(この開発機はGT730、2GB、Kepler世代のみ)。
+
+### 検証
+
+- 実機(NVIDIA GeForce GT 730)で`cargo run -p hgemm_vulkan_real
+  --release`を実行し、`OK: hgemm(F16) 8x6 * 6x4 verified: real Vulkan
+  Compute agrees with the CPU reference`を確認。
+- `cargo test -p opencuda-blas --release -- --test-threads=1`
+  **57 passed / 1 ignored**(既存55件+新規3件:
+  `hgemm_vulkan_generic_matches_cpu_naive_on_real_hardware`・
+  `hgemm_dispatch_uses_vulkan_path_and_matches_cpu_on_real_hardware`・
+  既存の`hgemm_dispatch_on_cpu_device_matches_plain_hgemm`等の
+  呼び出し元更新、回帰なし)。
+- `cargo clippy -p opencuda-blas -p opencuda-vulkan -p hgemm_vulkan_real
+  --release --all-targets --features "opencuda-vulkan/real-vulkan" --
+  -D warnings`警告0件(`manual_is_multiple_of`2件・
+  `too_many_arguments`1件を検出・修正済み)。
+- `cargo build --workspace --release`成功、リグレッション無し。
+
+**English summary**: Implemented a real Vulkan F16 GEMM shader
+(`hgemm.comp`, packing 2 halves per uint via `unpackHalf2x16`/
+`packHalf2x16`, no extra Vulkan extension needed) and wired
+`hgemm_dispatch`'s `GemmPath::VulkanGeneric` branch to it via the new
+`hgemm_vulkan_generic`. Verified on real hardware (NVIDIA GeForce GT
+730): `cargo run -p hgemm_vulkan_real --release` matches the CPU
+reference; `opencuda-blas` tests 57/58 pass (1 ignored, 3 new); clippy
+clean; full workspace build clean. Honest disclosure: this GPU has no
+FP16 Tensor Core, so the shader still computes in f32 internally (the
+benefit is halved memory transfer, not speed); F64(dgemm)/F128(qgemm)
+still have no dedicated GPU shader (CPU-only, unchanged); no 32GB-VRAM-
+class hardware exists in this environment to test at that scale.
+
 ## HANDOFF追記(2026-09-05、hgemm/dgemm/qgemmへGPUディスパッチ配線(select_gemm_path経由)を追加 / Follow-up: wired hgemm/dgemm/qgemm through select_gemm_path's GPU dispatch)
 
 続き3エントリの正直な残課題「hgemm/dgemm/qgemmはCPU参照実装のみで、
