@@ -1,0 +1,48 @@
+#version 450
+
+// dgemm(F64) 用の Vulkan Compute シェーダ(2026-09-05新設)。
+//
+// GLSLの`double`型はVulkan/SPIR-Vではcore(GLSL 4.00以降)だが、実行に
+// あたって物理デバイスが`shaderFloat64`機能をサポートし、かつ論理デバイス
+// 作成時にこの機能が有効化されている必要がある(`opencuda-vulkan::real::
+// VulkanDevice::new`が実際に`vkGetPhysicalDeviceFeatures`で確認した
+// 場合のみ有効化する、`GpuDevice::supports_f64_shader()`参照)。
+//
+// half(F16)版の`hgemm.comp`と異なり、`double`は8バイト/要素で単純に
+// std430レイアウトの配列としてそのままバインドできるため、2要素パッキング
+// のような特殊な回避策は不要(1スレッド=1出力要素の素朴な実装、
+// `matmul.comp`のf32版と全く同じ構造)。
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A {
+    double a[];
+};
+
+layout(set = 0, binding = 1) readonly buffer B {
+    double b[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer C {
+    double c[];
+};
+
+layout(push_constant) uniform Params {
+    uint m;
+    uint k;
+    uint n;
+} params;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= params.m || col >= params.n) {
+        return;
+    }
+
+    double acc = 0.0lf;
+    for (uint kk = 0u; kk < params.k; kk++) {
+        acc += a[row * params.k + kk] * b[kk * params.n + col];
+    }
+    c[row * params.n + col] = acc;
+}

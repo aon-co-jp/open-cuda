@@ -47,6 +47,7 @@ pub struct VulkanDevice {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     allocations: Mutex<HashMap<u64, VulkanAllocation>>,
     next_handle: AtomicU64,
+    shader_float64_supported: bool,
 }
 
 impl VulkanDevice {
@@ -136,12 +137,28 @@ impl VulkanDevice {
             }
         };
 
+        // shaderFloat64(SPIR-V Float64 capability、GLSLの`double`型)の
+        // 実サポートを問い合わせ、対応していれば論理デバイス作成時に有効化
+        // する(2026-09-05追加、dgemmのGPUディスパッチ配線向け)。対応
+        // していない物理デバイスへ無条件で要求するとvkCreateDeviceが
+        // 失敗するため、実際にサポートされている場合のみ有効化フラグを
+        // 立てる——`GpuDevice::supports_f64_shader`はこの結果をそのまま
+        // 反映する。
+        let available_features = unsafe { instance.get_physical_device_features(physical_device) };
+        let shader_float64_supported = available_features.shader_float64 == vk::TRUE;
+        let enabled_features = vk::PhysicalDeviceFeatures {
+            shader_float64: available_features.shader_float64,
+            ..Default::default()
+        };
+
         let priorities = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::builder()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities)
             .build()];
-        let device_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+        let device_info = vk::DeviceCreateInfo::builder()
+            .queue_create_infos(&queue_info)
+            .enabled_features(&enabled_features);
         let device = match unsafe { instance.create_device(physical_device, &device_info, None) }
             .context("vkCreateDevice failed")
         {
@@ -198,6 +215,7 @@ impl VulkanDevice {
             memory_properties,
             allocations: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            shader_float64_supported,
         }))
     }
 
@@ -409,6 +427,64 @@ impl VulkanDevice {
     /// `LaunchConfig::grid2d(m, n/2, 16, 16)`と対で使うこと)。
     fn run_hgemm_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
         let (a_buffer, b_buffer, c_buffer, m, k, n) = self.ensure_hgemm_args(args)?;
+        let mut push = Vec::with_capacity(12);
+        push.extend_from_slice(&m.to_ne_bytes());
+        push.extend_from_slice(&k.to_ne_bytes());
+        push.extend_from_slice(&n.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[a_buffer, b_buffer, c_buffer], &push)
+    }
+
+    /// `dgemm`(F64 GEMM、2026-09-05新設)の引数契約を検証する。
+    /// `double`はstd430で8バイト/要素の単純な配列としてバインドできる
+    /// ため、`hgemm`のような2要素パッキングは不要(`matmul`のf32版と
+    /// 同じ構造、要素サイズだけが異なる)。**このデバイスが
+    /// `shaderFloat64`をサポートしない場合は事前に明示的なエラーを返す**
+    /// (黙って未定義動作〈パイプライン作成失敗やドライバクラッシュ〉に
+    /// 突入させない、既存の誠実さの方針)。
+    fn ensure_dgemm_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer, u32, u32, u32)> {
+        if !self.shader_float64_supported {
+            bail!(
+                "dgemm: this Vulkan device does not report shaderFloat64 support \
+                 (vkGetPhysicalDeviceFeatures().shaderFloat64 == VK_FALSE); \
+                 native double-precision compute shaders cannot run here"
+            );
+        }
+        if args.len() != 6 {
+            bail!("dgemm expects 6 args: a, b, c, m, k, n");
+        }
+        let a = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 must be pointer"))?;
+        let b = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 must be pointer"))?;
+        let c = args[2].as_ptr().ok_or_else(|| anyhow!("arg2 must be pointer"))?;
+        let m = args[3].as_usize().ok_or_else(|| anyhow!("arg3 (m) must be usize/u32"))?;
+        let k = args[4].as_usize().ok_or_else(|| anyhow!("arg4 (k) must be usize/u32"))?;
+        let n = args[5].as_usize().ok_or_else(|| anyhow!("arg5 (n) must be usize/u32"))?;
+
+        let (abuf, _, _, alen, _, _) = self.get_allocation(a)?;
+        let (bbuf, _, _, blen, _, _) = self.get_allocation(b)?;
+        let (cbuf, _, _, clen, _, _) = self.get_allocation(c)?;
+
+        let f64_size = std::mem::size_of::<f64>();
+        let a_bytes = m.checked_mul(k).and_then(|v| v.checked_mul(f64_size)).ok_or_else(|| anyhow!("dgemm A byte size overflow"))?;
+        let b_bytes = k.checked_mul(n).and_then(|v| v.checked_mul(f64_size)).ok_or_else(|| anyhow!("dgemm B byte size overflow"))?;
+        let c_bytes = m.checked_mul(n).and_then(|v| v.checked_mul(f64_size)).ok_or_else(|| anyhow!("dgemm C byte size overflow"))?;
+        if a_bytes > alen {
+            bail!("dgemm buffer A too small: need {a_bytes} bytes, have {alen}");
+        }
+        if b_bytes > blen {
+            bail!("dgemm buffer B too small: need {b_bytes} bytes, have {blen}");
+        }
+        if c_bytes > clen {
+            bail!("dgemm buffer C too small: need {c_bytes} bytes, have {clen}");
+        }
+
+        let m_u32 = u32::try_from(m).context("dgemm m does not fit in u32 push constant")?;
+        let k_u32 = u32::try_from(k).context("dgemm k does not fit in u32 push constant")?;
+        let n_u32 = u32::try_from(n).context("dgemm n does not fit in u32 push constant")?;
+        Ok((abuf, bbuf, cbuf, m_u32, k_u32, n_u32))
+    }
+
+    fn run_dgemm_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (a_buffer, b_buffer, c_buffer, m, k, n) = self.ensure_dgemm_args(args)?;
         let mut push = Vec::with_capacity(12);
         push.extend_from_slice(&m.to_ne_bytes());
         push.extend_from_slice(&k.to_ne_bytes());
@@ -944,10 +1020,11 @@ impl GpuDevice for VulkanDevice {
             "sbm_ising" => self.run_sbm_ising_spirv(spirv, &kernel.entry, cfg, args),
             "flash_attention" => self.run_flash_attention_spirv(spirv, &kernel.entry, cfg, args),
             "hgemm" => self.run_hgemm_spirv(spirv, &kernel.entry, cfg, args),
+            "dgemm" => self.run_dgemm_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
                 "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
                  raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, sbm_ising, flash_attention, \
-                 and hgemm; got `{other}`"
+                 hgemm, and dgemm; got `{other}`"
             ),
         }
     }
@@ -961,6 +1038,14 @@ impl GpuDevice for VulkanDevice {
         // （下記 launch_kernel 実装参照）。ベンダー別スタブ経路(cuBLAS等)より
         // こちらを優先させるための能力フラグ。
         true
+    }
+
+    fn supports_f64_shader(&self) -> bool {
+        // `VulkanDevice::new`で実際に`vkGetPhysicalDeviceFeatures`を
+        // 問い合わせた結果(2026-09-05追加)。このマシン(GT730、Kepler
+        // 世代)がサポートするかどうかは実機依存——推測せず、実際の
+        // クエリ結果をそのまま返す。
+        self.shader_float64_supported
     }
 }
 

@@ -626,6 +626,67 @@ pub fn hgemm_vulkan_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize
     Ok(c)
 }
 
+fn f64_to_bytes(v: &[f64]) -> &[u8] {
+    // SAFETY: f32_to_bytes/f16_to_bytesと同じ最小キャストパターン。
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn f64_from_bytes_mut(v: &mut [f64]) -> &mut [u8] {
+    // SAFETY: 同上、可変版。
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v)) }
+}
+
+/// `dgemm`のVulkanディスパッチ版(2026-09-05新設、`GemmPath::VulkanGeneric`の
+/// F64実装)。`sgemm_vulkan_generic`/`hgemm_vulkan_generic`と同じ自己完結
+/// パターンだが、GLSLの`double`はstd430で8バイト/要素の単純配列として
+/// そのままバインドできるため、`hgemm`のような2要素パッキングは不要
+/// (`examples/dgemm_vulkan_real/shaders/dgemm.comp`参照)。
+///
+/// **正直な開示**: 実行には物理デバイス/ドライバの`shaderFloat64`
+/// サポートが必須(`device.supports_f64_shader()`で事前確認できる、
+/// `opencuda_vulkan::real::VulkanDevice`は実際に`vkGetPhysicalDevice
+/// Features`で確認済みの値を返す)。未対応デバイスに対しては
+/// `ensure_dgemm_args`(呼び出し元の`opencuda-vulkan`側)が明示的な
+/// エラーを返す——黙って未定義動作(パイプライン作成失敗・誤った
+/// 結果・ドライバクラッシュ)に突入させない。alpha/betaスケーリングは
+/// シェーダ側が対応していないため、`sgemm_vulkan_generic`と同様に
+/// 呼び出し元(`dgemm_dispatch`)がホスト側で適用する。
+pub fn dgemm_vulkan_generic(device: &dyn GpuDevice, m: usize, k: usize, n: usize, a: &[f64], b: &[f64], spirv: &[u8]) -> Result<Vec<f64>> {
+    if a.len() != m * k {
+        anyhow::bail!("dgemm_vulkan_generic: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    if b.len() != k * n {
+        anyhow::bail!("dgemm_vulkan_generic: b.len()={} != k*n={}", b.len(), k * n);
+    }
+
+    let da = ScopedAlloc::new(device, std::mem::size_of_val(a))?;
+    let db = ScopedAlloc::new(device, std::mem::size_of_val(b))?;
+    let dc = ScopedAlloc::new(device, m * n * std::mem::size_of::<f64>())?;
+
+    device.memcpy_h2d(da.ptr(), f64_to_bytes(a))?;
+    device.memcpy_h2d(db.ptr(), f64_to_bytes(b))?;
+
+    let kernel = CompiledKernel::spirv("dgemm", "main", spirv);
+    let cfg = LaunchConfig::grid2d(m as u32, n as u32, 16, 16);
+    device.launch_kernel(
+        &kernel,
+        &cfg,
+        &[
+            KernelArg::Ptr(da.ptr()),
+            KernelArg::Ptr(db.ptr()),
+            KernelArg::Ptr(dc.ptr()),
+            KernelArg::Usize(m),
+            KernelArg::Usize(k),
+            KernelArg::Usize(n),
+        ],
+    )?;
+    device.synchronize()?;
+
+    let mut c = vec![0.0f64; m * n];
+    device.memcpy_d2h(f64_from_bytes_mut(&mut c), dc.ptr())?;
+    Ok(c)
+}
+
 /// 行ごと(row-wise) softmaxを実Vulkan SPIR-Vカーネルで計算する
 /// (2026-08-06新設、CLAUDE.md HANDOFF 2026-08-05「次にすべきこと(1)
 /// softmax専用のSPIR-Vカーネル」への着手)。
@@ -1862,9 +1923,12 @@ pub fn hgemm_dispatch(
     }
 }
 
-/// [`dgemm`]のGPUディスパッチ版。設計・制約は[`hgemm_dispatch`]と同じ
-/// (F64専用のGPUシェーダは本クレートに存在しないため、`CpuNaive`以外の
-/// 経路は明示的なエラー)。
+/// [`dgemm`]のGPUディスパッチ版(2026-09-05更新: `GemmPath::VulkanGeneric`
+/// かつ`spirv`が`Some`かつ`device.supports_f64_shader()`なら
+/// [`dgemm_vulkan_generic`]へディスパッチする)。それ以外(`spirv=None`・
+/// `supports_f64_shader()==false`・`DirectXGeneric`/ベンダー専用経路)は
+/// 明示的なエラー(黙ってCPUへ落としたり誤った結果を返したりしない、
+/// `sgemm`/`hgemm_dispatch`と同じ設計方針)。
 #[allow(clippy::too_many_arguments)]
 pub fn dgemm_dispatch(
     device: &dyn GpuDevice,
@@ -1876,13 +1940,36 @@ pub fn dgemm_dispatch(
     b: &[f64],
     beta: f64,
     c: &mut [f64],
+    spirv: Option<&[u8]>,
 ) -> Result<()> {
     match select_gemm_path(device) {
         GemmPath::CpuNaive => dgemm(m, k, n, alpha, a, b, beta, c),
+        GemmPath::VulkanGeneric => {
+            let Some(spirv) = spirv else {
+                anyhow::bail!(
+                    "dgemm_dispatch: GemmPath::VulkanGeneric selected (device.supports_spirv()==true) \
+                     but no spirv bytes were provided; pass the compiled dgemm.spv bytes via the \
+                     `spirv` argument"
+                );
+            };
+            if !device.supports_f64_shader() {
+                anyhow::bail!(
+                    "dgemm_dispatch: GemmPath::VulkanGeneric selected but device.supports_f64_shader() \
+                     == false (this GPU/driver does not report shaderFloat64 support) — pass a CPU \
+                     device, or a Vulkan device whose hardware actually supports native double shaders"
+                );
+            }
+            anyhow::ensure!(c.len() == m * n, "dgemm_dispatch: c.len()={} != m*n={}", c.len(), m * n);
+            let result = dgemm_vulkan_generic(device, m, k, n, a, b, spirv)?;
+            for (ci, ri) in c.iter_mut().zip(result.iter()) {
+                *ci = alpha * ri + beta * *ci;
+            }
+            Ok(())
+        }
         other => anyhow::bail!(
             "dgemm_dispatch: GemmPath::{other:?} was selected but this crate has no F64 GPU \
-             kernel yet (only the CpuNaive reference path is wired) — pass a CPU device, or \
-             implement a Vulkan/DirectX F64 shader and route it here"
+             kernel yet (only CpuNaive and VulkanGeneric are wired) — pass a CPU or Vulkan device, or \
+             implement a DirectX F64 shader and route it here"
         ),
     }
 }
@@ -2467,6 +2554,111 @@ mod tests {
         for (i, (&gd, &gc)) in c_dispatch.iter().zip(c_cpu.iter()).enumerate() {
             let diff = (gd.to_f32() - gc.to_f32()).abs();
             assert!(diff < 5e-2, "idx {i}: dispatch={gd}, cpu={gc} (diff={diff})");
+        }
+    }
+
+    #[test]
+    fn dgemm_vulkan_generic_matches_cpu_naive_on_real_hardware() {
+        // `hgemm_vulkan_generic_matches_cpu_naive_on_real_hardware`と同じ
+        // パターン(2026-09-05新設、F64 GPUディスパッチ配線)。実Vulkan環境・
+        // 事前コンパイル済みのdgemm.spv・`device.supports_f64_shader()`の
+        // 全てが揃わない環境ではスキップする(いずれか欠けている場合に
+        // 誤魔化さずassertを飛ばす既存の方針を踏襲)。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/dgemm_vulkan_real/shaders/dgemm.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping dgemm_vulkan_generic test: dgemm.spv not compiled at {}: {e} \
+                     (run tools/compile-vulkan-shaders.* first)",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping dgemm_vulkan_generic test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        if !vulkan_device.supports_f64_shader() {
+            eprintln!(
+                "skipping dgemm_vulkan_generic test: this device/driver does not report \
+                 shaderFloat64 support (honest environment limitation, not a bug)"
+            );
+            return;
+        }
+
+        let m = 8;
+        let k = 6;
+        let n = 5;
+        let a: Vec<f64> = (0..m * k).map(|i| (i % 7) as f64 - 3.0).collect();
+        let b: Vec<f64> = (0..k * n).map(|i| (i % 5) as f64 - 2.0).collect();
+
+        let mut c_cpu = vec![0.0f64; m * n];
+        dgemm(m, k, n, 1.0, &a, &b, 0.0, &mut c_cpu).unwrap();
+
+        let c_vulkan = dgemm_vulkan_generic(vulkan_device.as_ref(), m, k, n, &a, &b, &spirv).unwrap();
+
+        assert_eq!(c_vulkan.len(), c_cpu.len());
+        for (i, (&gv, &gc)) in c_vulkan.iter().zip(c_cpu.iter()).enumerate() {
+            assert!((gv - gc).abs() < 1e-9, "idx {i}: vulkan={gv}, cpu={gc}");
+        }
+    }
+
+    #[test]
+    fn dgemm_dispatch_uses_vulkan_path_and_matches_cpu_on_real_hardware() {
+        // dgemm_dispatchの`GemmPath::VulkanGeneric`分岐(2026-09-05新設)が
+        // 実際に`dgemm_vulkan_generic`へ配線されていることを実機確認する
+        // (`hgemm_dispatch_uses_vulkan_path_and_matches_cpu_on_real_hardware`
+        // と同じパターン)。
+        let spirv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/dgemm_vulkan_real/shaders/dgemm.spv");
+        let spirv = match std::fs::read(&spirv_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "skipping dgemm_dispatch real-hardware test: dgemm.spv not compiled at {}: {e}",
+                    spirv_path.display()
+                );
+                return;
+            }
+        };
+
+        let vulkan_device = match opencuda_vulkan::VulkanDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping dgemm_dispatch real-hardware test: no real Vulkan device available: {e}");
+                return;
+            }
+        };
+        if !vulkan_device.supports_f64_shader() {
+            eprintln!(
+                "skipping dgemm_dispatch real-hardware test: this device/driver does not report \
+                 shaderFloat64 support (honest environment limitation, not a bug)"
+            );
+            return;
+        }
+        assert_eq!(select_gemm_path(vulkan_device.as_ref()), GemmPath::VulkanGeneric);
+
+        let m = 4;
+        let k = 2;
+        let n = 2;
+        let a: Vec<f64> = (0..m * k).map(|i| i as f64).collect();
+        let b: Vec<f64> = (0..k * n).map(|i| i as f64 + 1.0).collect();
+
+        let mut c_cpu = vec![0.0f64; m * n];
+        dgemm(m, k, n, 1.0, &a, &b, 0.0, &mut c_cpu).unwrap();
+
+        let mut c_dispatch = vec![0.0f64; m * n];
+        dgemm_dispatch(vulkan_device.as_ref(), m, k, n, 1.0, &a, &b, 0.0, &mut c_dispatch, Some(&spirv)).unwrap();
+
+        for (i, (&gd, &gc)) in c_dispatch.iter().zip(c_cpu.iter()).enumerate() {
+            assert!((gd - gc).abs() < 1e-9, "idx {i}: dispatch={gd}, cpu={gc}");
         }
     }
 
@@ -3152,7 +3344,7 @@ mod tests {
         let b = [5.0f64, 6.0, 7.0, 8.0];
         let mut c_dispatch = [0.0f64; 4];
         let mut c_plain = [0.0f64; 4];
-        dgemm_dispatch(device.as_ref(), 2, 2, 2, 1.0, &a, &b, 0.0, &mut c_dispatch).unwrap();
+        dgemm_dispatch(device.as_ref(), 2, 2, 2, 1.0, &a, &b, 0.0, &mut c_dispatch, None).unwrap();
         dgemm(2, 2, 2, 1.0, &a, &b, 0.0, &mut c_plain).unwrap();
         assert_eq!(c_dispatch, c_plain);
     }
@@ -3189,7 +3381,7 @@ mod tests {
 
         let a64 = [1.0f64; 4];
         let mut c64 = [0.0f64; 4];
-        assert!(dgemm_dispatch(&device, 2, 2, 2, 1.0, &a64, &a64, 0.0, &mut c64).is_err());
+        assert!(dgemm_dispatch(&device, 2, 2, 2, 1.0, &a64, &a64, 0.0, &mut c64, None).is_err());
 
         let a128 = vec![Dd::from_f64(1.0); 4];
         let mut c128 = vec![Dd::ZERO; 4];

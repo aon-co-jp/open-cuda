@@ -1,0 +1,17 @@
+[package]
+name = "dgemm_vulkan_real"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+opencuda-core.workspace = true
+opencuda-cpu.workspace = true
+opencuda-blas.workspace = true
+opencuda-vulkan = { workspace = true, features = ["real-vulkan"] }
+anyhow.workspace = true
+
+[[bin]]
+name = "dgemm_vulkan_real"
+path = "src/main.rs"
