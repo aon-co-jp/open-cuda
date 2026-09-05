@@ -183,6 +183,46 @@ max_new_tokens, penalty)`を追加した。既存の`generate()`は`penalty=1.0`
 3. サンプリング(温度・top-k/top-p)は組み合わせていない(貪欲デコード+
    繰り返しペナルティのみ)。
 
+## F16/F64 GPUディスパッチの実装パターン(`hgemm`/`dgemm`、2026-09-05新設)
+
+要素サイズがf32(4バイト)と異なる精度をVulkan Computeでディスパッチする
+際の2つの異なる移植パターン:
+
+1. **F16(half): 2要素パッキング方式**(`crates/opencuda-blas/shaders/
+   hgemm.comp`相当は`examples/hgemm_vulkan_real/shaders/hgemm.comp`
+   参照): GLSLの`unpackHalf2x16`/`packHalf2x16`(core、追加のVulkan
+   拡張不要)で、half 2要素を1つのuintへパックしたバッファを読み書き
+   する。1スレッドが出力ワード1つ(連続する2要素分)をまとめて計算・
+   書き込みすることで、別スレッドが同じワードの別半分を同時に書く
+   データ競合を避ける設計——このため呼び出し側は`k`・`n`が偶数である
+   ことを保証する必要がある(奇数なら明示的エラー、黙って誤った結果を
+   返さない)。シェーダ内部の演算自体はf32(ネイティブFP16 ALUが無い
+   前提のソフトウェア変換)。
+2. **F64(double): ネイティブ型方式**(`examples/dgemm_vulkan_real/
+   shaders/dgemm.comp`): GLSLの`double`型はstd430で8バイト/要素の
+   単純配列としてそのままバインドできるため、F16のようなパッキングは
+   不要——`matmul.comp`のf32版と全く同じ構造で要素サイズだけ変える
+   だけで済む。ただし実行には**物理デバイス/ドライバの`shaderFloat64`
+   機能サポートが必須**(`GpuDevice::supports_f64_shader()`、新設の
+   能力フラグ)。`VulkanDevice::new`が論理デバイス作成前に
+   `vkGetPhysicalDeviceFeatures`を問い合わせ、対応している場合のみ
+   `enabled_features`でこの機能を有効化する(未対応デバイスへ
+   無条件で要求すると`vkCreateDevice`自体が失敗するため)。
+
+**移植時の判断基準**: 対象の精度がGLSL/SPIR-Vのネイティブ型として
+存在する(`double`・`bool`等)場合はパターン2(ネイティブ型+能力フラグ
+確認)を、存在しない(`half`はGLSL 4.20以降core型として存在するが
+`unpackHalf2x16`系関数はf32算術ベースであり、真のFP16 ALU実行では
+ない)場合や、対象GPUでの拡張サポートが不確実な場合はパターン1
+(パッキング+ソフトウェア変換)を検討するとよい。
+
+**正直な開示**: このマシン(NVIDIA GeForce GT 730、Kepler世代)は
+`shaderFloat64`を実際にサポートしていた(意外な発見、事前の想定は
+「コンシューマGPUはFP64が遅い」という速度の話であり、機能対応可否
+とは別問題だった)。他のベンダー・世代での対応状況は未検証。F128は
+GPUハードウェアが原理的に存在しないため、この2パターンいずれも適用
+対象外(恒久的にCPU参照実装のみ)。
+
 ## 現状(2026-07-30)
 
 `opencuda-core`/`opencuda-cpu`/`opencuda-vulkan`/`opencuda-directx`/
