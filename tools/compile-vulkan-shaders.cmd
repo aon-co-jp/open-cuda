@@ -59,3 +59,10 @@ set OUT=%SHADER_DIR%\hgemm.spv
 glslc "%SRC%" -o "%OUT%"
 if errorlevel 1 exit /b %errorlevel%
 echo OK: compiled %SRC% -^> %OUT%
+
+set SHADER_DIR=%ROOT%\examples\dgemm_vulkan_real\shaders
+set SRC=%SHADER_DIR%\dgemm.comp
+set OUT=%SHADER_DIR%\dgemm.spv
+glslc "%SRC%" -o "%OUT%"
+if errorlevel 1 exit /b %errorlevel%
+echo OK: compiled %SRC% -^> %OUT%

@@ -144,4 +144,16 @@ pub trait GpuDevice: Send + Sync {
     fn supports_fp8_tensor_core(&self) -> bool {
         false
     }
+
+    /// このデバイスがVulkan Computeシェーダ内でネイティブ`double`
+    /// (SPIR-V `Float64` capability、Vulkanの`shaderFloat64`機能)を
+    /// 実行できるか(2026-09-05新設、dgemmのGPUディスパッチ配線向け)。
+    /// `supports_spirv`(SpirVカーネル自体を受理できるか)とは別軸——
+    /// SpirVカーネルを実行できるバックエンドでも、物理デバイス/ドライバが
+    /// `shaderFloat64`をサポートしない場合はこちらが`false`のままになる。
+    /// デフォルトは`false`。`opencuda-vulkan::real::VulkanDevice`は
+    /// 実際に`vkGetPhysicalDeviceFeatures`で確認した結果をそのまま返す。
+    fn supports_f64_shader(&self) -> bool {
+        false
+    }
 }

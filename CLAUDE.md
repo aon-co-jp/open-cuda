@@ -89,6 +89,87 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-05続き2、dgemm(F64)にもVulkan実装を追加・実機検証(意外にも成功) / Follow-up: real Vulkan F64 GEMM for dgemm — this GPU actually supports it)
+
+直上エントリ(hgemm/F16)に続き、dgemm(F64)のGPUディスパッチも実装した。
+
+### 実装内容
+
+- `opencuda_core::GpuDevice`に`supports_f64_shader()`を新設(デフォルト
+  `false`、`supports_spirv`/`supports_dxil`と同じ設計パターン)。
+- `opencuda-vulkan::real::VulkanDevice::new`が論理デバイス作成前に
+  `vkGetPhysicalDeviceFeatures`を実際に問い合わせ、`shaderFloat64`が
+  サポートされていればその機能を有効化した上でデバイスを作成する
+  (未対応デバイスへ無条件で要求すると`vkCreateDevice`が失敗するため、
+  実際にサポートされている場合のみ)。`supports_f64_shader()`はこの
+  問い合わせ結果をそのまま返す。
+- 新規`examples/dgemm_vulkan_real/shaders/dgemm.comp`: GLSLネイティブ
+  `double`型を使う素朴なGEMMシェーダ(`matmul.comp`のf32版と全く同じ
+  構造——`double`はstd430で8バイト/要素の単純配列としてそのまま
+  バインドできるため、`hgemm.comp`のような2要素パッキングは不要)。
+- `opencuda-vulkan::real::VulkanDevice`に`ensure_dgemm_args`/
+  `run_dgemm_spirv`を追加(`shader_float64_supported`が`false`なら
+  ディスパッチ前に明示的エラー、黙って未定義動作に突入させない)。
+- `opencuda-blas::dgemm_vulkan_generic`+`dgemm_dispatch`の
+  `GemmPath::VulkanGeneric`分岐への実配線(`device.supports_f64_shader()`
+  も呼び出し側で確認、`sgemm`/`hgemm_dispatch`と同じ「明示的エラー」
+  設計)。新規example crate`dgemm_vulkan_real`。
+
+### 検証(そして意外な発見)
+
+**このマシン(NVIDIA GeForce GT 730、Kepler世代)は`shaderFloat64`を
+実際にサポートしていた**——事前の予想(モジュールdocの過去の記述
+「コンシューマ向けGPUではF32比で大幅に低スループット」)は演算
+"速度"についての一般論であり、機能自体の対応可否とは別問題だったと
+判明した。誇張せず、実際にドライバへ問い合わせて確認した結果として
+記録する:
+- `cargo run -p dgemm_vulkan_real --release`:
+  `OK: dgemm(F64) 8x6 * 6x5 verified: real Vulkan Compute agrees with
+  the CPU reference`(実機、CPU参照実装と1e-9以内で一致)。
+- `cargo test -p opencuda-blas --release -- --test-threads=1`
+  **59 passed / 1 ignored**(既存57件+新規2件:
+  `dgemm_vulkan_generic_matches_cpu_naive_on_real_hardware`・
+  `dgemm_dispatch_uses_vulkan_path_and_matches_cpu_on_real_hardware`、
+  回帰なし)。
+- `cargo clippy -p opencuda-blas -p opencuda-vulkan -p opencuda-core
+  -p hgemm_vulkan_real -p dgemm_vulkan_real --release --all-targets
+  --features "opencuda-vulkan/real-vulkan" -- -D warnings`警告0件
+  (`field_reassign_with_default`1件を検出・修正済み)。
+- `cargo test --workspace --release -- --test-threads=1`全クレート
+  regression無し(全て`test result: ok`)。
+
+### 正直な残課題
+
+- F128(qgemm)はGPUハードウェアが原理的に存在しないため対象外
+  (モジュール冒頭コメント通り、恒久的な制約)。
+- `shaderFloat64`が実際にサポートされていることは確認できたが、
+  **演算速度(f32/f16経路と比べてどの程度遅いか)の実測はまだ
+  行っていない**——「動く」ことの実証に留まる。GT730のFP64演算
+  レートは一般にF32比で大幅に低いとされる(アーキテクチャ上の
+  既知の特性)が、今回のシェーダは正確性優先のnaive実装のため、
+  実際のボトルネックがFP64演算レートかVulkanディスパッチの固定
+  オーバーヘッドかは未計測。
+- 他のベンダー(AMD/Intel)・他のGPU世代での`shaderFloat64`対応状況は
+  未検証(このマシンにNVIDIA GT730以外の実機が無いため)。
+
+**English summary**: Added F64 GPU dispatch for `dgemm`. New
+`GpuDevice::supports_f64_shader()` capability flag; `VulkanDevice::new`
+now queries `vkGetPhysicalDeviceFeatures` and conditionally enables
+`shaderFloat64` at device creation. New `dgemm.comp` shader uses GLSL's
+native `double` type (no packing needed, unlike F16's `hgemm.comp`).
+Wired `dgemm_vulkan_generic` + `dgemm_dispatch`'s `VulkanGeneric` branch.
+**Surprising real-hardware result: this GT730 (Kepler) actually supports
+shaderFloat64** — contrary to the vague assumption that consumer GPUs
+lack FP64 shader support (that's about throughput, not capability).
+Verified: `dgemm_vulkan_real` example matches CPU reference within
+1e-9; `opencuda-blas` 59/60 tests pass (1 ignored, 2 new, no
+regressions); clippy clean; full workspace test suite has no
+regressions. Honest gaps: F128 remains permanently out of scope (no
+GPU hardware exists for it anywhere); FP64 shader *speed* (vs f32/f16)
+has not been benchmarked, only correctness; other vendors'/generations'
+`shaderFloat64` support remains unverified (only one NVIDIA GT730 in
+this environment).
+
 ## HANDOFF追記(2026-09-05続き、hgemm(F16)にVulkan実装を追加・実機検証 / Follow-up: real Vulkan F16 GEMM implementation for hgemm)
 
 直上エントリの正直な残課題「F16/F64/F128専用のVulkan/DirectXシェーダは
