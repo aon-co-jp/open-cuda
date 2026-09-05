@@ -6,6 +6,25 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-05)**: `hgemm`(F16)/`dgemm`(F64)へ実Vulkan
+> GPUディスパッチを実装した。`hgemm`は half 2要素を1uintへパックする
+> 専用シェーダ(`hgemm.comp`、`unpackHalf2x16`/`packHalf2x16`、追加の
+> Vulkan拡張不要)を新設し、`hgemm_dispatch`の`GemmPath::VulkanGeneric`
+> 分岐へ実配線。`dgemm`はGLSLネイティブ`double`型のシェーダ
+> (`dgemm.comp`、パッキング不要)で、`GpuDevice::supports_f64_shader()`
+> (新設、`vkGetPhysicalDeviceFeatures`の`shaderFloat64`を実際に問い
+> 合わせた結果)が`true`の場合のみディスパッチする。**意外な発見**:
+> この開発機(NVIDIA GeForce GT 730、Kepler世代)は`shaderFloat64`を
+> 実際にサポートしており、CPU参照実装と1e-9以内で一致する本物のF64
+> GPU計算に成功した。**正直な開示**: いずれも「動く」ことは実証した
+> が、演算速度(f32経路との比較)は未計測。F128(qgemm)はGPUハード
+> ウェアが原理的に存在しないため引き続きCPU参照実装のみ(恒久的な
+> 制約)。実機検証: `cargo run -p hgemm_vulkan_real --release`・
+> `cargo run -p dgemm_vulkan_real --release`いずれも実機で成功、
+> `cargo test -p opencuda-blas --release`は新規5件を含め全green
+> (回帰なし)。詳細は[CLAUDE.md](CLAUDE.md)の2026-09-05 HANDOFF
+> 追記(続き・続き2)参照。
+>
 > 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/
 > aruaru-llmで、今後32GB VRAM級のNVIDIA/AMD/Intel GPUを想定し、
 > F16/F32/F64、さらにF128まで見据えて開発する」への対応。
