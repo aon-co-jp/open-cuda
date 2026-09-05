@@ -14,7 +14,8 @@ $shaders = @(
     @{ Dir = "examples\raid6_xor_parity_vulkan_real\shaders"; Name = "raid6_xor_parity" },
     @{ Dir = "examples\raid6_q_parity_vulkan_real\shaders"; Name = "raid6_q_parity" },
     @{ Dir = "examples\softmax_vulkan_real\shaders"; Name = "softmax" },
-    @{ Dir = "examples\flash_attention_vulkan_real\shaders"; Name = "flash_attention" }
+    @{ Dir = "examples\flash_attention_vulkan_real\shaders"; Name = "flash_attention" },
+    @{ Dir = "examples\hgemm_vulkan_real\shaders"; Name = "hgemm" }
 )
 
 foreach ($shader in $shaders) {

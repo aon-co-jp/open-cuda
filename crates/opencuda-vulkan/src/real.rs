@@ -352,6 +352,70 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[a_buffer, b_buffer, c_buffer], &push)
     }
 
+    /// `hgemm`(F16 GEMM、2026-09-05新設)の引数契約を検証する。
+    /// `matmul`(f32、4バイト/要素)と異なり、A/B/Cはいずれも
+    /// **half 2要素を1つのuintへパックしたバッファ**(2バイト/要素)を
+    /// 前提とする(`examples/hgemm_vulkan_real/shaders/hgemm.comp`のコメント
+    /// 参照)。`k`・`n`が偶数でない場合は、シェーダ側の「1スレッドが
+    /// Cの1ワード(2出力要素)をまとめて書く」設計が破綻し、行境界を
+    /// またいだ誤ったパッキングになりかねないため、ここで明示的に
+    /// 拒否する(黙って誤った結果を返さない、既存の`ensure_matmul_args`
+    /// と同じ誠実さの方針)。
+    fn ensure_hgemm_args(&self, args: &[KernelArg]) -> Result<(vk::Buffer, vk::Buffer, vk::Buffer, u32, u32, u32)> {
+        if args.len() != 6 {
+            bail!("hgemm expects 6 args: a, b, c, m, k, n");
+        }
+        let a = args[0].as_ptr().ok_or_else(|| anyhow!("arg0 must be pointer"))?;
+        let b = args[1].as_ptr().ok_or_else(|| anyhow!("arg1 must be pointer"))?;
+        let c = args[2].as_ptr().ok_or_else(|| anyhow!("arg2 must be pointer"))?;
+        let m = args[3].as_usize().ok_or_else(|| anyhow!("arg3 (m) must be usize/u32"))?;
+        let k = args[4].as_usize().ok_or_else(|| anyhow!("arg4 (k) must be usize/u32"))?;
+        let n = args[5].as_usize().ok_or_else(|| anyhow!("arg5 (n) must be usize/u32"))?;
+
+        if !k.is_multiple_of(2) {
+            bail!("hgemm: k={k} must be even (2 half elements pack into one uint word per row)");
+        }
+        if !n.is_multiple_of(2) {
+            bail!("hgemm: n={n} must be even (2 half elements pack into one uint word per row)");
+        }
+
+        let (abuf, _, _, alen, _, _) = self.get_allocation(a)?;
+        let (bbuf, _, _, blen, _, _) = self.get_allocation(b)?;
+        let (cbuf, _, _, clen, _, _) = self.get_allocation(c)?;
+
+        let half_size = std::mem::size_of::<u16>();
+        let a_bytes = m.checked_mul(k).and_then(|v| v.checked_mul(half_size)).ok_or_else(|| anyhow!("hgemm A byte size overflow"))?;
+        let b_bytes = k.checked_mul(n).and_then(|v| v.checked_mul(half_size)).ok_or_else(|| anyhow!("hgemm B byte size overflow"))?;
+        let c_bytes = m.checked_mul(n).and_then(|v| v.checked_mul(half_size)).ok_or_else(|| anyhow!("hgemm C byte size overflow"))?;
+        if a_bytes > alen {
+            bail!("hgemm buffer A too small: need {a_bytes} bytes, have {alen}");
+        }
+        if b_bytes > blen {
+            bail!("hgemm buffer B too small: need {b_bytes} bytes, have {blen}");
+        }
+        if c_bytes > clen {
+            bail!("hgemm buffer C too small: need {c_bytes} bytes, have {clen}");
+        }
+
+        let m_u32 = u32::try_from(m).context("hgemm m does not fit in u32 push constant")?;
+        let k_u32 = u32::try_from(k).context("hgemm k does not fit in u32 push constant")?;
+        let n_u32 = u32::try_from(n).context("hgemm n does not fit in u32 push constant")?;
+        Ok((abuf, bbuf, cbuf, m_u32, k_u32, n_u32))
+    }
+
+    /// ディスパッチグリッドは`n/2`(Cのワード数、1スレッド=1ワード=2列)を
+    /// x次元、`m`をy次元とする(`matmul`の`col=x,row=y`契約と揃えつつ、
+    /// xはワード単位に半減させる——`sgemm_vulkan_generic`呼び出し側の
+    /// `LaunchConfig::grid2d(m, n/2, 16, 16)`と対で使うこと)。
+    fn run_hgemm_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (a_buffer, b_buffer, c_buffer, m, k, n) = self.ensure_hgemm_args(args)?;
+        let mut push = Vec::with_capacity(12);
+        push.extend_from_slice(&m.to_ne_bytes());
+        push.extend_from_slice(&k.to_ne_bytes());
+        push.extend_from_slice(&n.to_ne_bytes());
+        self.dispatch_spirv(spirv, entry, cfg, &[a_buffer, b_buffer, c_buffer], &push)
+    }
+
     /// `raid6_xor_parity` の引数契約を検証する(2026-07-30追記、open-raid-zの
     /// NVMe RAID6 ランダムアクセス低速化問題〈parity write penalty〉解決策として
     /// ユーザーから明示指示のあった「open-directx/open-cudaでのハードウェア
@@ -879,9 +943,11 @@ impl GpuDevice for VulkanDevice {
             "sha256d_mine" => self.run_sha256d_mine_spirv(spirv, &kernel.entry, cfg, args),
             "sbm_ising" => self.run_sbm_ising_spirv(spirv, &kernel.entry, cfg, args),
             "flash_attention" => self.run_flash_attention_spirv(spirv, &kernel.entry, cfg, args),
+            "hgemm" => self.run_hgemm_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
                 "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
-                 raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, sbm_ising, and flash_attention; got `{other}`"
+                 raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, sbm_ising, flash_attention, \
+                 and hgemm; got `{other}`"
             ),
         }
     }

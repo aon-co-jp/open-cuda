@@ -1,0 +1,70 @@
+#version 450
+
+// hgemm(F16) 用の Vulkan Compute シェーダ(2026-09-05新設)。
+//
+// このマシンにFP16 Tensor Core搭載GPUが無い(GT730はKepler世代)ため、
+// half専用の高速演算命令(VK_KHR_shader_float16_int8等)には頼らず、
+// coreのunpackHalf2x16/packHalf2x16(GLSL 4.20以降でcore、追加拡張
+// 不要)で「half 2要素を1つのuintへパックしたバッファ」を読み書きし、
+// シェーダ内部の演算自体はfloat(f32)で行う——`half`crateのCPU実装
+// (f16<->f32変換のみソフトウェア)と同じ考え方をGPU側でも踏襲した形。
+//
+// **レイアウト制約(誤った結果を黙って返さないため、呼び出し側で
+// 事前に検証すること)**: k・n はいずれも偶数であること(A/B/Cの各行が
+// 常に2要素単位の境界で終わるようにするため——奇数だと1ワードが
+// 行をまたいでパックされ、後述の「1スレッドが1ワード=2出力要素を
+// まとめて書く」設計が破綻する)。1スレッドがCの1ワード
+// (連続する2列 col, col+1)をまとめて計算・書き込みすることで、
+// 別スレッドが同じワードの別半分を同時に書き込むデータ競合を避けている。
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A {
+    uint aw[];
+};
+
+layout(set = 0, binding = 1) readonly buffer B {
+    uint bw[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer C {
+    uint cw[];
+};
+
+layout(push_constant) uniform Params {
+    uint m;
+    uint k;
+    uint n;
+} params;
+
+float a_at(uint idx) {
+    vec2 hv = unpackHalf2x16(aw[idx >> 1]);
+    return (idx & 1u) == 0u ? hv.x : hv.y;
+}
+
+float b_at(uint idx) {
+    vec2 hv = unpackHalf2x16(bw[idx >> 1]);
+    return (idx & 1u) == 0u ? hv.x : hv.y;
+}
+
+void main() {
+    uint colPair = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    uint nPairs = params.n >> 1u;
+    if (row >= params.m || colPair >= nPairs) {
+        return;
+    }
+
+    uint col0 = colPair * 2u;
+    uint col1 = col0 + 1u;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    for (uint kk = 0u; kk < params.k; kk++) {
+        float av = a_at(row * params.k + kk);
+        acc0 += av * b_at(kk * params.n + col0);
+        acc1 += av * b_at(kk * params.n + col1);
+    }
+
+    uint outIdx = row * params.n + col0;
+    cw[outIdx >> 1] = packHalf2x16(vec2(acc0, acc1));
+}
