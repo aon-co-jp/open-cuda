@@ -89,6 +89,69 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-05、hgemm/dgemm/qgemmへGPUディスパッチ配線(select_gemm_path経由)を追加 / Follow-up: wired hgemm/dgemm/qgemm through select_gemm_path's GPU dispatch)
+
+続き3エントリの正直な残課題「hgemm/dgemm/qgemmはCPU参照実装のみで、
+sgemmが持つ`GpuDevice::launch_kernel`経由の実GPUディスパッチ配線が無い」
+への対応(コミット`914900d`)。
+
+### 実装内容
+
+`hgemm_dispatch`/`dgemm_dispatch`/`qgemm_dispatch(device, ...)`を新設。
+`select_gemm_path(device)`で経路を選び、`GemmPath::CpuNaive`のときのみ
+既存のCPU参照実装(`hgemm`/`dgemm`/`qgemm`、変更なし)を呼ぶ。
+
+**正直な開示、誇張しない**: F16/F64/F128専用のVulkan/DirectXシェーダは
+今回も新規に書いていない——既存の`matmul.comp`/`matmul.hlsl`はf32専用の
+バイト列レイアウト(4バイト/要素)を前提にしており、half(2バイト/要素)や
+f64(8バイト/要素)・double-double(16バイト/要素)のバッファをそのまま
+流し込むと、要素数の解釈がズレて誤った結果を黙って返しかねない。よって
+今回実装したのは**ディスパッチ選択ロジックの配線のみ**——`CpuNaive`
+以外の経路(`VulkanGeneric`/`DirectXGeneric`/ベンダー専用stub)が選ばれた
+場合は、`sgemm`の`GemmPath::DirectXGeneric`未実装スタブや
+`sgemm_fp8_weight_vendor`と同じ設計方針で、黙ってCPUへフォールバック
+したり誤った結果を返したりせず明示的なエラーを返す。`qgemm_dispatch`は
+F128がGPU上に原理的に存在しない(モジュール冒頭コメント参照)ため、
+`CpuNaive`以外は常に拒否する。
+
+### 検証
+
+- `cargo test -p opencuda-blas --release --lib`: **55 passed / 1
+  ignored**(既存51件+新規4件: CPUデバイスでの`hgemm_dispatch`/
+  `dgemm_dispatch`/`qgemm_dispatch`が素の`hgemm`/`dgemm`/`qgemm`と一致
+  することの確認3件、および`supports_spirv()==true`を自己申告する
+  偽装デバイス〈`SpirvCapableDevice`、`Fp8CapableDevice`と同じ設計
+  パターン、ベンダーを`Unknown`に差し替えて`select_gemm_path`が
+  `GemmPath::VulkanGeneric`を選ぶ状況を作る〉に対し3関数とも明示的な
+  エラーを返すことの確認1件)。
+- `cargo clippy -p opencuda-blas --release --all-targets -- -D
+  warnings`: 警告0件。
+- `cargo build --workspace --release`: 成功、警告0件。
+
+### 正直な残課題(続き3から変更なし)
+
+- F16/F64/F128専用のVulkan/DirectXシェーダそのものはまだ存在しない
+  ——実装するには`matmul.comp`/`matmul.hlsl`とは別に、要素サイズが
+  異なるバッファレイアウトに対応した新規シェーダが必要。
+- 32GB級VRAMカード(NVIDIA/AMD/Intel いずれも)での実機検証は引き続き
+  未実施(この開発機はGT730、2GB、Kepler世代のみ)。
+
+**English summary**: Added `hgemm_dispatch`/`dgemm_dispatch`/
+`qgemm_dispatch(device, ...)` which route through `select_gemm_path`
+and call the existing CPU reference implementations only when
+`GemmPath::CpuNaive` is selected — F16/F64/F128 still have no dedicated
+Vulkan/DirectX shaders (the existing f32-only `matmul.comp`/`matmul.hlsl`
+assume 4-byte elements and would silently misinterpret half/f64/
+double-double buffers), so any other path returns an honest error rather
+than a silent fallback or wrong result (matching `sgemm`'s
+`DirectXGeneric`-stub and `sgemm_fp8_weight_vendor` conventions).
+`qgemm_dispatch` always rejects non-CPU paths since F128 has no GPU
+hardware anywhere. Verified: `opencuda-blas` 55/56 tests pass (1
+ignored, 4 new — CPU-path parity plus an honest-rejection test using a
+`supports_spirv()==true` mock device), clippy clean, full workspace
+build clean. Real GPU shaders for F16/F64/F128 remain future work; no
+32GB-VRAM-class hardware exists in this environment.
+
 ## HANDOFF追記(2026-09-03(続き3)、F16/F32/F64/F128 精度対応 + 32GB級VRAMベンダー方針を設計文書化 / Follow-up: F16/F32/F64/F128 precision support + 32GB-VRAM-class vendor design)
 
 ユーザー指示「今後は NVIDIA(RTX)/AMD/Intel の 32GB VRAM 級カードを前提に
