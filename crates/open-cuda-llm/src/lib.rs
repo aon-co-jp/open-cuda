@@ -41,6 +41,12 @@ use anyhow::{Context, Result};
 use opencuda_core::GpuDevice;
 use serde::Deserialize;
 
+/// Qwen2/Qwen2.5系(RoPE・GQA・RMSNorm・SwiGLU)アーキテクチャの新しい
+/// forward pass経路(2026-09-11新設、`qwen_arch.rs`のモジュールdoc参照)。
+/// 既存の`GptModel`(GPT-2系)経路とは独立・並行。
+mod qwen_arch;
+pub use qwen_arch::{QwenConfig, QwenModel};
+
 /// デコーダの設定(GPT系アーキテクチャの最小構成)。
 #[derive(Debug, Clone)]
 pub struct GptConfig {
