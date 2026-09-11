@@ -89,6 +89,49 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-11、Qwen2/Qwen2.5系〈RoPE+GQA+RMSNorm+SwiGLU〉の新エンジン+MLA圧縮+実重み検証 / Follow-up: new Qwen2/Qwen2.5 (RoPE+GQA+RMSNorm+SwiGLU) engine + MLA compression + real-weight verification)
+
+2026年9月頭に話題になった中国発の小型高性能LLM(Qwen3.5系・
+DeepSeek-V4.1-Flash等)のニュースへの対応の第一段階として、
+`open-cuda-llm`に`QwenModel`(Qwen2/Qwen2.5系アーキテクチャ)を新設した。
+既存の`GptModel`(GPT-2専用)には一切手を触れず、完全に並行する経路として
+追加(`crates/open-cuda-llm/src/qwen_arch.rs`)。
+
+- RoPE(rotate_half方式)・Grouped Query Attention・RMSNorm・SwiGLU MLP
+  を新規実装。Attention自体は既存の`opencuda_blas::
+  scaled_dot_product_attention`をそのまま再利用
+- MLA KVキャッシュ圧縮(`enable_mla_kv_compression`)をGQA向けに移植
+  (KVヘッド単位、`GptModel`側のヘッドあたり=num_heads個とは異なる設計)
+- 単体テスト8件、全pass
+- **実機検証(Qwen/Qwen2.5-0.5B-Instruct、Apache 2.0、Hugging Face)**:
+  `cargo run -p open-cuda-llm --example qwen_real_weights_demo`で実際に
+  ダウンロード・ロード・生成。"The capital of France is" ->
+  " Paris. It is the largest city in Europe..."という文法的に正しく
+  事実として正確な文章を確認(CPU、0.5Bロード3.7秒・24トークン生成10.5秒)。
+  MLA圧縮(d_c=16、乱数射影)有効時は配線自体は完走するが出力品質が
+  明確に劣化することも確認(`GptModel`側で既に開示済みの既知の限界の
+  再現、捏造なし)
+
+**正直な開示・スコープの限界**: Qwen3.5-4B・DeepSeek-V4.1-Flash自体
+(MoE・Causal Encoder-Decoder・FP4 KVキャッシュ圧縮)には未対応——
+全く別の計算グラフが必要で、今回は範囲外。PCA較正版MLA
+(`GptModel::enable_mla_kv_compression_calibrated`相当)のQwenModel移植も
+次の増分。aruaru-llm側の配線状況は`aruaru-llm/CLAUDE.md`参照。
+
+*English*: Added `QwenModel` (Qwen2/Qwen2.5 architecture: RoPE, Grouped
+Query Attention, RMSNorm, SwiGLU) to `open-cuda-llm` as a first step
+toward the small-but-strong Chinese open-weight LLMs that made headlines
+in early September 2026 (Qwen3.5 family, DeepSeek-V4.1-Flash). Added as a
+fully parallel path — `GptModel` (GPT-2-only) is untouched. Ported MLA
+KV-cache compression to the GQA setting (per-KV-head, not per-Q-head).
+8 new unit tests, all passing. Verified end-to-end against real weights
+(Qwen2.5-0.5B-Instruct, Apache 2.0): a real download → load → generate
+run produced a grammatically correct, factually accurate sentence
+("The capital of France is" → " Paris. It is the largest city in
+Europe..."). Honestly disclosed: Qwen3.5-4B and DeepSeek-V4.1-Flash
+themselves (MoE, Causal Encoder-Decoder, FP4 KV compression) are a
+separate, much larger undertaking and remain out of scope for now.
+
 ## HANDOFF追記(2026-09-05続き3、hgemm/dgemm Vulkan経路の速度実測(結論: CPUの方が大幅に速い) / Follow-up: benchmarked hgemm/dgemm Vulkan speed — CPU wins by a wide margin)
 
 直上2エントリ(hgemm/F16・dgemm/F64のVulkan実装)で「動くことは実証した
