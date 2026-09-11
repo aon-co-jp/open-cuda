@@ -42,6 +42,26 @@
 > 未実施。詳細は[CLAUDE.md](CLAUDE.md)・[OmniGPU-Design.md](OmniGPU-Design.md)
 > §13参照。
 >
+> 📌 **最近の更新(2026-09-11)**: `open-cuda-llm`に`QwenModel`
+> (Qwen2/Qwen2.5系、RoPE+Grouped Query Attention+RMSNorm+SwiGLU)を
+> 新設した——既存の`GptModel`(GPT-2専用)とは完全に並行する経路。
+> MLA KVキャッシュ圧縮もGQA向けに移植済み。実在モデル
+> (Qwen2.5-0.5B-Instruct、Apache 2.0)でダウンロード→ロード→生成まで
+> 実機検証し、文法的に正しく事実として正確な文章の生成を確認した。
+> **正直な開示**: Qwen3.5-4B・DeepSeek-V4.1-Flash自体(MoE・Causal
+> Encoder-Decoder)は別の大規模開発で今回は未対応。詳細は
+> [CLAUDE.md](CLAUDE.md)の2026-09-11 HANDOFF追記参照。
+>
+> *English*: Added `QwenModel` (Qwen2/Qwen2.5: RoPE, Grouped Query
+> Attention, RMSNorm, SwiGLU) alongside the existing GPT-2-only
+> `GptModel`, plus GQA-aware MLA KV-cache compression. Verified
+> end-to-end against real weights (Qwen2.5-0.5B-Instruct) — a real
+> download → load → generate produced grammatically correct, factually
+> accurate output. Honest disclosure: Qwen3.5-4B and DeepSeek-V4.1-Flash
+> themselves (MoE, Causal Encoder-Decoder) remain out of scope, a
+> separate larger undertaking. See the 2026-09-11 HANDOFF entry in
+> [CLAUDE.md](CLAUDE.md).
+>
 > 📌 **最近の更新(2026-09-01)**: `open-cuda-llm::GptModel`へ
 > Model Folding(層冗長性検出・実際の除去・線形アダプタ置換)を実装
 > した。`analyze_layer_redundancy`/`prune_redundant_layers`
