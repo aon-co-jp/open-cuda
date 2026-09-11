@@ -35,7 +35,7 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use opencuda_core::GpuDevice;
 
-use super::{argmax, apply_repetition_penalty, random_vec, tensor_f32, transpose, KvCacheHead, Linear, SplitMix64};
+use super::{argmax, apply_repetition_penalty, random_vec, tensor_f32, transpose, KvCacheHead, Linear, MlaHeadProjection, SplitMix64};
 
 /// Qwen2/Qwen2.5 dense アーキテクチャの設定。`config.json` の該当
 /// フィールドにそのまま対応する。
@@ -159,6 +159,15 @@ struct QwenLayer {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
+    /// **2026-09-11新設**: [`QwenModel::enable_mla_kv_compression`]配線先。
+    /// `GptModel`の同名機構(`DecoderLayer::mla`)の移植だが、**KVヘッド
+    /// 単位**(GQAでは`num_kv_heads` < `num_heads`)で持つ点が異なる——
+    /// GPT-2にはGQAが無く`num_heads`個持っていたのに対し、こちらは
+    /// 実際にKVキャッシュを持つヘッド数ぶんだけで足りる(かつそれが
+    /// 正しい: 複数のクエリヘッドが同じKVヘッドのキャッシュを共有する
+    /// ため、圧縮もKVヘッド単位で行うのが筋が通る)。`None`(既定)なら
+    /// 従来通りフル精度でKVキャッシュを保持する(後方互換)。
+    mla: Option<Vec<MlaHeadProjection>>,
 }
 
 impl QwenLayer {
@@ -176,6 +185,7 @@ impl QwenLayer {
             gate_proj: Linear::random(rng, hidden, cfg.intermediate_size),
             up_proj: Linear::random(rng, hidden, cfg.intermediate_size),
             down_proj: Linear::random(rng, cfg.intermediate_size, hidden),
+            mla: None,
         }
     }
 }
@@ -250,6 +260,7 @@ impl QwenModel {
                 gate_proj: load_linear(&tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)?,
                 up_proj: load_linear(&tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
                 down_proj: load_linear(&tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
+                mla: None,
             });
         }
 
@@ -265,6 +276,31 @@ impl QwenModel {
         };
 
         Ok(Self { config, embed_tokens, layers, norm, lm_head })
+    }
+
+    /// KVキャッシュをヘッドあたり`head_dim`次元から`d_c`次元(`d_c < head_dim`)
+    /// へ低ランク圧縮する(`GptModel::enable_mla_kv_compression`の移植、
+    /// `QwenLayer::mla`のモジュールdoc参照——GQAではKVヘッド単位で行う)。
+    ///
+    /// **正直な開示(`GptModel`側の既存知見をそのまま引き継ぐ)**: ここでの
+    /// 射影は乱数(`SplitMix64`)によるものであり、実際のK/V活性化統計に
+    /// 基づくPCA較正版(`GptModel::enable_mla_kv_compression_calibrated`)
+    /// ではない。`GptModel`側では実重みで乱数射影が生成品質を明確に
+    /// 劣化させることが実測されている(モジュールdoc該当箇所参照)——
+    /// `QwenModel`でも同様の劣化が起きる可能性が高く、圧縮率とのトレード
+    /// オフを事前に検証してから使うこと。PCA較正版の`QwenModel`移植は
+    /// 今回のスコープ外(次の増分)。
+    pub fn enable_mla_kv_compression(&mut self, d_c: usize, seed: u64) -> Result<()> {
+        let head_dim = self.config.head_dim();
+        ensure!(d_c > 0 && d_c < head_dim, "open-cuda-llm: QwenModel::enable_mla_kv_compression: d_c={d_c} must satisfy 0 < d_c < head_dim={head_dim}");
+        let mut rng = SplitMix64::new(seed);
+        for layer in &mut self.layers {
+            let projections = (0..self.config.num_kv_heads)
+                .map(|_| MlaHeadProjection { down_proj: random_vec(&mut rng, head_dim * d_c, 0.02), up_proj: random_vec(&mut rng, d_c * head_dim, 0.02), d_c })
+                .collect();
+            layer.mla = Some(projections);
+        }
+        Ok(())
     }
 
     fn new_caches(&self) -> Vec<LayerCache> {
@@ -301,7 +337,8 @@ impl QwenModel {
                 let mut k_h = k[kvh * head_dim..(kvh + 1) * head_dim].to_vec();
                 apply_rope(&mut k_h, &cos, &sin);
                 let v_h = &v[kvh * head_dim..(kvh + 1) * head_dim];
-                cache.kv[kvh].push(device, &k_h, v_h, None, None)?;
+                let proj = layer.mla.as_ref().map(|v| &v[kvh]);
+                cache.kv[kvh].push(device, &k_h, v_h, proj, None)?;
                 k_heads_rot.push(k_h);
             }
 
@@ -311,7 +348,8 @@ impl QwenModel {
                 let mut q_h = q[qh * head_dim..(qh + 1) * head_dim].to_vec();
                 apply_rope(&mut q_h, &cos, &sin);
 
-                let (k_all, v_all) = cache.kv[kvh].current_kv(device, head_dim, None, None)?;
+                let proj = layer.mla.as_ref().map(|v| &v[kvh]);
+                let (k_all, v_all) = cache.kv[kvh].current_kv(device, head_dim, proj, None)?;
                 let n = cache.kv[kvh].n;
                 // `scaled_dot_product_attention`はseq_len行のqを要求するため、
                 // 単一のクエリ行をn回複製して先頭行だけを使う
@@ -471,6 +509,28 @@ mod tests {
         let out1 = model.generate(&device, &[10], 6).unwrap();
         let out2 = model.generate(&device, &[20], 6).unwrap();
         assert_ne!(out1, out2, "different prompts should not collapse to identical output");
+    }
+
+    /// MLA圧縮(GQA向け、KVヘッド単位)を有効化しても最後まで完走すること
+    /// (`GptModel`側の同名テストと同じ趣旨)。
+    #[test]
+    fn mla_kv_compression_enabled_qwen_model_generates_without_panicking() {
+        let config = QwenConfig::tiny(64); // hidden=32, num_heads=4 => head_dim=8
+        let mut model = QwenModel::load_random(config, 123);
+        model.enable_mla_kv_compression(2, 999).unwrap(); // head_dim=8 -> d_c=2 (75%削減)
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 6).unwrap();
+        assert_eq!(generated.len(), 6);
+    }
+
+    /// `d_c >= head_dim`は圧縮になっていないため拒否されることを確認
+    /// (`GptModel::enable_mla_kv_compression`と同じ不変条件)。
+    #[test]
+    fn mla_kv_compression_rejects_non_reducing_d_c() {
+        let config = QwenConfig::tiny(32); // head_dim=8
+        let mut model = QwenModel::load_random(config, 1);
+        assert!(model.enable_mla_kv_compression(8, 1).is_err());
+        assert!(model.enable_mla_kv_compression(0, 1).is_err());
     }
 
     #[test]
