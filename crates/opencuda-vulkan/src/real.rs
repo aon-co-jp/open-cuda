@@ -323,6 +323,48 @@ impl VulkanDevice {
         self.dispatch_spirv(spirv, entry, cfg, &[a_buffer, b_buffer, c_buffer], &n.to_ne_bytes())
     }
 
+    /// `chain_n_buffer`/`chain_n_buffer_f32` の引数契約を検証し、Vulkanバッファ
+    /// ハンドルの配列(発見順=呼び出し側が渡した順、最後がpush constantの`n`)を
+    /// 返す。2026-09-12追加: `directx-shader-translate`のRegExprチェーン
+    /// デコーダ(`yuv444_to_g`のような4バッファ以上を読み書きするカーネル、
+    /// および今後のMED予測器〈left/top/topleft/output〉のような固定本数では
+    /// ないバッファ数のカーネル)を実Vulkanで検証するには、`vector_add`/
+    /// `matmul`のようなカーネル名ごとにバッファ本数が決め打ちのディスパッチ
+    /// では足りない——本関数の内部で使う`dispatch_spirv`自体は元々バッファ
+    /// 本数に汎用対応済みだった(`buffers: &[vk::Buffer]`)ため、その汎用性を
+    /// 実際に公開APIとして引き出すだけで済んだ(`dispatch_spirv`自体は
+    /// 一切変更していない)。
+    ///
+    /// 引数の並び: `KernelArg::Ptr`がN個(読み込み元・書き込み先を問わず、
+    /// 呼び出し側がSPIR-Vの`binding`と一致する順序で並べる責任を負う)、
+    /// 続けて最後に1個`KernelArg::Usize(n)`(要素数)。最低2個(バッファ1本+
+    /// n)必要——1本しか無いのは通常あり得ないが、上限本数を決め打ちにしない
+    /// という設計方針上、下限のみ検証する。
+    fn ensure_chain_n_buffer_args(&self, args: &[KernelArg]) -> Result<(Vec<vk::Buffer>, u32)> {
+        if args.len() < 2 {
+            bail!("chain_n_buffer expects at least 2 args: 1+ buffer pointer(s) followed by n");
+        }
+        let (n_arg, ptr_args) = args.split_last().expect("checked len >= 2 above");
+        let n = n_arg.as_usize().ok_or_else(|| anyhow!("last arg must be usize/u32 (element count n)"))?;
+        let bytes = n.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| anyhow!("byte size overflow"))?;
+        let mut buffers = Vec::with_capacity(ptr_args.len());
+        for (i, arg) in ptr_args.iter().enumerate() {
+            let ptr = arg.as_ptr().ok_or_else(|| anyhow!("arg{i} must be pointer"))?;
+            let (buf, _, _, len, _, _) = self.get_allocation(ptr)?;
+            if bytes > len {
+                bail!("chain_n_buffer arg{i} buffer too small: need {bytes} bytes, has {len}");
+            }
+            buffers.push(buf);
+        }
+        let n_u32 = u32::try_from(n).context("chain_n_buffer n does not fit in u32 push constant")?;
+        Ok((buffers, n_u32))
+    }
+
+    fn run_chain_n_buffer_spirv(&self, spirv: &[u8], entry: &str, cfg: &LaunchConfig, args: &[KernelArg]) -> Result<()> {
+        let (buffers, n) = self.ensure_chain_n_buffer_args(args)?;
+        self.dispatch_spirv(spirv, entry, cfg, &buffers, &n.to_ne_bytes())
+    }
+
     /// `matmul` の引数契約を検証し、Vulkanバッファハンドルと push constant 用の
     /// (m, k, n) を返す。CPU版 `examples/matmul` と同じ行優先(row-major)レイアウトを前提とする:
     /// A は M行K列、B は K行N列、C は M行N列。
@@ -1012,6 +1054,7 @@ impl GpuDevice for VulkanDevice {
         };
         match kernel.name.as_str() {
             "vector_add" | "vector_add_f32" => self.run_vector_add_spirv(spirv, &kernel.entry, cfg, args),
+            "chain_n_buffer" | "chain_n_buffer_f32" => self.run_chain_n_buffer_spirv(spirv, &kernel.entry, cfg, args),
             "matmul" | "matmul_f32" => self.run_matmul_spirv(spirv, &kernel.entry, cfg, args),
             "raid6_xor_parity" => self.run_raid6_xor_parity_spirv(spirv, &kernel.entry, cfg, args),
             "raid6_q_parity" => self.run_raid6_q_parity_spirv(spirv, &kernel.entry, cfg, args),
@@ -1022,9 +1065,9 @@ impl GpuDevice for VulkanDevice {
             "hgemm" => self.run_hgemm_spirv(spirv, &kernel.entry, cfg, args),
             "dgemm" => self.run_dgemm_spirv(spirv, &kernel.entry, cfg, args),
             other => bail!(
-                "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, matmul/matmul_f32, \
-                 raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, sbm_ising, flash_attention, \
-                 hgemm, and dgemm; got `{other}`"
+                "VulkanDevice v0.4.1 only implements vector_add/vector_add_f32, chain_n_buffer/chain_n_buffer_f32, \
+                 matmul/matmul_f32, raid6_xor_parity, raid6_q_parity, softmax, sha256d_mine, sbm_ising, \
+                 flash_attention, hgemm, and dgemm; got `{other}`"
             ),
         }
     }

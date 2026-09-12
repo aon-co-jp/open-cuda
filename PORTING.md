@@ -231,3 +231,47 @@ GPUハードウェアが原理的に存在しないため、この2パターン�
 Poly1305の実機ディスパッチ)。`opencuda-vulkan`にRAID6 P-parity(XOR)/
 Q-parity(Reed-Solomon)カーネルを追加、実機検証済み。詳細な到達状況は
 `CLAUDE.md`のHANDOFF節を参照。
+
+## `chain_n_buffer`汎用Nバッファディスパッチを`opencuda-vulkan`へ追加(2026-09-12、open-directx連携)
+
+`open-directx`側(`directx-shader-translate`)がDXBC→SPIR-V翻訳する
+「RegExprチェーン」カーネル(`yuv444_to_g`のような4バッファ以上を
+読み書きするもの、および今後のMED予測器〈left/top/topleft/output〉の
+ような固定本数ではないバッファ数のカーネル)を実Vulkanで検証しようと
+した際、`VulkanDevice::launch_kernel`が`"vector_add"`/`"matmul"`等
+カーネル名ごとにバッファ本数を決め打ちでディスパッチする実装だった
+ため、4バッファ以上のカーネルは構造検証(SPIR-Vの形のみ確認)止まりに
+なっていた(`open-directx/PORTING.md`に記録済みの既知の制約)。
+
+内部で実際にVulkanディスクリプタ/コマンドバッファを組み立てる
+`dispatch_spirv`関数自体は元々`buffers: &[vk::Buffer]`という可変長
+引数を受け取る、バッファ本数に汎用対応した実装だった(呼び出し側の
+公開APIだけがカーネル名ごとに固定本数へ絞り込んでいた)。そのため
+今回追加したのは、この既存の汎用性を実際に引き出す薄い公開エント
+リポイントのみ:
+
+- `ensure_chain_n_buffer_args`: 引数を「`KernelArg::Ptr`がN個
+  (呼び出し側がSPIR-Vのbinding順に並べる)+最後に`KernelArg::Usize(n)`
+  (要素数)」という契約で検証し、Vulkanバッファハンドルの`Vec`を返す
+  (最低2引数=バッファ1本+nのみ検証、上限本数は決め打ちにしない)。
+- `run_chain_n_buffer_spirv`: 上記を`dispatch_spirv`へそのまま渡す。
+- `VulkanDevice::launch_kernel`のカーネル名ディスパッチに
+  `"chain_n_buffer"`/`"chain_n_buffer_f32"`を追加。
+
+`vector_add`/`matmul`等の既存カーネル名の挙動・引数契約は一切変更
+していない(完全に加算的な変更)。`cargo test -p opencuda-vulkan
+--features real-vulkan`: 既存テストに回帰無し。
+
+**実際の効果**: `open-directx`側の`yuv444_to_g_real_vulkan.rs`
+テストを、この新APIを使う形へ書き換えたところ、以前は構造検証止まり
+だったGチャンネル(4バッファ)カーネルが**実GT730ハードウェアで
+256/256要素の数値一致でpassするようになった**(詳細は
+`open-directx/PORTING.md`「FFv1 step 1」以降の節を参照)。
+
+**Honest scope (English)**: this is a purely additive change — a new
+kernel-name dispatch path (`chain_n_buffer`/`chain_n_buffer_f32`) that
+exposes the buffer-count-generic `dispatch_spirv` internals through a
+thin public entry point. No existing kernel name's behavior or argument
+contract changed. This resolves the "generic N-buffer dispatch" item
+that `open-directx/PORTING.md` had recorded as its top-priority next
+step for real-GPU-verifying chain kernels with more than 3 buffers.

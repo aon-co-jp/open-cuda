@@ -3356,3 +3356,17 @@ QKV射影・softmax・P·V・KVキャッシュpushの演算自体は毎回実行
      trying. Doing this measurement on the dev machine (NVIDIA GT 730,
      which has a working `--features real-vulkan` build history) is
      the next task.
+
+## HANDOFF追記(2026-09-12) `chain_n_buffer`汎用Nバッファディスパッチ追加(open-directx連携、他プロジェクトからの実要望に対応)
+
+`open-directx`側の作業(FFv1のyuv444_to_g/MED予測器プロトタイプ)で、
+`VulkanDevice::launch_kernel`がカーネル名ごとに固定本数のバッファしか
+受け付けないため4バッファ以上のRegExprチェーンカーネルを実GPU検証
+できない、という制約に実際に突き当たった。内部の`dispatch_spirv`
+自体はバッファ本数に汎用対応済みだったため、`"chain_n_buffer"`/
+`"chain_n_buffer_f32"`という新規カーネル名でその汎用性を公開する薄い
+関数(`ensure_chain_n_buffer_args`/`run_chain_n_buffer_spirv`)を
+`crates/opencuda-vulkan/src/real.rs`に追加した。既存カーネル名の挙動は
+無変更(完全加算)。詳細は`PORTING.md`「chain_n_buffer汎用Nバッファ
+ディスパッチ」節参照。`cargo test -p opencuda-vulkan --features
+real-vulkan`: 既存テストに回帰無し。
