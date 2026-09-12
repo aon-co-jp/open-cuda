@@ -13,6 +13,7 @@ members = [
     "crates/open-cuda-llm",
     "crates/open-cuda-whisper",
     "examples/vector_add",
+    "examples/yuv_to_rgb_cpu",
     "examples/vector_add_vulkan",
     "examples/vector_add_omniir",
     "examples/vector_add_vulkan_real",
