@@ -1,0 +1,15 @@
+[package]
+name = "yuv_to_rgb_cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+opencuda-core.workspace = true
+opencuda-cpu.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "yuv_to_rgb_cpu"
+path = "src/main.rs"
