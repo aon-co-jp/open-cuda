@@ -6,6 +6,27 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き5)**: `DeepseekModel`にDeepSeek-V3固有の
+> MoE拡張(aux-loss-free補正・group-limited routing・sigmoidスコア
+> リング)を実装、加えて実チェックポイントが分割済み(sharded、4分割・
+> 31.4GB)配布であることが判明したため分割safetensorsローダーを新設した。
+> **正直な開示**: 実機ダウンロード・ロード検証は見送った——現在の
+> ローダー設計ではピークメモリが90GBを超える可能性が高く、この開発機
+> (実測: 総RAM32GB・空き16GB)では実行するとクラッシュ・システム不安定化
+> の恐れがあるため。分割ロード自体は合成チェックポイントでのファイルI/O
+> テストで検証済み。詳細は[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Implemented DeepSeek-V3-specific MoE extensions
+> (aux-loss-free bias correction, group-limited routing, sigmoid
+> scoring) in `DeepseekModel`, and added a sharded-safetensors loader
+> after discovering the real checkpoint ships as 4 shards / 31.4GB.
+> **Honest scope**: skipped real download/load verification — the
+> current loader design could peak past 90GB of memory, and this dev
+> machine (measured: 32GB total RAM, 16GB free) would likely crash or
+> destabilize under that load. The sharded-loading path itself is
+> verified via a synthetic on-disk fixture test. See
+> [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き2)**: `open-cuda-llm::DeepseekModel`に
 > DeepSeekMoE(共有エキスパート+top-kルーティング)を実装した——直下の
 > エントリで「今回はスコープ外」としたMoEに、世界中の言語での追加調査に

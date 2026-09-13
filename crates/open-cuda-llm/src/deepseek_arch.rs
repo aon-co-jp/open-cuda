@@ -65,18 +65,75 @@
 //!   `routed_scaling_factor`を乗算 → 選択エキスパートの出力を重み付き
 //!   加算 → 常時計算する`shared_experts`の出力を加算。
 //!
-//! **正直な開示(誇張しない、意図的に見送った部分)**:
-//! - **aux-loss-free load balancing**(V3以降の`gate.e_score_correction_bias`
-//!   テンソルによる補正)は未対応——V2-Liteにはこのテンソル自体が無く、
-//!   V3系チェックポイントのロードには対応していない。
-//! - **group-limited routing**(`n_group`/`topk_group`、V3が使う
-//!   グループ単位でのエキスパート絞り込み)は未対応——V2-Liteは
-//!   `n_group=1`のため実質no-opだが、V3の`n_group>1`構成は正しく
-//!   ルーティングされない。
-//! - **`scoring_func="sigmoid"`**(V3が使う、softmaxではなくsigmoid+
-//!   事後正規化のスコアリング)は未対応——`load()`は`scoring_func`が
-//!   `"softmax"`であることを`ensure!`で要求し、それ以外(sigmoid等)は
-//!   明示的なエラーで拒否する(誤った計算を黙って実行しない)。
+//! ## V3固有拡張(2026-09-13続き4追記): aux-loss-free補正・group-limited
+//! routing・sigmoidスコアリングにも対応
+//!
+//! 直前(すぐ下)で「未対応」と明記した3項目について、ユーザーから
+//! 「世界中の言語で設計と開発の為にGoogle検索とGithub調査して対応
+//! させて」との指示を受け、DeepSeek-V3公式推論実装
+//! (<https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py>
+//! の`Gate`クラス、実`config.json`
+//! <https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json>、
+//! 論文Sec.2.1.2 arXiv:2412.19437)を調査した上で実装した。
+//!
+//! **非自明な発見(実装前に把握すべき要点)**: `e_score_correction_bias`は
+//! 「どのエキスパートを選ぶか」(top-k選択)にのみ影響し、「選ばれた
+//! エキスパートへ与える重み」は**bias加算前の生スコア**
+//! (`original_scores`)がそのまま使われる——選択用と重み用でスコアを
+//! 2本持つ必要がある。グループ集約方式も分岐する: biasが無ければ
+//! グループ内最大値(`amax`)、biasがあれば(V3の`noaux_tc`構成)
+//! グループ内**上位2個の合計**を使う。sigmoidスコアリングでは、
+//! 各エキスパートのスコアが独立([0,1]で合計が1にならない)ため、
+//! 選択後の正規化(`weight /= weight.sum()`)が事実上必須(公式実装では
+//! `scoring_func=="sigmoid"`かどうかで無条件に分岐しており、
+//! `norm_topk_prob`とは別ロジック)。
+//!
+//! 正確な計算順序: `scores = softmax_or_sigmoid(gate(x))` →
+//! `original_scores = scores.clone()` →
+//! (biasがあれば`scores += bias`、選択にのみ影響) →
+//! (`n_group>1`なら、グループごとの集約スコアで上位`topk_group`グループ
+//! 以外を`-inf`マスク) → 上位`num_experts_per_tok`個を選択 →
+//! `weight = original_scores[selected]`(bias抜き) →
+//! (`scoring_func=="sigmoid"`または`norm_topk_prob`なら`weight`を再正規化)
+//! → `weight *= routed_scaling_factor`。
+//!
+//! **正直な開示(誇張しない、それでも残る限界)**:
+//! - `e_score_correction_bias`は推論時は固定値としてそのままロードする
+//!   だけ(学習時の動的更新ロジックは推論専用実装のため実装しない、
+//!   調査で確認した通りDeepSeek公式推論実装にも学習ロジックは無い)。
+//! - `topk_method`は`"greedy"`(バイアス無し、V2系)と`"noaux_tc"`
+//!   (バイアス有り、V3系)のみ対応。それ以外の値は`load()`が拒否する。
+//! - 実チェックポイント(V3本体、`n_routed_experts=256`)は671B
+//!   パラメータの巨大モデルで、この開発機(GT730、VRAM 2GB)は
+//!   もちろんダウンロード自体も一般的な開発機では非現実的——この実装は
+//!   あくまで構造的な正しさ(テンソル形状・計算順序)を極小構成の
+//!   単体テストで検証したものであり、実V3チェックポイントでの実機
+//!   検証は行っていない(行うこと自体が非現実的)。
+//!
+//! **2026-09-13(続き5)追記・実機検証の具体的な試算**: より小型な
+//! `deepseek-ai/DeepSeek-V2-Lite-Chat`(15.7B、`n_group=1`・
+//! `topk_method="greedy"`・`scoring_func="softmax"`——この実装が対応
+//! 済みの構成)についても、実際に`model.safetensors.index.json`を
+//! 取得して試算した結果、**この開発機での実ダウンロード・実ロード検証は
+//! 見送った**。理由: 実チェックポイントは31.4GB(bf16)・4分割
+//! (`model-00001-of-000004.safetensors`等)で配布されており(対応の
+//! ため`ModelWeights::load_sharded`を新設——下記参照)、現在のローダー
+//! 設計(各シャードの生バイト列を`ModelWeights`が一括保持しつつ、
+//! 全テンソルをf32へ変換して`DeepseekModel`が永続保持する)では、
+//! ピークメモリが「シャード生データ31.4GB」+「f32変換後の全重み
+//! (bf16の2倍、約62.8GB)」を同時に抱える構成になり得るため、
+//! 90GBを超えるメモリを要求する可能性が高い。この開発機の実測
+//! (`Get-CimInstance Win32_OperatingSystem`)は総RAM 32GB・空き16GB
+//! ——実行すればスワップの多発やプロセスのクラッシュ、最悪OS全体の
+//! 不安定化を招く恐れがあるため、**無理に実行せず見送った**
+//! (「実機検証した」と偽らず、リスクの実測値とともに正直に記録する)。
+//! かわりに、`ModelWeights::load_sharded`のロード経路そのものは、
+//! 合成の決定的な値で埋めた極小チェックポイントを2ファイルに分割して
+//! ディスクへ実際に書き出すテスト
+//! (`load_parses_sharded_safetensors_checkpoint_split_across_two_files`)
+//! で検証済み——分割ロードのロジック自体に欠陥が無いことは実際の
+//! ファイルI/Oを通して確認しているが、実DeepSeekチェックポイントの
+//! テンソル値そのものでの検証ではない。
 //! - **学習専用ロジックは実装しない**(推論専用実装のため無関係):
 //!   auxiliary loss計算・逆伝播・expert-parallelism分散シャーディング
 //!   ・capacity factor等はすべて省略(調査で確認した通り、DeepSeek公式
@@ -179,12 +236,21 @@ pub struct DeepseekConfig {
     pub moe_intermediate_size: usize,
     #[serde(default)]
     pub norm_topk_prob: bool,
-    /// `"softmax"`のみ対応(モジュールdoc参照、`"sigmoid"`はV3系が使うが
-    /// 未対応——`load()`が明示的に拒否する)。
+    /// `"softmax"`または`"sigmoid"`(V3系)。それ以外は`load()`が拒否する。
     #[serde(default = "default_scoring_func")]
     pub scoring_func: String,
     #[serde(default = "default_routed_scaling_factor")]
     pub routed_scaling_factor: f32,
+    /// グループ制限ルーティング(V3系)。`1`(既定)なら実質no-op。
+    #[serde(default = "default_group")]
+    pub n_group: usize,
+    #[serde(default = "default_group")]
+    pub topk_group: usize,
+    /// `"greedy"`(既定、`e_score_correction_bias`無し、V2系)または
+    /// `"noaux_tc"`(V3系、`gate.e_score_correction_bias`テンソルを
+    /// ロードして選択にのみ使う——モジュールdoc「V3固有拡張」参照)。
+    #[serde(default = "default_topk_method")]
+    pub topk_method: String,
 }
 
 fn default_max_seq_len() -> usize {
@@ -204,6 +270,12 @@ fn default_scoring_func() -> String {
 }
 fn default_routed_scaling_factor() -> f32 {
     1.0
+}
+fn default_group() -> usize {
+    1
+}
+fn default_topk_method() -> String {
+    "greedy".to_string()
 }
 
 impl DeepseekConfig {
@@ -233,6 +305,9 @@ impl DeepseekConfig {
             norm_topk_prob: false,
             scoring_func: "softmax".to_string(),
             routed_scaling_factor: 1.0,
+            n_group: 1,
+            topk_group: 1,
+            topk_method: "greedy".to_string(),
         }
     }
 
@@ -256,6 +331,28 @@ impl DeepseekConfig {
             scoring_func: "softmax".to_string(),
             routed_scaling_factor: 1.0,
             ..Self::tiny(vocab_size)
+        }
+    }
+
+    /// [`tiny_with_moe`]のV3拡張版: `n_group>1`のgroup-limited routing・
+    /// `topk_method="noaux_tc"`(`e_score_correction_bias`使用)・
+    /// `scoring_func="sigmoid"`をすべて有効にする(実DeepSeek-V3の
+    /// config.jsonが実際に使う組み合わせ、モジュールdoc「V3固有拡張」
+    /// 参照)。`n_routed_experts=8`を`n_group=4`グループ(各2個)に分割し、
+    /// `topk_group=2`で半分のグループへ絞ってから`num_experts_per_tok=2`
+    /// を選ぶ。
+    pub fn tiny_with_moe_v3(vocab_size: usize) -> Self {
+        Self {
+            n_routed_experts: 8,
+            n_shared_experts: 1,
+            num_experts_per_tok: 2,
+            n_group: 4,
+            topk_group: 2,
+            topk_method: "noaux_tc".to_string(),
+            scoring_func: "sigmoid".to_string(),
+            norm_topk_prob: true,
+            routed_scaling_factor: 2.5,
+            ..Self::tiny_with_moe(vocab_size)
         }
     }
 
@@ -368,10 +465,28 @@ impl DenseSwiGlu {
 /// トークンごとに`num_experts_per_tok`個のルーティングされるエキスパート
 /// (`experts`)を選び、常時計算される`shared_experts`の出力と合算する。
 struct DeepseekMoeMlp {
-    /// ルーター: `hidden -> n_routed_experts`(softmaxスコア用ロジット)。
+    /// ルーター: `hidden -> n_routed_experts`(スコア用ロジット)。
     gate: Linear,
+    /// `topk_method="noaux_tc"`(V3系)のみ`Some`。`[n_routed_experts]`長、
+    /// 選択(top-k)にのみ影響し重みには使わない(モジュールdoc
+    /// 「V3固有拡張」参照)。
+    e_score_correction_bias: Option<Vec<f32>>,
     shared_experts: DenseSwiGlu,
     experts: Vec<DenseSwiGlu>,
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn softmax_scores(logits: &[f32]) -> Vec<f32> {
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut scores: Vec<f32> = logits.iter().map(|&v| (v - max_logit).exp()).collect();
+    let sum_exp: f32 = scores.iter().sum();
+    for s in &mut scores {
+        *s /= sum_exp;
+    }
+    scores
 }
 
 enum DeepseekMlp {
@@ -384,27 +499,64 @@ impl DeepseekMlp {
         match self {
             DeepseekMlp::Dense(dense) => dense.forward(device, x),
             DeepseekMlp::Moe(moe) => {
-                // ── ルーティング計算(モジュールdoc参照、softmaxスコアのみ対応) ──
+                // ── ルーティング計算(モジュールdoc「V3固有拡張」参照) ──
                 let logits = moe.gate.forward(device, x, 1)?;
-                let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut scores: Vec<f32> = logits.iter().map(|&v| (v - max_logit).exp()).collect();
-                let sum_exp: f32 = scores.iter().sum();
-                for s in &mut scores {
-                    *s /= sum_exp;
+                let scores = if cfg.scoring_func == "sigmoid" { logits.iter().map(|&v| sigmoid(v)).collect::<Vec<f32>>() } else { softmax_scores(&logits) };
+                // 選択にのみbiasを使い、重みには「biasを足す前」の
+                // original_scoresを使う(調査で確認した非自明な仕様、
+                // モジュールdoc参照)。
+                let original_scores = scores.clone();
+                let mut select_scores = scores;
+                if let Some(bias) = &moe.e_score_correction_bias {
+                    for (s, b) in select_scores.iter_mut().zip(bias) {
+                        *s += b;
+                    }
                 }
 
-                let mut ranked: Vec<usize> = (0..scores.len()).collect();
-                ranked.sort_unstable_by(|&a, &b| scores[b].partial_cmp(&scores[a]).expect("open-cuda-llm: DeepSeekMoE router score must not be NaN"));
+                if cfg.n_group > 1 {
+                    let group_size = select_scores.len() / cfg.n_group;
+                    let mut group_scores = vec![0.0f32; cfg.n_group];
+                    for (g, group_score) in group_scores.iter_mut().enumerate() {
+                        let group = &select_scores[g * group_size..(g + 1) * group_size];
+                        *group_score = if moe.e_score_correction_bias.is_some() {
+                            // bias有り(noaux_tc): グループ内上位2個の合計。
+                            let mut sorted = group.to_vec();
+                            sorted.sort_unstable_by(|a, b| b.partial_cmp(a).expect("open-cuda-llm: DeepSeekMoE group score must not be NaN"));
+                            sorted.iter().take(2).sum()
+                        } else {
+                            // bias無し: グループ内最大値。
+                            group.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                        };
+                    }
+                    let mut group_ranked: Vec<usize> = (0..cfg.n_group).collect();
+                    group_ranked.sort_unstable_by(|&a, &b| group_scores[b].partial_cmp(&group_scores[a]).expect("open-cuda-llm: DeepSeekMoE group score must not be NaN"));
+                    let kept_groups = &group_ranked[..cfg.topk_group];
+                    for g in 0..cfg.n_group {
+                        if !kept_groups.contains(&g) {
+                            for s in &mut select_scores[g * group_size..(g + 1) * group_size] {
+                                *s = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                }
+
+                let mut ranked: Vec<usize> = (0..select_scores.len()).collect();
+                ranked.sort_unstable_by(|&a, &b| select_scores[b].partial_cmp(&select_scores[a]).expect("open-cuda-llm: DeepSeekMoE router score must not be NaN"));
                 let selected = &ranked[..cfg.num_experts_per_tok];
 
-                let mut weight_sum: f32 = selected.iter().map(|&i| scores[i]).sum();
-                if !cfg.norm_topk_prob {
-                    weight_sum = 1.0; // 正規化しない(元スコアをそのまま重みに使う)
+                let mut weights: Vec<f32> = selected.iter().map(|&i| original_scores[i]).collect();
+                if cfg.scoring_func == "sigmoid" || cfg.norm_topk_prob {
+                    let sum: f32 = weights.iter().sum();
+                    for w in &mut weights {
+                        *w /= sum;
+                    }
+                }
+                for w in &mut weights {
+                    *w *= cfg.routed_scaling_factor;
                 }
 
                 let mut y = vec![0.0f32; x.len()];
-                for &expert_idx in selected {
-                    let weight = (scores[expert_idx] / weight_sum) * cfg.routed_scaling_factor;
+                for (&expert_idx, &weight) in selected.iter().zip(&weights) {
                     let expert_out = moe.experts[expert_idx].forward(device, x)?;
                     for (acc, v) in y.iter_mut().zip(&expert_out) {
                         *acc += weight * v;
@@ -443,6 +595,7 @@ impl DeepseekLayer {
         let mlp = if cfg.is_moe_layer(layer_idx) {
             DeepseekMlp::Moe(Box::new(DeepseekMoeMlp {
                 gate: Linear::random(rng, hidden, cfg.n_routed_experts),
+                e_score_correction_bias: if cfg.topk_method == "noaux_tc" { Some(random_vec(rng, cfg.n_routed_experts, 0.02)) } else { None },
                 shared_experts: DenseSwiGlu::random(rng, hidden, cfg.moe_intermediate_size * cfg.n_shared_experts),
                 experts: (0..cfg.n_routed_experts).map(|_| DenseSwiGlu::random(rng, hidden, cfg.moe_intermediate_size)).collect(),
             }))
@@ -506,9 +659,16 @@ impl DeepseekModel {
     /// フルサイズのDeepSeek-V2/V2-Lite/V3チェックポイントは
     /// `first_k_dense_replace`以降の層で必ず失敗する(このメソッドは
     /// 「MLA構成だが全層dense FFN」の仮想的/カスタムなチェックポイント、
-    /// または将来のMoE対応後に使うための土台)。分割済み
-    /// (`model-00001-of-00002.safetensors`等)のsharded checkpointにも
-    /// 未対応(`QwenModel::load`と同じ制約)。
+    /// または将来のMoE対応後に使うための土台)。
+    ///
+    /// **2026-09-13(続き5)追記**: 分割済み(sharded、
+    /// `model-00001-of-00004.safetensors`等+`model.safetensors.index.json`)
+    /// チェックポイントに対応した——実際に`deepseek-ai/DeepSeek-V2-Lite-Chat`
+    /// の`model.safetensors.index.json`を取得して確認したところ、実在の
+    /// チェックポイントは31.4GB・4分割で配布されており、単一ファイルの
+    /// `model.safetensors`しか読めない旧実装(`QwenModel::load`と同じ
+    /// 制約を踏襲していた)では構造的にロードできないことが判明したため
+    /// (`ModelWeights`参照)。
     pub fn load(dir: &Path) -> Result<Self> {
         let config_bytes = std::fs::read(dir.join("config.json")).with_context(|| format!("open-cuda-llm: failed to read {}/config.json", dir.display()))?;
         let config: DeepseekConfig = serde_json::from_slice(&config_bytes).context("open-cuda-llm: failed to parse DeepSeek config.json")?;
@@ -520,19 +680,23 @@ impl DeepseekModel {
         ensure!(config.kv_lora_rank > 0, "open-cuda-llm: kv_lora_rank must be > 0");
         if config.first_k_dense_replace < config.num_layers {
             ensure!(
-                config.scoring_func == "softmax",
-                "open-cuda-llm: DeepseekModel::load: scoring_func '{}' is not supported yet — only \"softmax\" is implemented \
-                 (V3's \"sigmoid\" scoring + aux-loss-free correction bias is a documented, not-yet-implemented gap, see deepseek_arch.rs module docs)",
+                config.scoring_func == "softmax" || config.scoring_func == "sigmoid",
+                "open-cuda-llm: DeepseekModel::load: scoring_func '{}' is not supported — only \"softmax\" and \"sigmoid\" are implemented",
                 config.scoring_func
+            );
+            ensure!(
+                config.topk_method == "greedy" || config.topk_method == "noaux_tc",
+                "open-cuda-llm: DeepseekModel::load: topk_method '{}' is not supported — only \"greedy\" (no correction bias) and \"noaux_tc\" (V3 aux-loss-free bias) are implemented",
+                config.topk_method
             );
             ensure!(config.n_routed_experts > 0, "open-cuda-llm: n_routed_experts must be > 0 when first_k_dense_replace < num_hidden_layers (some layers are MoE)");
             ensure!(config.num_experts_per_tok > 0 && config.num_experts_per_tok <= config.n_routed_experts, "open-cuda-llm: num_experts_per_tok ({}) must be in 1..=n_routed_experts ({})", config.num_experts_per_tok, config.n_routed_experts);
             ensure!(config.moe_intermediate_size > 0, "open-cuda-llm: moe_intermediate_size must be > 0 when some layers are MoE");
+            ensure!(config.n_group > 0 && config.n_routed_experts % config.n_group == 0, "open-cuda-llm: n_routed_experts ({}) must be a positive multiple of n_group ({})", config.n_routed_experts, config.n_group);
+            ensure!(config.topk_group > 0 && config.topk_group <= config.n_group, "open-cuda-llm: topk_group ({}) must be in 1..=n_group ({})", config.topk_group, config.n_group);
         }
 
-        let weights_path = dir.join("model.safetensors");
-        let data = std::fs::read(&weights_path).with_context(|| format!("open-cuda-llm: failed to read {}", weights_path.display()))?;
-        let tensors = safetensors::SafeTensors::deserialize(&data).context("open-cuda-llm: failed to parse model.safetensors")?;
+        let weights = ModelWeights::load(dir)?;
 
         let hidden = config.hidden_size;
         let q_head_dim = config.q_head_dim();
@@ -540,7 +704,7 @@ impl DeepseekModel {
         let kv_b_out = config.num_heads * (config.qk_nope_head_dim + config.v_head_dim);
         let attn_out_dim = config.num_heads * config.v_head_dim;
 
-        let embed_tokens = tensor_f32(&tensors, "model.embed_tokens.weight")?;
+        let embed_tokens = weights.tensor_f32("model.embed_tokens.weight")?;
         ensure!(embed_tokens.len() == config.vocab_size * hidden, "open-cuda-llm: model.embed_tokens.weight has {} elements, expected {}x{}", embed_tokens.len(), config.vocab_size, hidden);
 
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -549,36 +713,36 @@ impl DeepseekModel {
             let sa = format!("{p}.self_attn");
 
             let (q_proj, q_a_proj, q_a_layernorm, q_b_proj) = match config.q_lora_rank {
-                None => (Some(load_linear(&tensors, &format!("{sa}.q_proj"), hidden, config.num_heads * q_head_dim)?), None, None, None),
+                None => (Some(load_linear(&weights, &format!("{sa}.q_proj"), hidden, config.num_heads * q_head_dim)?), None, None, None),
                 Some(q_lora_rank) => (
                     None,
-                    Some(load_linear(&tensors, &format!("{sa}.q_a_proj"), hidden, q_lora_rank)?),
-                    Some(RmsNorm { weight: tensor_f32(&tensors, &format!("{sa}.q_a_layernorm.weight"))?, eps: config.rms_norm_eps }),
-                    Some(load_linear(&tensors, &format!("{sa}.q_b_proj"), q_lora_rank, config.num_heads * q_head_dim)?),
+                    Some(load_linear(&weights, &format!("{sa}.q_a_proj"), hidden, q_lora_rank)?),
+                    Some(RmsNorm { weight: weights.tensor_f32(&format!("{sa}.q_a_layernorm.weight"))?, eps: config.rms_norm_eps }),
+                    Some(load_linear(&weights, &format!("{sa}.q_b_proj"), q_lora_rank, config.num_heads * q_head_dim)?),
                 ),
             };
 
             layers.push(DeepseekLayer {
-                input_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
+                input_layernorm: RmsNorm { weight: weights.tensor_f32(&format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
                 q_proj,
                 q_a_proj,
                 q_a_layernorm,
                 q_b_proj,
-                kv_a_proj_with_mqa: load_linear(&tensors, &format!("{sa}.kv_a_proj_with_mqa"), hidden, kv_a_dim)?,
-                kv_a_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{sa}.kv_a_layernorm.weight"))?, eps: config.rms_norm_eps },
-                kv_b_proj: load_linear(&tensors, &format!("{sa}.kv_b_proj"), config.kv_lora_rank, kv_b_out)?,
-                o_proj: load_linear(&tensors, &format!("{sa}.o_proj"), attn_out_dim, hidden)?,
-                post_attention_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
-                mlp: load_mlp(&tensors, &p, &config, i, hidden)?,
+                kv_a_proj_with_mqa: load_linear(&weights, &format!("{sa}.kv_a_proj_with_mqa"), hidden, kv_a_dim)?,
+                kv_a_layernorm: RmsNorm { weight: weights.tensor_f32(&format!("{sa}.kv_a_layernorm.weight"))?, eps: config.rms_norm_eps },
+                kv_b_proj: load_linear(&weights, &format!("{sa}.kv_b_proj"), config.kv_lora_rank, kv_b_out)?,
+                o_proj: load_linear(&weights, &format!("{sa}.o_proj"), attn_out_dim, hidden)?,
+                post_attention_layernorm: RmsNorm { weight: weights.tensor_f32(&format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
+                mlp: load_mlp(&weights, &p, &config, i, hidden)?,
             });
         }
 
-        let norm = RmsNorm { weight: tensor_f32(&tensors, "model.norm.weight")?, eps: config.rms_norm_eps };
+        let norm = RmsNorm { weight: weights.tensor_f32("model.norm.weight")?, eps: config.rms_norm_eps };
 
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            let raw = tensor_f32(&tensors, "lm_head.weight")?;
+            let raw = weights.tensor_f32("lm_head.weight")?;
             ensure!(raw.len() == config.vocab_size * hidden, "open-cuda-llm: lm_head.weight has {} elements, expected {}x{}", raw.len(), config.vocab_size, hidden);
             let weight_t = transpose(&raw, config.vocab_size, hidden);
             Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
@@ -741,36 +905,115 @@ impl DeepseekModel {
     }
 }
 
-/// 層`layer_idx`のMLP部分をロードする(`config.first_k_dense_replace`に
-/// 応じてdense/MoEを分岐、モジュールdoc「DeepSeekMoE対応」参照)。
-fn load_mlp(tensors: &safetensors::SafeTensors, layer_prefix: &str, config: &DeepseekConfig, layer_idx: usize, hidden: usize) -> Result<DeepseekMlp> {
-    if config.is_moe_layer(layer_idx) {
-        let gate = load_linear(tensors, &format!("{layer_prefix}.mlp.gate"), hidden, config.n_routed_experts)
-            .with_context(|| format!("open-cuda-llm: layer {layer_idx}: MoE router 'mlp.gate' not found (layer_idx >= first_k_dense_replace={} so this layer is expected to be MoE)", config.first_k_dense_replace))?;
-        let shared_experts = load_dense_swiglu(tensors, &format!("{layer_prefix}.mlp.shared_experts"), hidden, config.moe_intermediate_size * config.n_shared_experts)?;
-        let mut experts = Vec::with_capacity(config.n_routed_experts);
-        for e in 0..config.n_routed_experts {
-            experts.push(load_dense_swiglu(tensors, &format!("{layer_prefix}.mlp.experts.{e}"), hidden, config.moe_intermediate_size)?);
+/// 単一の`model.safetensors`、または`model.safetensors.index.json`+
+/// 複数の`model-NNNNN-of-MMMMM.safetensors`という分割済み(sharded)
+/// チェックポイントの両方を透過的に読めるようにする抽象化
+/// (2026-09-13追加、`load()`のdocコメント参照)。各シャードの生バイト列
+/// (`shard_bytes`)を保持し、テンソル名ごとにどのシャードに含まれるかを
+/// `tensor_shard`(名前→`shard_bytes`のインデックス)で引く。
+/// `safetensors::SafeTensors`はバイト列を借用するだけの薄いビューで
+/// ヘッダ解析コストのみ(データ自体のコピーは無い)なので、テンソル
+/// アクセスのたびに対象シャードだけ`deserialize`し直しても実用上問題ない
+/// (自己参照構造体を避けるための単純な設計判断)。
+struct ModelWeights {
+    shard_bytes: Vec<Vec<u8>>,
+    tensor_shard: std::collections::HashMap<String, usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct SafetensorsIndex {
+    weight_map: std::collections::HashMap<String, String>,
+}
+
+impl ModelWeights {
+    fn load(dir: &Path) -> Result<Self> {
+        let index_path = dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            Self::load_sharded(dir, &index_path)
+        } else {
+            let path = dir.join("model.safetensors");
+            let bytes = std::fs::read(&path).with_context(|| format!("open-cuda-llm: failed to read {}", path.display()))?;
+            let names: Vec<String> = safetensors::SafeTensors::deserialize(&bytes).context("open-cuda-llm: failed to parse model.safetensors")?.names().into_iter().map(|s| s.to_string()).collect();
+            let tensor_shard = names.into_iter().map(|n| (n, 0usize)).collect();
+            Ok(Self { shard_bytes: vec![bytes], tensor_shard })
         }
-        Ok(DeepseekMlp::Moe(Box::new(DeepseekMoeMlp { gate, shared_experts, experts })))
-    } else {
-        Ok(DeepseekMlp::Dense(Box::new(load_dense_swiglu(tensors, &format!("{layer_prefix}.mlp"), hidden, config.intermediate_size)?)))
+    }
+
+    /// `model.safetensors.index.json`(`weight_map`: テンソル名→ファイル名)
+    /// を読み、参照される各シャードファイルを一度だけ読み込む。実在する
+    /// `deepseek-ai/DeepSeek-V2-Lite-Chat`で実際に確認した形式
+    /// (`model-00001-of-000004.safetensors`等、4分割・合計31.4GB)。
+    fn load_sharded(dir: &Path, index_path: &Path) -> Result<Self> {
+        let index_bytes = std::fs::read(index_path).with_context(|| format!("open-cuda-llm: failed to read {}", index_path.display()))?;
+        let index: SafetensorsIndex = serde_json::from_slice(&index_bytes).context("open-cuda-llm: failed to parse model.safetensors.index.json")?;
+        ensure!(!index.weight_map.is_empty(), "open-cuda-llm: model.safetensors.index.json has an empty weight_map");
+
+        let mut filename_to_shard: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut shard_bytes: Vec<Vec<u8>> = Vec::new();
+        let mut tensor_shard: std::collections::HashMap<String, usize> = std::collections::HashMap::with_capacity(index.weight_map.len());
+        for (tensor_name, filename) in index.weight_map {
+            let shard_idx = match filename_to_shard.get(&filename) {
+                Some(&idx) => idx,
+                None => {
+                    let shard_path = dir.join(&filename);
+                    let bytes = std::fs::read(&shard_path).with_context(|| format!("open-cuda-llm: failed to read shard {}", shard_path.display()))?;
+                    let idx = shard_bytes.len();
+                    shard_bytes.push(bytes);
+                    filename_to_shard.insert(filename, idx);
+                    idx
+                }
+            };
+            tensor_shard.insert(tensor_name, shard_idx);
+        }
+        Ok(Self { shard_bytes, tensor_shard })
+    }
+
+    fn tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let &shard_idx = self.tensor_shard.get(name).with_context(|| format!("open-cuda-llm: tensor '{name}' not found in checkpoint"))?;
+        let tensors = safetensors::SafeTensors::deserialize(&self.shard_bytes[shard_idx]).context("open-cuda-llm: failed to re-parse a shard's safetensors header")?;
+        tensor_f32(&tensors, name)
     }
 }
 
-fn load_dense_swiglu(tensors: &safetensors::SafeTensors, prefix: &str, hidden: usize, intermediate: usize) -> Result<DenseSwiGlu> {
+/// 層`layer_idx`のMLP部分をロードする(`config.first_k_dense_replace`に
+/// 応じてdense/MoEを分岐、モジュールdoc「DeepSeekMoE対応」参照)。
+fn load_mlp(weights: &ModelWeights, layer_prefix: &str, config: &DeepseekConfig, layer_idx: usize, hidden: usize) -> Result<DeepseekMlp> {
+    if config.is_moe_layer(layer_idx) {
+        let gate = load_linear(weights, &format!("{layer_prefix}.mlp.gate"), hidden, config.n_routed_experts)
+            .with_context(|| format!("open-cuda-llm: layer {layer_idx}: MoE router 'mlp.gate' not found (layer_idx >= first_k_dense_replace={} so this layer is expected to be MoE)", config.first_k_dense_replace))?;
+        let e_score_correction_bias = if config.topk_method == "noaux_tc" {
+            let bias = weights
+                .tensor_f32(&format!("{layer_prefix}.mlp.gate.e_score_correction_bias"))
+                .with_context(|| format!("open-cuda-llm: layer {layer_idx}: topk_method=\"noaux_tc\" but 'mlp.gate.e_score_correction_bias' not found"))?;
+            ensure!(bias.len() == config.n_routed_experts, "open-cuda-llm: layer {layer_idx}: 'mlp.gate.e_score_correction_bias' has {} elements, expected {}", bias.len(), config.n_routed_experts);
+            Some(bias)
+        } else {
+            None
+        };
+        let shared_experts = load_dense_swiglu(weights, &format!("{layer_prefix}.mlp.shared_experts"), hidden, config.moe_intermediate_size * config.n_shared_experts)?;
+        let mut experts = Vec::with_capacity(config.n_routed_experts);
+        for e in 0..config.n_routed_experts {
+            experts.push(load_dense_swiglu(weights, &format!("{layer_prefix}.mlp.experts.{e}"), hidden, config.moe_intermediate_size)?);
+        }
+        Ok(DeepseekMlp::Moe(Box::new(DeepseekMoeMlp { gate, e_score_correction_bias, shared_experts, experts })))
+    } else {
+        Ok(DeepseekMlp::Dense(Box::new(load_dense_swiglu(weights, &format!("{layer_prefix}.mlp"), hidden, config.intermediate_size)?)))
+    }
+}
+
+fn load_dense_swiglu(weights: &ModelWeights, prefix: &str, hidden: usize, intermediate: usize) -> Result<DenseSwiGlu> {
     Ok(DenseSwiGlu {
-        gate_proj: load_linear(tensors, &format!("{prefix}.gate_proj"), hidden, intermediate)?,
-        up_proj: load_linear(tensors, &format!("{prefix}.up_proj"), hidden, intermediate)?,
-        down_proj: load_linear(tensors, &format!("{prefix}.down_proj"), intermediate, hidden)?,
+        gate_proj: load_linear(weights, &format!("{prefix}.gate_proj"), hidden, intermediate)?,
+        up_proj: load_linear(weights, &format!("{prefix}.up_proj"), hidden, intermediate)?,
+        down_proj: load_linear(weights, &format!("{prefix}.down_proj"), intermediate, hidden)?,
     })
 }
 
-fn load_linear(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
-    let raw = tensor_f32(tensors, &format!("{prefix}.weight"))?;
+fn load_linear(weights: &ModelWeights, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
+    let raw = weights.tensor_f32(&format!("{prefix}.weight"))?;
     ensure!(raw.len() == out_dim * in_dim, "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}", raw.len(), out_dim, in_dim);
     let weight_t = transpose(&raw, out_dim, in_dim);
-    let bias = tensor_f32(tensors, &format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0; out_dim]);
+    let bias = weights.tensor_f32(&format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0; out_dim]);
     Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
 }
 
@@ -892,6 +1135,124 @@ mod tests {
         let device = device();
         let generated = model.generate(&device, &[3, 4], 5).unwrap();
         assert_eq!(generated.len(), 5);
+    }
+
+    /// V3拡張(2026-09-13続き4追加): aux-loss-free補正
+    /// (`e_score_correction_bias`)+group-limited routing(`n_group=4`/
+    /// `topk_group=2`)+sigmoidスコアリングを全て有効にした構成
+    /// (`tiny_with_moe_v3`)でもパニックせず完走すること。
+    #[test]
+    fn deepseekmoe_v3_extensions_generate_without_panicking() {
+        let config = DeepseekConfig::tiny_with_moe_v3(64);
+        assert_eq!(config.topk_method, "noaux_tc");
+        assert_eq!(config.scoring_func, "sigmoid");
+        assert!(config.n_group > 1);
+        let model = DeepseekModel::load_random(config, 31);
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 6).unwrap();
+        assert_eq!(generated.len(), 6);
+    }
+
+    /// group-limited routingが実際にグループ外のエキスパートを除外して
+    /// いることの間接検証: `topk_group=1`(最も絞り込んだ設定)でも
+    /// `num_experts_per_tok`個選べる(選択候補がグループ内に十分残る)
+    /// ことを確認する(境界条件、`n_group=4`・グループサイズ2・
+    /// `num_experts_per_tok=2`なら`topk_group=1`でグループ内2個ちょうど
+    /// 選べる)。
+    #[test]
+    fn deepseekmoe_v3_group_limited_routing_with_minimal_topk_group_works() {
+        let mut config = DeepseekConfig::tiny_with_moe_v3(64);
+        config.topk_group = 1;
+        let model = DeepseekModel::load_random(config, 32);
+        let device = device();
+        let generated = model.generate(&device, &[4, 5], 5).unwrap();
+        assert_eq!(generated.len(), 5);
+    }
+
+    /// **2026-09-13(続き5)追加**: 分割済み(sharded)safetensors
+    /// チェックポイント(`model.safetensors.index.json`+複数の
+    /// `.safetensors`ファイル)を実際にディスクへ書き出し、
+    /// `DeepseekModel::load`が正しく読み込めることを検証する。
+    /// `deepseek-ai/DeepSeek-V2-Lite-Chat`が実際に4分割・31.4GBで
+    /// 配布されていることを確認した上で追加した`ModelWeights::
+    /// load_sharded`の直接的な回帰テスト(実際にダウンロードするには
+    /// 大きすぎるため、合成の決定的な値で埋めた極小チェックポイントを
+    /// 2ファイルに分割して同じ経路を検証する)。
+    #[test]
+    fn load_parses_sharded_safetensors_checkpoint_split_across_two_files() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use std::collections::HashMap;
+
+        let vocab = 10usize;
+        let hidden = 8usize;
+        let num_heads = 2usize;
+        let kv_lora_rank = 4usize;
+        let qk_nope = 2usize;
+        let qk_rope = 2usize;
+        let v_dim = 2usize;
+        let q_head_dim = qk_nope + qk_rope;
+        let intermediate = 8usize;
+        let kv_a_dim = kv_lora_rank + qk_rope;
+        let kv_b_out = num_heads * (qk_nope + v_dim);
+        let attn_out_dim = num_heads * v_dim;
+
+        let mut rng = SplitMix64::new(777);
+        let push = |buffers: &mut Vec<(String, Vec<usize>, Vec<u8>)>, name: String, shape: Vec<usize>, rng: &mut SplitMix64| {
+            let len: usize = shape.iter().product();
+            let bytes: Vec<u8> = random_vec(rng, len, 0.1).iter().flat_map(|v| v.to_le_bytes()).collect();
+            buffers.push((name, shape, bytes));
+        };
+
+        // シャード1: embed_tokens + attention側の前半(q_proj〜kv_a_layernorm)。
+        let mut shard1: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        push(&mut shard1, "model.embed_tokens.weight".to_string(), vec![vocab, hidden], &mut rng);
+        push(&mut shard1, "model.layers.0.input_layernorm.weight".to_string(), vec![hidden], &mut rng);
+        push(&mut shard1, "model.layers.0.self_attn.q_proj.weight".to_string(), vec![num_heads * q_head_dim, hidden], &mut rng);
+        push(&mut shard1, "model.layers.0.self_attn.kv_a_proj_with_mqa.weight".to_string(), vec![kv_a_dim, hidden], &mut rng);
+        push(&mut shard1, "model.layers.0.self_attn.kv_a_layernorm.weight".to_string(), vec![kv_lora_rank], &mut rng);
+
+        // シャード2: attention側の後半(kv_b_proj〜o_proj)+MLP+最終norm。
+        let mut shard2: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        push(&mut shard2, "model.layers.0.self_attn.kv_b_proj.weight".to_string(), vec![kv_b_out, kv_lora_rank], &mut rng);
+        push(&mut shard2, "model.layers.0.self_attn.o_proj.weight".to_string(), vec![hidden, attn_out_dim], &mut rng);
+        push(&mut shard2, "model.layers.0.post_attention_layernorm.weight".to_string(), vec![hidden], &mut rng);
+        push(&mut shard2, "model.layers.0.mlp.gate_proj.weight".to_string(), vec![intermediate, hidden], &mut rng);
+        push(&mut shard2, "model.layers.0.mlp.up_proj.weight".to_string(), vec![intermediate, hidden], &mut rng);
+        push(&mut shard2, "model.layers.0.mlp.down_proj.weight".to_string(), vec![hidden, intermediate], &mut rng);
+        push(&mut shard2, "model.norm.weight".to_string(), vec![hidden], &mut rng);
+
+        let dir = std::env::temp_dir().join(format!("open-cuda-llm-deepseek-sharded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut weight_map: HashMap<String, String> = HashMap::new();
+        for (shard_name, buffers) in [("model-00001-of-00002.safetensors", &shard1), ("model-00002-of-00002.safetensors", &shard2)] {
+            let mut views: HashMap<String, TensorView> = HashMap::new();
+            for (name, shape, bytes) in buffers {
+                views.insert(name.clone(), TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap());
+                weight_map.insert(name.clone(), shard_name.to_string());
+            }
+            let serialized = safetensors::serialize(&views, &None).unwrap();
+            std::fs::write(dir.join(shard_name), serialized).unwrap();
+        }
+
+        let index_json = serde_json::json!({ "metadata": { "total_size": 0 }, "weight_map": weight_map });
+        std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&index_json).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"vocab_size":{vocab},"hidden_size":{hidden},"num_hidden_layers":1,"num_attention_heads":{num_heads},
+                "kv_lora_rank":{kv_lora_rank},"qk_nope_head_dim":{qk_nope},"qk_rope_head_dim":{qk_rope},"v_head_dim":{v_dim},
+                "intermediate_size":{intermediate},"tie_word_embeddings":true}}"#
+            ),
+        )
+        .unwrap();
+
+        let model = DeepseekModel::load(&dir).expect("DeepseekModel::load should read a sharded checkpoint split across two safetensors files");
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 4).unwrap();
+        assert_eq!(generated.len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// decoupled RoPE配線の健全性: rope専用部分を意図的に無効化(cos=1,
