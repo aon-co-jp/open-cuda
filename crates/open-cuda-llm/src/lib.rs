@@ -47,6 +47,12 @@ use serde::Deserialize;
 mod qwen_arch;
 pub use qwen_arch::{QwenConfig, QwenModel};
 
+/// DeepSeek-V2/V3系Multi-head Latent Attention(MLA)アーキテクチャの
+/// 新しいforward pass経路(2026-09-13新設、`deepseek_arch.rs`のモジュール
+/// doc参照)。`qwen_arch`同様、既存の`GptModel`経路とは独立・並行。
+mod deepseek_arch;
+pub use deepseek_arch::{DeepseekConfig, DeepseekModel};
+
 /// デコーダの設定(GPT系アーキテクチャの最小構成)。
 #[derive(Debug, Clone)]
 pub struct GptConfig {

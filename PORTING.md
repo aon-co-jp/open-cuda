@@ -17,6 +17,41 @@
 
 他プロジェクトへ`open-cuda`の設計パターンを移植する際の要点をまとめる。
 
+## -1. `open-cuda-llm::DeepseekModel`(本物のDeepSeek-V2/V3 MLA、2026-09-13新設)
+
+世界中の言語(英語・日本語・中国語)でのGoogle検索・GitHub調査
+(2026-09-13)に基づき`deepseek_arch.rs`を新設した。移植時の要点:
+
+- **実チェックポイントのフィールド名**(`deepseek-ai/
+  DeepSeek-V2-Lite-Chat/config.json`実物で確認済み):
+  `q_lora_rank`(小型モデルは`null`)、`kv_lora_rank`、
+  `qk_nope_head_dim`、`qk_rope_head_dim`、`v_head_dim`。
+  テンソル名: `q_a_proj`/`q_a_layernorm`/`q_b_proj`(query低ランク、
+  `q_lora_rank=null`なら`q_proj`直結)、`kv_a_proj_with_mqa`/
+  `kv_a_layernorm`/`kv_b_proj`(KV低ランク、MLAの核心)、`o_proj`。
+- **forward順序**: down-proj→RMSNorm→up-projで各ヘッドを展開し、
+  「RoPE無しnope部分」と「RoPE有りrope専用部分(KVは全ヘッドMQA的に
+  共有)」に分割するdecoupled RoPE。詳細擬似コードは
+  `deepseek_arch.rs`のモジュールdoc参照。
+- **既存の共有Attentionヘルパーが使えない**: `q`/`k`次元
+  (`qk_nope_head_dim+qk_rope_head_dim`)と`v`次元(`v_head_dim`)が
+  非対称(実チェックポイントで192 vs 128)なため、
+  `opencuda_blas::scaled_dot_product_attention`(単一head_dim前提)は
+  再利用不可——素朴なCPUループでQKᵀ・softmax・P·Vを直接計算する必要が
+  ある。
+- **意図的にスコープ外にしたもの**(誇張しない): MoE
+  (DeepSeekMoE、`n_routed_experts`等)、absorb最適化(KV up-projを
+  Q/O側へ吸収してKVキャッシュを圧縮ベクトルのまま保持する高速化)、
+  YaRN RoPEスケーリング、Attentionコアのvulkan/DXILディスパッチ。
+  MoE未対応のため、**実在の公開チェックポイントは`first_k_dense_replace`
+  以降の層(ほぼ全部)でロード失敗する**——これは意図した制約であり
+  バグではない。
+- `aruaru-llm`側の連携(`deepseek_generation.rs`): Qwenの
+  `QWEN_CATALOG`のような自動ダウンロードカタログは意図的に設けて
+  いない(上記の理由で「ダウンロードすれば動く」と言えるリポジトリが
+  無いため)。かわりにローカルディレクトリを直接指定する
+  `POST /v1/deepseek/select { "dir": "..." }`を追加した。
+
 ## 0. `open-cuda-llm::GptModel`のModel Folding機能(2026-09-01新設)
 
 `analyze_layer_redundancy`/`prune_redundant_layers`/

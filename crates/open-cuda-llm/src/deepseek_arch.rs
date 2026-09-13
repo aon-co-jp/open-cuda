@@ -1,0 +1,656 @@
+//! DeepSeek-V2/V3系 Multi-head Latent Attention (MLA) アーキテクチャの
+//! forward pass実装(2026-09-13新設)。
+//!
+//! ## 経緯・正直な開示
+//!
+//! これまで`lib.rs`/`qwen_arch.rs`にあった`enable_mla_kv_compression*`は
+//! **「MLA風」の事後(post-hoc)retrofit**——既に学習済みの標準Attention
+//! モデルのKVキャッシュを、ランダム射影またはPCAで低ランク圧縮する
+//! だけのものであり、実際のDeepSeek-V2/V3が学習時から持つMLAとは別物
+//! だった(このモジュールのdocコメントで前回明記した通り)。
+//!
+//! このモジュールは、世界中の言語(英語・日本語・中国語)でのGoogle検索・
+//! GitHub調査(2026-09-13実施)で確認した実際のDeepSeek-V2/V2-Lite/V3の
+//! チェックポイント構造・forward計算順序に基づき、**学習済みの低ランク
+//! 射影重みをそのまま読み込んで動く**、本物のMLA構造を実装する。
+//! 出典:
+//! - <https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat/blob/main/config.json>
+//!   (実在するconfig.jsonのフィールド名・値をそのまま採用)
+//! - DeepSeek-V2論文 <https://arxiv.org/pdf/2405.04434>
+//! - <https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py>
+//!   (forward計算の実際の順序)
+//! - `qwen_arch.rs`(このクレートの既存の「実チェックポイントを読み込んで
+//!   動く新アーキテクチャモジュール」のお手本、RmsNorm/RoPE/SwiGLU MLP
+//!   パターンを踏襲する)
+//!
+//! ## MLA計算の要点(モジュールdocに要約、詳細は`forward_step`のコメント)
+//!
+//! - Query側: `hidden --q_a_proj--> q_lora_rank --RMSNorm--q_b_proj-->`
+//!   `num_heads*(qk_nope_head_dim+qk_rope_head_dim)`という2段階低ランク
+//!   射影(`q_lora_rank`が`None`の小型モデルでは`q_proj`一発)。
+//! - KV側: `hidden --kv_a_proj_with_mqa--> kv_lora_rank + qk_rope_head_dim`
+//!   (後半`qk_rope_head_dim`分はMQA的に**全ヘッド共有**のRoPE専用鍵)、
+//!   前半`kv_lora_rank`分を`RMSNorm`してから`kv_b_proj`で
+//!   `num_heads*(qk_nope_head_dim+v_head_dim)`へ展開する。
+//! - **decoupled RoPE**: 各ヘッドの`q`/`k`は「RoPEを適用しないnope部分」と
+//!   「RoPEを適用するrope専用部分」に分割され、RoPEはrope専用部分にしか
+//!   掛からない(この点が通常のGQA/MHAのRoPEと構造的に異なる)。
+//!
+//! ## スコープの限界(誇張しない、`qwen_arch.rs`と同じ開示方針)
+//!
+//! - **MoE(DeepSeekMoE)は今回のスコープ外**——調査結果で明確に推奨された
+//!   通り、まずMLA構造そのものの正しさを検証するため、MLP層は
+//!   `qwen_arch.rs`と同じdense SwiGLUのみをサポートする。したがって
+//!   `load()`は「MLA構成のattentionだが全層dense FFN」という
+//!   チェックポイントしか完全には読み込めない——**実在の
+//!   DeepSeek-V2/V2-Lite/V3本体は`first_k_dense_replace`以降の層がMoEに
+//!   なっている**ため、それらの層の`mlp.*`テンソル(`mlp.experts.*`等)は
+//!   この`load()`では読めない(dense層である先頭`first_k_dense_replace`層
+//!   ぶんだけは読める設計だが、それ以降の層まで含めた完全なロードは
+//!   MoE実装が別途必要な次の増分)。MLA部分(`self_attn.*`)のテンソル名は
+//!   実チェックポイントと完全に一致させてあるので、MoE実装後は
+//!   attention側の変更なしにMLP部分だけ差し替えられる設計にしてある。
+//! - **absorb最適化(推論高速化)は未実装**——調査で判明した通り、
+//!   `kv_b_proj`のK側/V側をQ/O側へ数学的に吸収してKVキャッシュを
+//!   圧縮ベクトルのまま保持する最適化があるが、今回は正しさの検証を
+//!   優先し、`kv_b_proj`で毎ステップ素直に展開してから
+//!   フル精度`k`/`v`をキャッシュする(`KvCacheHead`を`proj=None`で
+//!   使う、後述)。したがってメモリ削減効果は実現できていない
+//!   ——absorbは正しさが確定してからの最適化増分とする。
+//! - **YaRN RoPEスケーリング(`rope_scaling`)は未対応**——実際の
+//!   DeepSeek-V2-Liteの`config.json`は`rope_scaling.type="yarn"`を
+//!   使っているが、YaRNの周波数補間・`mscale`補正は別途実装が要る
+//!   ため、今回は`qwen_arch.rs`と同じ素朴なRoPE(`rope_theta`のみ)に
+//!   とどめる。長コンテキストでの精度はYaRN無しでは実際のモデルと
+//!   一致しない。
+//! - `scaled_dot_product_attention`(既存共有ヘルパー)は**再利用できない**
+//!   ——MLAは`q`/`k`の次元(`qk_nope_head_dim+qk_rope_head_dim`)と`v`の
+//!   次元(`v_head_dim`)が非対称(実チェックポイントでは192 vs 128)で、
+//!   既存ヘルパーは`q`/`k`/`v`が同一`head_dim`であることを前提にした
+//!   単一引数設計のため使えない。このモジュールでは
+//!   QKᵀ・softmax・P·Vを素朴なCPUループで直接計算する(GPU
+//!   ディスパッチ・Vulkan/DXILオフロードは今回対応しない——`Linear`側の
+//!   射影計算〈`q_a_proj`等〉はGPU対応する`Linear::forward`をそのまま
+//!   使うが、Attentionコア自体はCPUのみ)。
+//! - この開発機(GT730、VRAM 2GB)では実DeepSeekモデル(V2-Liteでも
+//!   15.7Bパラメータ)は実行不可能なため、実重みでの検証は構造的な
+//!   単体テスト(ランダム重み・極小構成)に限られる——`qwen_arch.rs`が
+//!   Qwen2.5-0.5Bですら実行不可能だったのと同じ制約。
+
+use std::path::Path;
+
+use anyhow::{ensure, Context, Result};
+use opencuda_core::GpuDevice;
+
+use super::{argmax, apply_repetition_penalty, random_vec, tensor_f32, transpose, KvCacheHead, Linear, SplitMix64};
+
+/// DeepSeek-V2/V3系MLAアーキテクチャの設定。実在する
+/// `DeepSeek-V2-Lite-Chat/config.json`のフィールド名にそのまま対応する
+/// (2026-09-13のGoogle/GitHub調査で確認、フィールド値の出典は
+/// モジュールdoc参照)。MoE関連フィールド(`n_routed_experts`等)は
+/// このモジュールのスコープ外(モジュールdoc参照)のため意図的に含めない。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DeepseekConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    #[serde(rename = "num_hidden_layers")]
+    pub num_layers: usize,
+    #[serde(rename = "num_attention_heads")]
+    pub num_heads: usize,
+    /// Query側低ランク圧縮の次元。`null`(小型モデル、例:
+    /// DeepSeek-V2-Lite)なら`q_proj`を直接使い、`q_a_proj`/`q_b_proj`
+    /// 二段構成は使わない。
+    #[serde(default)]
+    pub q_lora_rank: Option<usize>,
+    /// KV側低ランク圧縮の次元(MLAの核心、必須)。
+    pub kv_lora_rank: usize,
+    /// RoPEを適用しない側のQ/K次元。
+    pub qk_nope_head_dim: usize,
+    /// RoPEを適用する側のQ/K次元(decoupled RoPE、全ヘッド共有のK側を
+    /// `kv_a_proj_with_mqa`の後半として生成する)。
+    pub qk_rope_head_dim: usize,
+    /// Value側の次元(`qk_nope_head_dim+qk_rope_head_dim`とは独立)。
+    pub v_head_dim: usize,
+    pub intermediate_size: usize,
+    #[serde(default = "default_max_seq_len")]
+    #[serde(rename = "max_position_embeddings")]
+    pub max_seq_len: usize,
+    #[serde(default = "default_rms_eps")]
+    pub rms_norm_eps: f32,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+}
+
+fn default_max_seq_len() -> usize {
+    32768
+}
+fn default_rms_eps() -> f32 {
+    1e-6
+}
+fn default_rope_theta() -> f32 {
+    10_000.0
+}
+
+impl DeepseekConfig {
+    /// テスト用の極小構成(`q_lora_rank=None`、実DeepSeek-V2-Liteの
+    /// 「query側lora無し」パスを再現)。実運用サイズではない。
+    pub fn tiny(vocab_size: usize) -> Self {
+        Self {
+            vocab_size,
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            q_lora_rank: None,
+            kv_lora_rank: 8,
+            qk_nope_head_dim: 4,
+            qk_rope_head_dim: 4,
+            v_head_dim: 4,
+            intermediate_size: 64,
+            max_seq_len: 256,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: true,
+        }
+    }
+
+    /// [`tiny`]のquery側lora有り版(実DeepSeek-V3が使う`q_a_proj`/
+    /// `q_b_proj`二段構成の経路もテストするため)。
+    pub fn tiny_with_q_lora(vocab_size: usize) -> Self {
+        Self { q_lora_rank: Some(6), ..Self::tiny(vocab_size) }
+    }
+
+    fn q_head_dim(&self) -> usize {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+}
+
+struct RmsNorm {
+    weight: Vec<f32>,
+    eps: f32,
+}
+
+impl RmsNorm {
+    fn identity(dim: usize, eps: f32) -> Self {
+        Self { weight: vec![1.0; dim], eps }
+    }
+
+    fn forward_row(&self, x: &mut [f32]) {
+        let dim = x.len();
+        let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+        let inv_rms = 1.0 / (ms + self.eps).sqrt();
+        for (v, w) in x.iter_mut().zip(&self.weight) {
+            *v = *v * inv_rms * w;
+        }
+    }
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// `qwen_arch::rope_cos_sin`と同じ"rotate_half"方式(このモジュール専用に
+/// 複製——`qk_rope_head_dim`はQwenの`head_dim`とは無関係な独立の次元の
+/// ため、共有ヘルパー化するメリットが薄く、各アーキテクチャモジュールが
+/// 自己完結する既存方針〈`qwen_arch.rs`のモジュールdoc参照〉に合わせる)。
+fn rope_cos_sin(rope_dim: usize, theta: f32, pos: usize) -> (Vec<f32>, Vec<f32>) {
+    let half = rope_dim / 2;
+    let mut cos = vec![0.0f32; half];
+    let mut sin = vec![0.0f32; half];
+    for i in 0..half {
+        let freq = 1.0f32 / theta.powf((2 * i) as f32 / rope_dim as f32);
+        let angle = pos as f32 * freq;
+        cos[i] = angle.cos();
+        sin[i] = angle.sin();
+    }
+    (cos, sin)
+}
+
+fn apply_rope(x: &mut [f32], cos: &[f32], sin: &[f32]) {
+    let half = cos.len();
+    debug_assert_eq!(x.len(), half * 2);
+    for i in 0..half {
+        let x1 = x[i];
+        let x2 = x[i + half];
+        x[i] = x1 * cos[i] - x2 * sin[i];
+        x[i + half] = x2 * cos[i] + x1 * sin[i];
+    }
+}
+
+struct DeepseekLayer {
+    input_layernorm: RmsNorm,
+    /// `q_lora_rank`が`None`の場合に使う直接射影(`hidden -> num_heads*q_head_dim`)。
+    q_proj: Option<Linear>,
+    /// `q_lora_rank`が`Some`の場合に使う二段射影。
+    q_a_proj: Option<Linear>,
+    q_a_layernorm: Option<RmsNorm>,
+    q_b_proj: Option<Linear>,
+    /// `hidden -> kv_lora_rank + qk_rope_head_dim`(常に存在、MLAの核心)。
+    kv_a_proj_with_mqa: Linear,
+    /// `dim = kv_lora_rank`。
+    kv_a_layernorm: RmsNorm,
+    /// `kv_lora_rank -> num_heads*(qk_nope_head_dim+v_head_dim)`。
+    kv_b_proj: Linear,
+    /// `num_heads*v_head_dim -> hidden`。
+    o_proj: Linear,
+    post_attention_layernorm: RmsNorm,
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl DeepseekLayer {
+    fn random(rng: &mut SplitMix64, cfg: &DeepseekConfig) -> Self {
+        let hidden = cfg.hidden_size;
+        let q_head_dim = cfg.q_head_dim();
+        let kv_a_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
+        let kv_b_out = cfg.num_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim);
+        let attn_out_dim = cfg.num_heads * cfg.v_head_dim;
+
+        let (q_proj, q_a_proj, q_a_layernorm, q_b_proj) = match cfg.q_lora_rank {
+            None => (Some(Linear::random(rng, hidden, cfg.num_heads * q_head_dim)), None, None, None),
+            Some(q_lora_rank) => {
+                (None, Some(Linear::random(rng, hidden, q_lora_rank)), Some(RmsNorm::identity(q_lora_rank, cfg.rms_norm_eps)), Some(Linear::random(rng, q_lora_rank, cfg.num_heads * q_head_dim)))
+            }
+        };
+
+        Self {
+            input_layernorm: RmsNorm::identity(hidden, cfg.rms_norm_eps),
+            q_proj,
+            q_a_proj,
+            q_a_layernorm,
+            q_b_proj,
+            kv_a_proj_with_mqa: Linear::random(rng, hidden, kv_a_dim),
+            kv_a_layernorm: RmsNorm::identity(cfg.kv_lora_rank, cfg.rms_norm_eps),
+            kv_b_proj: Linear::random(rng, cfg.kv_lora_rank, kv_b_out),
+            o_proj: Linear::random(rng, attn_out_dim, hidden),
+            post_attention_layernorm: RmsNorm::identity(hidden, cfg.rms_norm_eps),
+            gate_proj: Linear::random(rng, hidden, cfg.intermediate_size),
+            up_proj: Linear::random(rng, hidden, cfg.intermediate_size),
+            down_proj: Linear::random(rng, cfg.intermediate_size, hidden),
+        }
+    }
+}
+
+/// ヘッドごとのKVキャッシュ(`num_heads`本、absorb最適化なしのため
+/// フル精度で`k`〈`q_head_dim`長〉/`v`〈`v_head_dim`長〉を保持する——
+/// モジュールdocの「absorb未実装」参照)。既存の[`KvCacheHead`]を
+/// `proj=None`で流用する(この経路では`k`/`v`の長さが異なっても問題
+/// ない——`KvCacheHead::push`/`current_kv`の`None`分岐は単純な
+/// `Vec`への追記・複製のみで、長さの一致を仮定していない)。
+struct LayerCache {
+    kv: Vec<KvCacheHead>,
+}
+
+impl LayerCache {
+    fn new(num_heads: usize) -> Self {
+        Self { kv: (0..num_heads).map(|_| KvCacheHead::empty()).collect() }
+    }
+}
+
+pub struct DeepseekModel {
+    config: DeepseekConfig,
+    embed_tokens: Vec<f32>,
+    layers: Vec<DeepseekLayer>,
+    norm: RmsNorm,
+    lm_head: Option<Linear>,
+}
+
+impl DeepseekModel {
+    pub fn load_random(config: DeepseekConfig, seed: u64) -> Self {
+        let mut rng = SplitMix64::new(seed);
+        let embed_tokens = random_vec(&mut rng, config.vocab_size * config.hidden_size, 0.02);
+        let layers = (0..config.num_layers).map(|_| DeepseekLayer::random(&mut rng, &config)).collect();
+        let norm = RmsNorm::identity(config.hidden_size, config.rms_norm_eps);
+        let lm_head = if config.tie_word_embeddings { None } else { Some(Linear::random(&mut rng, config.hidden_size, config.vocab_size)) };
+        Self { config, embed_tokens, layers, norm, lm_head }
+    }
+
+    /// 実在の学習済み重み(`config.json` + 単一ファイルの
+    /// `model.safetensors`)を読み込む。**正直な開示**: モジュールdoc
+    /// 参照——MoE層(`mlp.experts.*`)には対応していないため、実在する
+    /// フルサイズのDeepSeek-V2/V2-Lite/V3チェックポイントは
+    /// `first_k_dense_replace`以降の層で必ず失敗する(このメソッドは
+    /// 「MLA構成だが全層dense FFN」の仮想的/カスタムなチェックポイント、
+    /// または将来のMoE対応後に使うための土台)。分割済み
+    /// (`model-00001-of-00002.safetensors`等)のsharded checkpointにも
+    /// 未対応(`QwenModel::load`と同じ制約)。
+    pub fn load(dir: &Path) -> Result<Self> {
+        let config_bytes = std::fs::read(dir.join("config.json")).with_context(|| format!("open-cuda-llm: failed to read {}/config.json", dir.display()))?;
+        let config: DeepseekConfig = serde_json::from_slice(&config_bytes).context("open-cuda-llm: failed to parse DeepSeek config.json")?;
+        ensure!(config.num_heads > 0, "open-cuda-llm: num_attention_heads must be > 0");
+        ensure!(config.qk_rope_head_dim % 2 == 0, "open-cuda-llm: qk_rope_head_dim ({}) must be even (rotate_half RoPE pairs dimensions)", config.qk_rope_head_dim);
+        if let Some(q_lora_rank) = config.q_lora_rank {
+            ensure!(q_lora_rank > 0, "open-cuda-llm: q_lora_rank, when present, must be > 0");
+        }
+        ensure!(config.kv_lora_rank > 0, "open-cuda-llm: kv_lora_rank must be > 0");
+
+        let weights_path = dir.join("model.safetensors");
+        let data = std::fs::read(&weights_path).with_context(|| format!("open-cuda-llm: failed to read {}", weights_path.display()))?;
+        let tensors = safetensors::SafeTensors::deserialize(&data).context("open-cuda-llm: failed to parse model.safetensors")?;
+
+        let hidden = config.hidden_size;
+        let q_head_dim = config.q_head_dim();
+        let kv_a_dim = config.kv_lora_rank + config.qk_rope_head_dim;
+        let kv_b_out = config.num_heads * (config.qk_nope_head_dim + config.v_head_dim);
+        let attn_out_dim = config.num_heads * config.v_head_dim;
+
+        let embed_tokens = tensor_f32(&tensors, "model.embed_tokens.weight")?;
+        ensure!(embed_tokens.len() == config.vocab_size * hidden, "open-cuda-llm: model.embed_tokens.weight has {} elements, expected {}x{}", embed_tokens.len(), config.vocab_size, hidden);
+
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for i in 0..config.num_layers {
+            let p = format!("model.layers.{i}");
+            let sa = format!("{p}.self_attn");
+
+            let (q_proj, q_a_proj, q_a_layernorm, q_b_proj) = match config.q_lora_rank {
+                None => (Some(load_linear(&tensors, &format!("{sa}.q_proj"), hidden, config.num_heads * q_head_dim)?), None, None, None),
+                Some(q_lora_rank) => (
+                    None,
+                    Some(load_linear(&tensors, &format!("{sa}.q_a_proj"), hidden, q_lora_rank)?),
+                    Some(RmsNorm { weight: tensor_f32(&tensors, &format!("{sa}.q_a_layernorm.weight"))?, eps: config.rms_norm_eps }),
+                    Some(load_linear(&tensors, &format!("{sa}.q_b_proj"), q_lora_rank, config.num_heads * q_head_dim)?),
+                ),
+            };
+
+            layers.push(DeepseekLayer {
+                input_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
+                q_proj,
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+                kv_a_proj_with_mqa: load_linear(&tensors, &format!("{sa}.kv_a_proj_with_mqa"), hidden, kv_a_dim)?,
+                kv_a_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{sa}.kv_a_layernorm.weight"))?, eps: config.rms_norm_eps },
+                kv_b_proj: load_linear(&tensors, &format!("{sa}.kv_b_proj"), config.kv_lora_rank, kv_b_out)?,
+                o_proj: load_linear(&tensors, &format!("{sa}.o_proj"), attn_out_dim, hidden)?,
+                post_attention_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
+                gate_proj: load_linear(&tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)
+                    .with_context(|| format!("open-cuda-llm: layer {i}: dense mlp.gate_proj not found — this layer is likely a MoE layer, which DeepseekModel::load does not support yet (see module docs)"))?,
+                up_proj: load_linear(&tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
+                down_proj: load_linear(&tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
+            });
+        }
+
+        let norm = RmsNorm { weight: tensor_f32(&tensors, "model.norm.weight")?, eps: config.rms_norm_eps };
+
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            let raw = tensor_f32(&tensors, "lm_head.weight")?;
+            ensure!(raw.len() == config.vocab_size * hidden, "open-cuda-llm: lm_head.weight has {} elements, expected {}x{}", raw.len(), config.vocab_size, hidden);
+            let weight_t = transpose(&raw, config.vocab_size, hidden);
+            Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+        };
+
+        Ok(Self { config, embed_tokens, layers, norm, lm_head })
+    }
+
+    fn new_caches(&self) -> Vec<LayerCache> {
+        (0..self.config.num_layers).map(|_| LayerCache::new(self.config.num_heads)).collect()
+    }
+
+    /// 1トークンぶんを処理し、次トークン予測のlogits(`vocab_size`長)を返す。
+    /// 計算順序はDeepSeek-V2の`modeling_deepseek.py`(モジュールdoc参照)の
+    /// 実装通り(query低ランク展開 → KV低ランク展開 → decoupled RoPE →
+    /// nope/rope結合 → 素朴なattention)。
+    fn forward_step(&self, device: &dyn GpuDevice, token_id: u32, caches: &mut [LayerCache]) -> Result<Vec<f32>> {
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+        let num_heads = cfg.num_heads;
+        let nope_dim = cfg.qk_nope_head_dim;
+        let rope_dim = cfg.qk_rope_head_dim;
+        let v_dim = cfg.v_head_dim;
+        let q_head_dim = cfg.q_head_dim();
+        let pos = caches[0].kv[0].n;
+        let (cos, sin) = rope_cos_sin(rope_dim, cfg.rope_theta, pos);
+
+        let tok = token_id as usize;
+        ensure!(tok < cfg.vocab_size, "open-cuda-llm: token id {tok} out of vocab range {}", cfg.vocab_size);
+        let mut hidden_state = self.embed_tokens[tok * hidden..(tok + 1) * hidden].to_vec();
+
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            // ---- Attention サブ層(pre-norm) ----
+            let mut normed = hidden_state.clone();
+            layer.input_layernorm.forward_row(&mut normed);
+
+            // Query側: 二段低ランク射影(q_lora_rank=Some)か直接射影(None)か。
+            let q_full = match (&layer.q_a_proj, &layer.q_a_layernorm, &layer.q_b_proj) {
+                (Some(q_a), Some(q_a_ln), Some(q_b)) => {
+                    let mut lat = q_a.forward(device, &normed, 1)?;
+                    q_a_ln.forward_row(&mut lat);
+                    q_b.forward(device, &lat, 1)?
+                }
+                _ => layer.q_proj.as_ref().expect("open-cuda-llm: DeepseekLayer must have either q_proj or q_a_proj/q_b_proj").forward(device, &normed, 1)?,
+            };
+            debug_assert_eq!(q_full.len(), num_heads * q_head_dim);
+
+            // KV側: 常に低ランク射影(MLAの核心)。後半`rope_dim`分は
+            // 全ヘッド共有のMQA的RoPE専用鍵(`k_pe`)。
+            let kv_a = layer.kv_a_proj_with_mqa.forward(device, &normed, 1)?;
+            debug_assert_eq!(kv_a.len(), cfg.kv_lora_rank + rope_dim);
+            let mut c_kv = kv_a[..cfg.kv_lora_rank].to_vec();
+            let mut k_pe_shared = kv_a[cfg.kv_lora_rank..].to_vec();
+            layer.kv_a_layernorm.forward_row(&mut c_kv);
+            apply_rope(&mut k_pe_shared, &cos, &sin); // 全ヘッドで共有するため1回だけ回転させる
+
+            let kv_full = layer.kv_b_proj.forward(device, &c_kv, 1)?;
+            debug_assert_eq!(kv_full.len(), num_heads * (nope_dim + v_dim));
+
+            let mut context = vec![0.0f32; num_heads * v_dim];
+            for h in 0..num_heads {
+                // ---- decoupled RoPE: nope部分はそのまま、rope部分だけ回転 ----
+                let q_h = &q_full[h * q_head_dim..(h + 1) * q_head_dim];
+                let mut q_h_rot = vec![0.0f32; q_head_dim];
+                q_h_rot[..nope_dim].copy_from_slice(&q_h[..nope_dim]);
+                let mut q_pe = q_h[nope_dim..].to_vec();
+                apply_rope(&mut q_pe, &cos, &sin);
+                q_h_rot[nope_dim..].copy_from_slice(&q_pe);
+
+                let kv_h = &kv_full[h * (nope_dim + v_dim)..(h + 1) * (nope_dim + v_dim)];
+                let k_nope_h = &kv_h[..nope_dim];
+                let v_h = &kv_h[nope_dim..];
+                let mut k_h = vec![0.0f32; q_head_dim];
+                k_h[..nope_dim].copy_from_slice(k_nope_h);
+                k_h[nope_dim..].copy_from_slice(&k_pe_shared); // 全ヘッド共有(MQA的)のk_peをそのまま結合
+
+                cache.kv[h].push(device, &k_h, v_h, None, None)?;
+
+                // ---- 素朴なattention(absorb最適化なし、モジュールdoc参照) ----
+                let (k_all, v_all) = cache.kv[h].current_kv(device, q_head_dim, None, None)?;
+                let n = cache.kv[h].n;
+                let scale = 1.0f32 / (q_head_dim as f32).sqrt();
+                let mut scores = vec![0.0f32; n];
+                for (t, score) in scores.iter_mut().enumerate() {
+                    let k_t = &k_all[t * q_head_dim..(t + 1) * q_head_dim];
+                    *score = q_h_rot.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale;
+                }
+                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f32;
+                for score in &mut scores {
+                    *score = (*score - max_score).exp();
+                    sum_exp += *score;
+                }
+                let out_h = &mut context[h * v_dim..(h + 1) * v_dim];
+                for (t, prob) in scores.iter().enumerate() {
+                    let weight = prob / sum_exp;
+                    let v_t = &v_all[t * v_dim..(t + 1) * v_dim];
+                    for (o, v) in out_h.iter_mut().zip(v_t) {
+                        *o += weight * v;
+                    }
+                }
+            }
+
+            let attn_out = layer.o_proj.forward(device, &context, 1)?;
+            for (h, a) in hidden_state.iter_mut().zip(&attn_out) {
+                *h += a;
+            }
+
+            // ---- MLP(SwiGLU、dense、MoE未対応)サブ層(pre-norm) ----
+            let mut normed2 = hidden_state.clone();
+            layer.post_attention_layernorm.forward_row(&mut normed2);
+            let gate = layer.gate_proj.forward(device, &normed2, 1)?;
+            let up = layer.up_proj.forward(device, &normed2, 1)?;
+            let mut mlp_hidden = vec![0.0f32; gate.len()];
+            for i in 0..gate.len() {
+                mlp_hidden[i] = silu(gate[i]) * up[i];
+            }
+            let mlp_out = layer.down_proj.forward(device, &mlp_hidden, 1)?;
+            for (h, m) in hidden_state.iter_mut().zip(&mlp_out) {
+                *h += m;
+            }
+        }
+
+        self.norm.forward_row(&mut hidden_state);
+
+        let logits = match &self.lm_head {
+            Some(head) => head.forward(device, &hidden_state, 1)?,
+            None => {
+                let mut logits = vec![0.0f32; cfg.vocab_size];
+                for (v, row) in logits.iter_mut().zip(self.embed_tokens.chunks_exact(hidden)) {
+                    *v = row.iter().zip(&hidden_state).map(|(a, b)| a * b).sum();
+                }
+                logits
+            }
+        };
+        Ok(logits)
+    }
+
+    pub fn generate(&self, device: &std::sync::Arc<dyn GpuDevice>, prompt_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+        self.generate_with_repetition_penalty(device, prompt_ids, max_new_tokens, 1.0)
+    }
+
+    pub fn generate_with_repetition_penalty(&self, device: &std::sync::Arc<dyn GpuDevice>, prompt_ids: &[u32], max_new_tokens: usize, penalty: f32) -> Result<Vec<u32>> {
+        ensure!(!prompt_ids.is_empty(), "open-cuda-llm: prompt must not be empty");
+        let device_ref = device.as_ref();
+        let mut caches = self.new_caches();
+        let mut logits = Vec::new();
+        for &id in prompt_ids {
+            logits = self.forward_step(device_ref, id, &mut caches)?;
+        }
+        let mut seen: std::collections::HashSet<u32> = prompt_ids.iter().copied().collect();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        for _ in 0..max_new_tokens {
+            if penalty != 1.0 {
+                apply_repetition_penalty(&mut logits, &seen, penalty);
+            }
+            let next = argmax(&logits);
+            generated.push(next);
+            seen.insert(next);
+            if generated.len() >= max_new_tokens {
+                break;
+            }
+            logits = self.forward_step(device_ref, next, &mut caches)?;
+        }
+        Ok(generated)
+    }
+}
+
+fn load_linear(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
+    let raw = tensor_f32(tensors, &format!("{prefix}.weight"))?;
+    ensure!(raw.len() == out_dim * in_dim, "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}", raw.len(), out_dim, in_dim);
+    let weight_t = transpose(&raw, out_dim, in_dim);
+    let bias = tensor_f32(tensors, &format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0; out_dim]);
+    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opencuda_cpu::CpuDevice;
+    use std::sync::Arc;
+
+    fn device() -> Arc<dyn GpuDevice> {
+        CpuDevice::new(0)
+    }
+
+    #[test]
+    fn generates_requested_number_of_tokens_without_panicking() {
+        let config = DeepseekConfig::tiny(64);
+        let model = DeepseekModel::load_random(config, 42);
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 8).unwrap();
+        assert_eq!(generated.len(), 8);
+        for &t in &generated {
+            assert!((t as usize) < 64, "generated token {t} out of vocab range");
+        }
+    }
+
+    /// `q_lora_rank=Some`(実DeepSeek-V3が使う二段query射影経路)でも
+    /// パニックせず完走すること。
+    #[test]
+    fn q_lora_rank_two_stage_query_projection_path_works() {
+        let config = DeepseekConfig::tiny_with_q_lora(64);
+        assert!(config.q_lora_rank.is_some());
+        let model = DeepseekModel::load_random(config, 7);
+        let device = device();
+        let generated = model.generate(&device, &[0, 1], 5).unwrap();
+        assert_eq!(generated.len(), 5);
+    }
+
+    /// `q_lora_rank=None`(実DeepSeek-V2-Liteが使う直接query射影経路)。
+    #[test]
+    fn q_lora_rank_none_direct_query_projection_path_works() {
+        let config = DeepseekConfig::tiny(64);
+        assert!(config.q_lora_rank.is_none());
+        let model = DeepseekModel::load_random(config, 8);
+        let device = device();
+        let generated = model.generate(&device, &[0, 1], 5).unwrap();
+        assert_eq!(generated.len(), 5);
+    }
+
+    /// 非対称なQ/K次元(`q_head_dim`=nope+rope)とV次元(`v_head_dim`)が
+    /// 異なっていても(実チェックポイントでは192 vs 128)、素朴な
+    /// attention実装が正しく動作すること(共有ヘルパーを再利用できない
+    /// 理由そのものを検証する回帰テスト)。
+    #[test]
+    fn asymmetric_qk_and_v_head_dims_do_not_panic() {
+        let mut config = DeepseekConfig::tiny(32);
+        config.qk_nope_head_dim = 6;
+        config.qk_rope_head_dim = 2;
+        config.v_head_dim = 3; // q_head_dim=8, v_head_dim=3 (非対称)
+        let model = DeepseekModel::load_random(config, 9);
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 6).unwrap();
+        assert_eq!(generated.len(), 6);
+    }
+
+    #[test]
+    fn generation_is_deterministic_for_a_fixed_seed() {
+        let device = device();
+        let a = DeepseekModel::load_random(DeepseekConfig::tiny(50), 99).generate(&device, &[1, 2], 6).unwrap();
+        let b = DeepseekModel::load_random(DeepseekConfig::tiny(50), 99).generate(&device, &[1, 2], 6).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// 異なるプロンプトが同一出力へ退化していないことのヘルスチェック
+    /// (RoPE/RMSNorm/低ランク射影配線のどこかが恒等的に無効化される
+    /// 実装ミスの検出用、`qwen_arch.rs`と同じ趣旨)。
+    #[test]
+    fn different_prompts_do_not_collapse_to_identical_output() {
+        let device = device();
+        let model = DeepseekModel::load_random(DeepseekConfig::tiny(80), 5);
+        let out1 = model.generate(&device, &[10], 6).unwrap();
+        let out2 = model.generate(&device, &[20], 6).unwrap();
+        assert_ne!(out1, out2, "different prompts should not collapse to identical output");
+    }
+
+    /// decoupled RoPE配線の健全性: rope専用部分を意図的に無効化(cos=1,
+    /// sin=0相当になる`rope_theta`を極端値にする、等)は難しいため、
+    /// 代わりに「位置を変えると出力が変わる」という間接的な検証を行う
+    /// (同一トークン列でも生成が1トークン進むごとに`pos`が変わり、
+    /// 何らかの形でRoPEが効いていることの健全性チェック)。
+    #[test]
+    fn generation_advances_position_dependent_state_across_steps() {
+        let device = device();
+        let model = DeepseekModel::load_random(DeepseekConfig::tiny(40), 11);
+        // 同じトークンを繰り返すプロンプトでも、位置依存(RoPE)が効いて
+        // いれば各ステップのlogitsは単純に同一値へ潰れない
+        // (退化していないことは`generate`が末尾で同一トークンの無限
+        // 繰り返しに陥っていないことでも間接的に確認できる)。
+        let generated = model.generate(&device, &[3, 3, 3], 10).unwrap();
+        assert_eq!(generated.len(), 10);
+        let all_same = generated.iter().all(|&t| t == generated[0]);
+        assert!(!all_same, "position-dependent RoPE should prevent total degeneration into a single repeated token");
+    }
+}
