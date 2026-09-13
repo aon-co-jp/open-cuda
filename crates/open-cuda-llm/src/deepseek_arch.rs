@@ -36,20 +36,61 @@
 //!   「RoPEを適用するrope専用部分」に分割され、RoPEはrope専用部分にしか
 //!   掛からない(この点が通常のGQA/MHAのRoPEと構造的に異なる)。
 //!
-//! ## スコープの限界(誇張しない、`qwen_arch.rs`と同じ開示方針)
+//! ## DeepSeekMoE対応(2026-09-13追記)
 //!
-//! - **MoE(DeepSeekMoE)は今回のスコープ外**——調査結果で明確に推奨された
-//!   通り、まずMLA構造そのものの正しさを検証するため、MLP層は
-//!   `qwen_arch.rs`と同じdense SwiGLUのみをサポートする。したがって
-//!   `load()`は「MLA構成のattentionだが全層dense FFN」という
-//!   チェックポイントしか完全には読み込めない——**実在の
-//!   DeepSeek-V2/V2-Lite/V3本体は`first_k_dense_replace`以降の層がMoEに
-//!   なっている**ため、それらの層の`mlp.*`テンソル(`mlp.experts.*`等)は
-//!   この`load()`では読めない(dense層である先頭`first_k_dense_replace`層
-//!   ぶんだけは読める設計だが、それ以降の層まで含めた完全なロードは
-//!   MoE実装が別途必要な次の増分)。MLA部分(`self_attn.*`)のテンソル名は
-//!   実チェックポイントと完全に一致させてあるので、MoE実装後は
-//!   attention側の変更なしにMLP部分だけ差し替えられる設計にしてある。
+//! 前回このモジュールを新設した時点では「MoEは今回のスコープ外」と
+//! 明記していたが、ユーザーから「MoE対応の為の設計と実装、開発の為に
+//! 世界中の言語でGoogle検索とGithub調査して」との指示を受け、実際に
+//! DeepSeekMoEを実装した。世界中の言語(英語・日本語・中国語)での
+//! 調査で確認した実チェックポイント構造(出典:
+//! <https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/model.safetensors.index.json>、
+//! <https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/config.json>、
+//! DeepSeek-V3公式推論実装 <https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py>、
+//! DeepSeek-V2論文 Sec.2.2 arXiv:2405.04434):
+//!
+//! - `config.json`のMoEフィールド: `n_routed_experts`・`n_shared_experts`・
+//!   `num_experts_per_tok`・`first_k_dense_replace`(この値未満の層番号は
+//!   dense、以降はMoE)・`moe_intermediate_size`・`norm_topk_prob`・
+//!   `scoring_func`・`routed_scaling_factor`。
+//! - テンソル名: dense層は`mlp.gate_proj`/`mlp.up_proj`/`mlp.down_proj`
+//!   (従来通り)。MoE層は`mlp.gate.weight`(ルーター、
+//!   `[n_routed_experts, hidden_size]`)・
+//!   `mlp.shared_experts.{gate_proj,up_proj,down_proj}`(常時適用される
+//!   共有エキスパート、dense SwiGLU一本)・
+//!   `mlp.experts.{0..n_routed_experts}.{gate_proj,up_proj,down_proj}`
+//!   (ルーティングされるエキスパート、各々独立したdense SwiGLU)。
+//! - ルーティング計算(推論専用、擬似コード): `scores = softmax(x @ gate.T)`
+//!   → 上位`num_experts_per_tok`個のエキスパートを選択(元スコアを重みに
+//!   使用) → `norm_topk_prob`が真なら選択後に再正規化 →
+//!   `routed_scaling_factor`を乗算 → 選択エキスパートの出力を重み付き
+//!   加算 → 常時計算する`shared_experts`の出力を加算。
+//!
+//! **正直な開示(誇張しない、意図的に見送った部分)**:
+//! - **aux-loss-free load balancing**(V3以降の`gate.e_score_correction_bias`
+//!   テンソルによる補正)は未対応——V2-Liteにはこのテンソル自体が無く、
+//!   V3系チェックポイントのロードには対応していない。
+//! - **group-limited routing**(`n_group`/`topk_group`、V3が使う
+//!   グループ単位でのエキスパート絞り込み)は未対応——V2-Liteは
+//!   `n_group=1`のため実質no-opだが、V3の`n_group>1`構成は正しく
+//!   ルーティングされない。
+//! - **`scoring_func="sigmoid"`**(V3が使う、softmaxではなくsigmoid+
+//!   事後正規化のスコアリング)は未対応——`load()`は`scoring_func`が
+//!   `"softmax"`であることを`ensure!`で要求し、それ以外(sigmoid等)は
+//!   明示的なエラーで拒否する(誤った計算を黙って実行しない)。
+//! - **学習専用ロジックは実装しない**(推論専用実装のため無関係):
+//!   auxiliary loss計算・逆伝播・expert-parallelism分散シャーディング
+//!   ・capacity factor等はすべて省略(調査で確認した通り、DeepSeek公式
+//!   推論実装自体にもこれらは存在しない)。
+//! - **CPU実装は素朴なループ**(llama.cppの`ggml_mul_mat_id`のような
+//!   バッチ化最適化は無し)——正しさ優先、`n_routed_experts`本のうち
+//!   `num_experts_per_tok`本だけを計算するので無駄な計算はしていないが、
+//!   メモリアクセスパターンの最適化は次の増分。
+//!
+//! これにより`DeepseekConfig`が正しいMoEフィールドを持つ(V2-Lite等の)
+//! チェックポイントは、`first_k_dense_replace`層目以降もエンドツーエンド
+//! でロードできるようになった——ただし上記の通りV3固有の拡張
+//! (aux-loss-free補正・group-limited routing・sigmoidスコアリング)には
+//! まだ対応していないため、V3系の完全なロードは次の増分。
 //! - **absorb最適化(推論高速化)は未実装**——調査で判明した通り、
 //!   `kv_b_proj`のK側/V側をQ/O側へ数学的に吸収してKVキャッシュを
 //!   圧縮ベクトルのまま保持する最適化があるが、今回は正しさの検証を
@@ -121,6 +162,29 @@ pub struct DeepseekConfig {
     pub rope_theta: f32,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+
+    // ── DeepSeekMoE(2026-09-13追加、モジュールdoc参照) ──────────────
+    /// この層番号未満(0始まり)はdense SwiGLU、以降はMoE。実チェックポイント
+    /// のconfig.jsonに必ず存在するフィールドだが、`tiny()`等の全層dense
+    /// テスト構成向けに「デフォルトは全層dense」(`usize::MAX`)にしておく。
+    #[serde(default = "default_first_k_dense_replace")]
+    pub first_k_dense_replace: usize,
+    #[serde(default)]
+    pub n_routed_experts: usize,
+    #[serde(default)]
+    pub n_shared_experts: usize,
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub norm_topk_prob: bool,
+    /// `"softmax"`のみ対応(モジュールdoc参照、`"sigmoid"`はV3系が使うが
+    /// 未対応——`load()`が明示的に拒否する)。
+    #[serde(default = "default_scoring_func")]
+    pub scoring_func: String,
+    #[serde(default = "default_routed_scaling_factor")]
+    pub routed_scaling_factor: f32,
 }
 
 fn default_max_seq_len() -> usize {
@@ -131,6 +195,15 @@ fn default_rms_eps() -> f32 {
 }
 fn default_rope_theta() -> f32 {
     10_000.0
+}
+fn default_first_k_dense_replace() -> usize {
+    usize::MAX
+}
+fn default_scoring_func() -> String {
+    "softmax".to_string()
+}
+fn default_routed_scaling_factor() -> f32 {
+    1.0
 }
 
 impl DeepseekConfig {
@@ -152,6 +225,14 @@ impl DeepseekConfig {
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
             tie_word_embeddings: true,
+            first_k_dense_replace: usize::MAX, // 全層dense(MoE無し)
+            n_routed_experts: 0,
+            n_shared_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            norm_topk_prob: false,
+            scoring_func: "softmax".to_string(),
+            routed_scaling_factor: 1.0,
         }
     }
 
@@ -161,8 +242,29 @@ impl DeepseekConfig {
         Self { q_lora_rank: Some(6), ..Self::tiny(vocab_size) }
     }
 
+    /// [`tiny`]のDeepSeekMoE有り版(実V2-Liteと同じ「先頭`first_k_dense_replace`
+    /// 層はdense、以降はMoE」構成、`num_layers=2`なので層0がdense・
+    /// 層1がMoEになる)。
+    pub fn tiny_with_moe(vocab_size: usize) -> Self {
+        Self {
+            first_k_dense_replace: 1,
+            n_routed_experts: 4,
+            n_shared_experts: 1,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: 8,
+            norm_topk_prob: false,
+            scoring_func: "softmax".to_string(),
+            routed_scaling_factor: 1.0,
+            ..Self::tiny(vocab_size)
+        }
+    }
+
     fn q_head_dim(&self) -> usize {
         self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+
+    fn is_moe_layer(&self, layer_idx: usize) -> bool {
+        layer_idx >= self.first_k_dense_replace
     }
 }
 
@@ -235,13 +337,92 @@ struct DeepseekLayer {
     /// `num_heads*v_head_dim -> hidden`。
     o_proj: Linear,
     post_attention_layernorm: RmsNorm,
+    mlp: DeepseekMlp,
+}
+
+/// dense SwiGLU MLP一本ぶん(従来のdense MLPそのもの、MoEの各
+/// エキスパート・共有エキスパートにも同じ形が使い回される)。
+struct DenseSwiGlu {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
 }
 
+impl DenseSwiGlu {
+    fn random(rng: &mut SplitMix64, hidden: usize, intermediate: usize) -> Self {
+        Self { gate_proj: Linear::random(rng, hidden, intermediate), up_proj: Linear::random(rng, hidden, intermediate), down_proj: Linear::random(rng, intermediate, hidden) }
+    }
+
+    fn forward(&self, device: &dyn GpuDevice, x: &[f32]) -> Result<Vec<f32>> {
+        let gate = self.gate_proj.forward(device, x, 1)?;
+        let up = self.up_proj.forward(device, x, 1)?;
+        let mut mlp_hidden = vec![0.0f32; gate.len()];
+        for i in 0..gate.len() {
+            mlp_hidden[i] = silu(gate[i]) * up[i];
+        }
+        self.down_proj.forward(device, &mlp_hidden, 1)
+    }
+}
+
+/// DeepSeekMoE層(モジュールdoc「DeepSeekMoE対応」参照)。`gate`が
+/// トークンごとに`num_experts_per_tok`個のルーティングされるエキスパート
+/// (`experts`)を選び、常時計算される`shared_experts`の出力と合算する。
+struct DeepseekMoeMlp {
+    /// ルーター: `hidden -> n_routed_experts`(softmaxスコア用ロジット)。
+    gate: Linear,
+    shared_experts: DenseSwiGlu,
+    experts: Vec<DenseSwiGlu>,
+}
+
+enum DeepseekMlp {
+    Dense(Box<DenseSwiGlu>),
+    Moe(Box<DeepseekMoeMlp>),
+}
+
+impl DeepseekMlp {
+    fn forward(&self, device: &dyn GpuDevice, x: &[f32], cfg: &DeepseekConfig) -> Result<Vec<f32>> {
+        match self {
+            DeepseekMlp::Dense(dense) => dense.forward(device, x),
+            DeepseekMlp::Moe(moe) => {
+                // ── ルーティング計算(モジュールdoc参照、softmaxスコアのみ対応) ──
+                let logits = moe.gate.forward(device, x, 1)?;
+                let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut scores: Vec<f32> = logits.iter().map(|&v| (v - max_logit).exp()).collect();
+                let sum_exp: f32 = scores.iter().sum();
+                for s in &mut scores {
+                    *s /= sum_exp;
+                }
+
+                let mut ranked: Vec<usize> = (0..scores.len()).collect();
+                ranked.sort_unstable_by(|&a, &b| scores[b].partial_cmp(&scores[a]).expect("open-cuda-llm: DeepSeekMoE router score must not be NaN"));
+                let selected = &ranked[..cfg.num_experts_per_tok];
+
+                let mut weight_sum: f32 = selected.iter().map(|&i| scores[i]).sum();
+                if !cfg.norm_topk_prob {
+                    weight_sum = 1.0; // 正規化しない(元スコアをそのまま重みに使う)
+                }
+
+                let mut y = vec![0.0f32; x.len()];
+                for &expert_idx in selected {
+                    let weight = (scores[expert_idx] / weight_sum) * cfg.routed_scaling_factor;
+                    let expert_out = moe.experts[expert_idx].forward(device, x)?;
+                    for (acc, v) in y.iter_mut().zip(&expert_out) {
+                        *acc += weight * v;
+                    }
+                }
+
+                let shared_out = moe.shared_experts.forward(device, x)?;
+                for (acc, v) in y.iter_mut().zip(&shared_out) {
+                    *acc += v;
+                }
+                Ok(y)
+            }
+        }
+    }
+}
+
 impl DeepseekLayer {
-    fn random(rng: &mut SplitMix64, cfg: &DeepseekConfig) -> Self {
+    fn random(rng: &mut SplitMix64, cfg: &DeepseekConfig, layer_idx: usize) -> Self {
         let hidden = cfg.hidden_size;
         let q_head_dim = cfg.q_head_dim();
         let kv_a_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
@@ -255,20 +436,32 @@ impl DeepseekLayer {
             }
         };
 
+        let kv_a_proj_with_mqa = Linear::random(rng, hidden, kv_a_dim);
+        let kv_b_proj = Linear::random(rng, cfg.kv_lora_rank, kv_b_out);
+        let o_proj = Linear::random(rng, attn_out_dim, hidden);
+
+        let mlp = if cfg.is_moe_layer(layer_idx) {
+            DeepseekMlp::Moe(Box::new(DeepseekMoeMlp {
+                gate: Linear::random(rng, hidden, cfg.n_routed_experts),
+                shared_experts: DenseSwiGlu::random(rng, hidden, cfg.moe_intermediate_size * cfg.n_shared_experts),
+                experts: (0..cfg.n_routed_experts).map(|_| DenseSwiGlu::random(rng, hidden, cfg.moe_intermediate_size)).collect(),
+            }))
+        } else {
+            DeepseekMlp::Dense(Box::new(DenseSwiGlu::random(rng, hidden, cfg.intermediate_size)))
+        };
+
         Self {
             input_layernorm: RmsNorm::identity(hidden, cfg.rms_norm_eps),
             q_proj,
             q_a_proj,
             q_a_layernorm,
             q_b_proj,
-            kv_a_proj_with_mqa: Linear::random(rng, hidden, kv_a_dim),
+            kv_a_proj_with_mqa,
             kv_a_layernorm: RmsNorm::identity(cfg.kv_lora_rank, cfg.rms_norm_eps),
-            kv_b_proj: Linear::random(rng, cfg.kv_lora_rank, kv_b_out),
-            o_proj: Linear::random(rng, attn_out_dim, hidden),
+            kv_b_proj,
+            o_proj,
             post_attention_layernorm: RmsNorm::identity(hidden, cfg.rms_norm_eps),
-            gate_proj: Linear::random(rng, hidden, cfg.intermediate_size),
-            up_proj: Linear::random(rng, hidden, cfg.intermediate_size),
-            down_proj: Linear::random(rng, cfg.intermediate_size, hidden),
+            mlp,
         }
     }
 }
@@ -301,7 +494,7 @@ impl DeepseekModel {
     pub fn load_random(config: DeepseekConfig, seed: u64) -> Self {
         let mut rng = SplitMix64::new(seed);
         let embed_tokens = random_vec(&mut rng, config.vocab_size * config.hidden_size, 0.02);
-        let layers = (0..config.num_layers).map(|_| DeepseekLayer::random(&mut rng, &config)).collect();
+        let layers = (0..config.num_layers).map(|layer_idx| DeepseekLayer::random(&mut rng, &config, layer_idx)).collect();
         let norm = RmsNorm::identity(config.hidden_size, config.rms_norm_eps);
         let lm_head = if config.tie_word_embeddings { None } else { Some(Linear::random(&mut rng, config.hidden_size, config.vocab_size)) };
         Self { config, embed_tokens, layers, norm, lm_head }
@@ -325,6 +518,17 @@ impl DeepseekModel {
             ensure!(q_lora_rank > 0, "open-cuda-llm: q_lora_rank, when present, must be > 0");
         }
         ensure!(config.kv_lora_rank > 0, "open-cuda-llm: kv_lora_rank must be > 0");
+        if config.first_k_dense_replace < config.num_layers {
+            ensure!(
+                config.scoring_func == "softmax",
+                "open-cuda-llm: DeepseekModel::load: scoring_func '{}' is not supported yet — only \"softmax\" is implemented \
+                 (V3's \"sigmoid\" scoring + aux-loss-free correction bias is a documented, not-yet-implemented gap, see deepseek_arch.rs module docs)",
+                config.scoring_func
+            );
+            ensure!(config.n_routed_experts > 0, "open-cuda-llm: n_routed_experts must be > 0 when first_k_dense_replace < num_hidden_layers (some layers are MoE)");
+            ensure!(config.num_experts_per_tok > 0 && config.num_experts_per_tok <= config.n_routed_experts, "open-cuda-llm: num_experts_per_tok ({}) must be in 1..=n_routed_experts ({})", config.num_experts_per_tok, config.n_routed_experts);
+            ensure!(config.moe_intermediate_size > 0, "open-cuda-llm: moe_intermediate_size must be > 0 when some layers are MoE");
+        }
 
         let weights_path = dir.join("model.safetensors");
         let data = std::fs::read(&weights_path).with_context(|| format!("open-cuda-llm: failed to read {}", weights_path.display()))?;
@@ -365,10 +569,7 @@ impl DeepseekModel {
                 kv_b_proj: load_linear(&tensors, &format!("{sa}.kv_b_proj"), config.kv_lora_rank, kv_b_out)?,
                 o_proj: load_linear(&tensors, &format!("{sa}.o_proj"), attn_out_dim, hidden)?,
                 post_attention_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
-                gate_proj: load_linear(&tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)
-                    .with_context(|| format!("open-cuda-llm: layer {i}: dense mlp.gate_proj not found — this layer is likely a MoE layer, which DeepseekModel::load does not support yet (see module docs)"))?,
-                up_proj: load_linear(&tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
-                down_proj: load_linear(&tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
+                mlp: load_mlp(&tensors, &p, &config, i, hidden)?,
             });
         }
 
@@ -486,16 +687,10 @@ impl DeepseekModel {
                 *h += a;
             }
 
-            // ---- MLP(SwiGLU、dense、MoE未対応)サブ層(pre-norm) ----
+            // ---- MLP(dense SwiGLUまたはDeepSeekMoE)サブ層(pre-norm) ----
             let mut normed2 = hidden_state.clone();
             layer.post_attention_layernorm.forward_row(&mut normed2);
-            let gate = layer.gate_proj.forward(device, &normed2, 1)?;
-            let up = layer.up_proj.forward(device, &normed2, 1)?;
-            let mut mlp_hidden = vec![0.0f32; gate.len()];
-            for i in 0..gate.len() {
-                mlp_hidden[i] = silu(gate[i]) * up[i];
-            }
-            let mlp_out = layer.down_proj.forward(device, &mlp_hidden, 1)?;
+            let mlp_out = layer.mlp.forward(device, &normed2, cfg)?;
             for (h, m) in hidden_state.iter_mut().zip(&mlp_out) {
                 *h += m;
             }
@@ -544,6 +739,31 @@ impl DeepseekModel {
         }
         Ok(generated)
     }
+}
+
+/// 層`layer_idx`のMLP部分をロードする(`config.first_k_dense_replace`に
+/// 応じてdense/MoEを分岐、モジュールdoc「DeepSeekMoE対応」参照)。
+fn load_mlp(tensors: &safetensors::SafeTensors, layer_prefix: &str, config: &DeepseekConfig, layer_idx: usize, hidden: usize) -> Result<DeepseekMlp> {
+    if config.is_moe_layer(layer_idx) {
+        let gate = load_linear(tensors, &format!("{layer_prefix}.mlp.gate"), hidden, config.n_routed_experts)
+            .with_context(|| format!("open-cuda-llm: layer {layer_idx}: MoE router 'mlp.gate' not found (layer_idx >= first_k_dense_replace={} so this layer is expected to be MoE)", config.first_k_dense_replace))?;
+        let shared_experts = load_dense_swiglu(tensors, &format!("{layer_prefix}.mlp.shared_experts"), hidden, config.moe_intermediate_size * config.n_shared_experts)?;
+        let mut experts = Vec::with_capacity(config.n_routed_experts);
+        for e in 0..config.n_routed_experts {
+            experts.push(load_dense_swiglu(tensors, &format!("{layer_prefix}.mlp.experts.{e}"), hidden, config.moe_intermediate_size)?);
+        }
+        Ok(DeepseekMlp::Moe(Box::new(DeepseekMoeMlp { gate, shared_experts, experts })))
+    } else {
+        Ok(DeepseekMlp::Dense(Box::new(load_dense_swiglu(tensors, &format!("{layer_prefix}.mlp"), hidden, config.intermediate_size)?)))
+    }
+}
+
+fn load_dense_swiglu(tensors: &safetensors::SafeTensors, prefix: &str, hidden: usize, intermediate: usize) -> Result<DenseSwiGlu> {
+    Ok(DenseSwiGlu {
+        gate_proj: load_linear(tensors, &format!("{prefix}.gate_proj"), hidden, intermediate)?,
+        up_proj: load_linear(tensors, &format!("{prefix}.up_proj"), hidden, intermediate)?,
+        down_proj: load_linear(tensors, &format!("{prefix}.down_proj"), intermediate, hidden)?,
+    })
 }
 
 fn load_linear(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
@@ -633,6 +853,45 @@ mod tests {
         let out1 = model.generate(&device, &[10], 6).unwrap();
         let out2 = model.generate(&device, &[20], 6).unwrap();
         assert_ne!(out1, out2, "different prompts should not collapse to identical output");
+    }
+
+    /// DeepSeekMoE(2026-09-13追加): `first_k_dense_replace=1`で層0が
+    /// dense・層1がMoEという実V2-Liteと同じ構成でもパニックせず完走する
+    /// こと(ルーター→top-k選択→共有エキスパート合算の配線を検証)。
+    #[test]
+    fn deepseekmoe_layer_generates_without_panicking() {
+        let config = DeepseekConfig::tiny_with_moe(64);
+        assert_eq!(config.first_k_dense_replace, 1);
+        assert!(config.is_moe_layer(1));
+        assert!(!config.is_moe_layer(0));
+        let model = DeepseekModel::load_random(config, 21);
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 6).unwrap();
+        assert_eq!(generated.len(), 6);
+    }
+
+    /// `num_experts_per_tok == n_routed_experts`(全エキスパートを常時
+    /// 使う、top-k選択の境界条件)でも壊れないこと。
+    #[test]
+    fn deepseekmoe_with_all_experts_selected_works() {
+        let mut config = DeepseekConfig::tiny_with_moe(64);
+        config.num_experts_per_tok = config.n_routed_experts; // 4 == 4
+        let model = DeepseekModel::load_random(config, 22);
+        let device = device();
+        let generated = model.generate(&device, &[1, 2], 5).unwrap();
+        assert_eq!(generated.len(), 5);
+    }
+
+    /// `norm_topk_prob=true`(選択後の重み再正規化)経路もパニックしない
+    /// こと。
+    #[test]
+    fn deepseekmoe_with_norm_topk_prob_works() {
+        let mut config = DeepseekConfig::tiny_with_moe(64);
+        config.norm_topk_prob = true;
+        let model = DeepseekModel::load_random(config, 23);
+        let device = device();
+        let generated = model.generate(&device, &[3, 4], 5).unwrap();
+        assert_eq!(generated.len(), 5);
     }
 
     /// decoupled RoPE配線の健全性: rope専用部分を意図的に無効化(cos=1,

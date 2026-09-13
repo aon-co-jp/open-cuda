@@ -6,6 +6,24 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き2)**: `open-cuda-llm::DeepseekModel`に
+> DeepSeekMoE(共有エキスパート+top-kルーティング)を実装した——直下の
+> エントリで「今回はスコープ外」としたMoEに、世界中の言語での追加調査に
+> 基づき対応。**正直な開示**: aux-loss-free補正(V3)・group-limited
+> routing(V3)・sigmoidスコアリング(V3)は未対応(`scoring_func`が
+> `"softmax"`以外なら`load()`が明示的に拒否)——V2-Lite相当の構成
+> (`scoring_func="softmax"`・`n_group=1`)は読める設計。新規テスト3本
+> 追加、クレート全体67本成功。詳細は[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Implemented DeepSeekMoE (shared experts + top-k routing)
+> in `open-cuda-llm::DeepseekModel`, following up on the entry below
+> that scoped MoE out. **Honest scope**: aux-loss-free bias correction,
+> group-limited routing, and sigmoid scoring (all V3-specific) are not
+> supported yet — `load()` explicitly rejects any `scoring_func` other
+> than `"softmax"`. Designed to load V2-Lite-shaped configs
+> (`scoring_func="softmax"`, `n_group=1`). 3 new tests added, full
+> crate suite (67 tests) passing. See [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き)**: 世界中の言語(英語・日本語・中国語)
 > でのGoogle検索・GitHub調査に基づき、`open-cuda-llm`に本物の
 > DeepSeek-V2/V3 Multi-head Latent Attention (MLA) アーキテクチャ
