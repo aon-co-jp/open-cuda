@@ -39,13 +39,25 @@
   `opencuda_blas::scaled_dot_product_attention`(単一head_dim前提)は
   再利用不可——素朴なCPUループでQKᵀ・softmax・P·Vを直接計算する必要が
   ある。
-- **意図的にスコープ外にしたもの**(誇張しない): MoE
-  (DeepSeekMoE、`n_routed_experts`等)、absorb最適化(KV up-projを
-  Q/O側へ吸収してKVキャッシュを圧縮ベクトルのまま保持する高速化)、
-  YaRN RoPEスケーリング、Attentionコアのvulkan/DXILディスパッチ。
-  MoE未対応のため、**実在の公開チェックポイントは`first_k_dense_replace`
-  以降の層(ほぼ全部)でロード失敗する**——これは意図した制約であり
-  バグではない。
+- **2026-09-13(続き)追記: MoEは実装済み**——上記の「意図的にスコープ外」
+  は当初の判断で、その後ユーザー指示によりDeepSeekMoE(共有エキスパート+
+  top-kルーティング)を実装した。テンソル名: `mlp.gate.weight`
+  (ルーター)・`mlp.shared_experts.{gate_proj,up_proj,down_proj}`
+  (常時計算)・`mlp.experts.{0..n}.{gate_proj,up_proj,down_proj}`
+  (ルーティングされる個々のエキスパート)。ルーティング擬似コード:
+  `scores=softmax(x@gate.T)` → top-k選択 → (`norm_topk_prob`なら
+  再正規化) → `routed_scaling_factor`乗算 → 選択エキスパート出力を
+  重み付き加算 → `shared_experts`出力を加算。推論専用実装のため
+  auxiliary loss計算・expert-parallelism分散シャーディング等の学習
+  専用ロジックは省略(DeepSeek公式推論実装にも存在しない)。
+  **なお未対応のまま(誇張しない)**: aux-loss-free補正
+  (`gate.e_score_correction_bias`、V3系)・group-limited routing
+  (`n_group`/`topk_group`、V3系)・`scoring_func="sigmoid"`(V3系)——
+  `load()`は`scoring_func != "softmax"`を明示的に拒否する。
+  absorb最適化・YaRN RoPE・Attentionコア/MoEのvulkan/DXILディスパッチ
+  も未対応。V2-Lite相当(`scoring_func="softmax"`・`n_group=1`)の
+  構成は読める設計だが、実機ダウンロード検証(15.7Bパラメータ、この
+  開発機では推論実行は不可能)はまだ行っていない。
 - `aruaru-llm`側の連携(`deepseek_generation.rs`): Qwenの
   `QWEN_CATALOG`のような自動ダウンロードカタログは意図的に設けて
   いない(上記の理由で「ダウンロードすれば動く」と言えるリポジトリが
