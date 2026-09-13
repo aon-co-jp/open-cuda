@@ -89,6 +89,75 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-13(続き5)、DeepSeek-V3固有拡張(aux-loss-free補正・group-limited routing・sigmoidスコアリング)+分割済みsafetensors対応+実機検証の試算 / Follow-up: V3-specific MoE extensions + sharded safetensors support + real-checkpoint feasibility estimate
+
+ユーザーから「V3系固有の拡張...世界中の言語で設計と開発の為にGoogle検索と
+Github調査して対応させて」との指示を受け、`deepseek_arch.rs`のMoE実装
+(直後、本ファイル下方の2026-09-13(続き2)エントリ)へ以下3点を追加した。
+
+**調査で判明した非自明な仕様**(出典: DeepSeek-V3公式推論実装
+<https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py>
+の`Gate`クラス、実`config.json`
+<https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json>、
+論文Sec.2.1.2 arXiv:2412.19437): `e_score_correction_bias`は「どの
+エキスパートを選ぶか」(top-k選択)にのみ影響し、「選ばれたエキスパートへ
+与える重み」は**bias加算前の生スコア**がそのまま使われる——選択用と
+重み用でスコアを2本持つ必要がある実装だった。グループ集約方式も
+「biasが無ければグループ内最大値、biasがあればグループ内上位2個の
+合計」で分岐する。sigmoidスコアリングは選択後の正規化が事実上必須
+(公式実装では`scoring_func`分岐そのものに紐づく別ロジック)。
+
+実装した3点: (1) aux-loss-free load balancing
+(`mlp.gate.e_score_correction_bias`、`topk_method="noaux_tc"`のみ
+ロード)、(2) group-limited routing(`n_group`/`topk_group`)、(3)
+`scoring_func="sigmoid"`。`DeepseekConfig`に`n_group`/`topk_group`/
+`topk_method`を追加、`DeepseekMoeMlp`に`e_score_correction_bias:
+Option<Vec<f32>>`を追加。`load()`の`ensure!`を
+`scoring_func∈{"softmax","sigmoid"}`・`topk_method∈{"greedy","noaux_tc"}`
+のみ許可する形へ変更(それ以外は明示的エラー)。新規テスト
+`tiny_with_moe_v3`構成2本(V3相当のフル構成、及び`topk_group=1`境界
+条件)追加。
+
+**続けて分割済み(sharded)safetensors対応も実施**: 実際に
+`deepseek-ai/DeepSeek-V2-Lite-Chat`の`model.safetensors.index.json`を
+取得したところ、31.4GB・4分割(`model-00001-of-000004.safetensors`等)
+で配布されていることが判明——単一ファイルの`model.safetensors`しか
+読めない旧`load()`(`QwenModel::load`と同じ制約を踏襲していた)では
+構造的にロードできないブロッカーだった。`ModelWeights`(シャードの
+生バイト列+テンソル名→シャードindexのマップ)という抽象化を新設し、
+`load_linear`/`load_dense_swiglu`/`load_mlp`の引数を
+`&safetensors::SafeTensors`から`&ModelWeights`へ変更。実際に合成の
+決定的な値で埋めた極小チェックポイントを2ファイルに分割してディスクへ
+書き出し、`DeepseekModel::load`が正しく読み込めることを検証する
+統合テスト(`load_parses_sharded_safetensors_checkpoint_split_across_two_files`)
+を追加、成功。
+
+**正直な開示・実機検証の具体的な試算(重要)**: `deepseek-ai/
+DeepSeek-V2-Lite-Chat`(この実装が対応済みの`scoring_func="softmax"`・
+`n_group=1`構成)を実際にダウンロード・ロードして動作確認する実機検証は
+**見送った**。理由: 現在のローダー設計では、シャード生データ
+(bf16、31.4GB)を`ModelWeights`が一括保持しつつ、全テンソルをf32へ
+変換した`Linear`重み(bf16の2倍、約62.8GB)を`DeepseekModel`が永続保持
+するため、ピークメモリが90GBを超える可能性が高い。この開発機を実測
+(`Get-CimInstance Win32_OperatingSystem`)したところ総RAM 32GB・空き
+16GBで、実行すればスワップの多発やプロセスクラッシュ、最悪OS全体の
+不安定化を招く恐れがあるため、**無理に実行しなかった**。ディスク容量
+(1.2TB空き)は問題無かったが、メモリが決定的な制約——「実機検証した」
+と偽らず、リスクの実測値とともに正直に記録する。かわりに分割ロード
+経路そのものは合成チェックポイントで実際のファイルI/Oを通して検証
+済み(上記)。
+
+クレート全体70本成功(既存67本+新規3本)、7本ignore、clippy警告0件
+(deepseek_arch関連)。
+
+**次回への引き継ぎ**: (1) より小さいVRAM/RAM要求で実機検証できる
+チェックポイントの探索(V2-Lite未満のサイズでMLA+MoE構成の実在
+チェックポイントがあるか要調査)、または(2) ストリーミングロード
+(シャードを保持し続けずテンソルごとに逐次読み書きする設計へ
+`ModelWeights`を改修し、ピークメモリを削減する)実装、のいずれかで
+実機検証の壁を越える必要がある。(3) absorb最適化・YaRN RoPE・
+Attentionコア/MoEのGPU/Vulkanディスパッチ化は引き続き未着手。
+
 ## HANDOFF追記(2026-09-13(続き2)、DeepSeekMoE実装(世界中の言語でのGoogle/GitHub調査に基づく、`deepseek_arch.rs`) / Follow-up: implemented DeepSeekMoE based on multilingual Google/GitHub research
 
 直後(本ファイル下方、2026-09-13(続き)エントリ)で「MoEは今回のスコープ
