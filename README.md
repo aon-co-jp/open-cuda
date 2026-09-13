@@ -6,6 +6,26 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き6・実機検証結果)**: 実際に
+> `deepseek-ai/DeepSeek-V2-Lite-Chat`(31.4GB)をダウンロードし実機検証を
+> 実施。**ロードは成功**(遅延ロード設計により19.9秒で完了)したが、
+> **生成開始直後にプロセスメモリが急増しシステムの空きメモリが
+> 127.5MBまで低下**、安全装置が自動的にプロセスを強制終了した(kill後
+> システムは正常に25GB空きまで回復、クラッシュには至らず)。「実機
+> 検証した」と誇張せず、生成の完走は達成できなかった事実を記録する。
+> 原因はMoEルーティングの疎性を加味しても足りないメモリ要求+巨大
+> ファイル群への散発読み込みによるOSファイルキャッシュ膨張と推定。
+> 詳細は[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Actually downloaded and attempted real-checkpoint
+> verification of `deepseek-ai/DeepSeek-V2-Lite-Chat` (31.4GB).
+> **Loading succeeded** (19.9s, thanks to the lazy-loading design), but
+> **generation triggered a memory spike that dropped system free
+> memory to 127.5MB within seconds**; a safety monitor force-killed the
+> process (system recovered cleanly to ~25GB free afterward — no
+> crash). Recording honestly that generation did not complete on this
+> machine. See [CLAUDE.md](CLAUDE.md) for the full analysis.
+
 > 📌 **最近の更新(2026-09-13続き6)**: ユーザー指摘「HDDのキャッシュを
 > 用意してもダメか」を受け、`ModelWeights`をヘッダのみ読み込み+
 > オンデマンド`seek`+`read`方式へ再設計し、ルーティングされる個々の
