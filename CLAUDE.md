@@ -197,9 +197,40 @@ RAM)には荷が重いことが実測で判明した。「実機検証した」�
 の探索。(2) OSページキャッシュを迂回する読み込みフラグ
 (Windowsの`FILE_FLAG_NO_BUFFERING`等、Rustでは`std::fs`の標準APIでは
 直接指定できないため`windows`クレート等の低レベルAPIが必要)の使用に
-よる、ファイルキャッシュ膨張の抑制。(3) より大きなメモリを持つ環境
-(クラウドインスタンス等)での再検証。(4) 安全装置の閾値・挙動の見直し
-(即killではなく、一定時間待って回収されるか確認してから判断する等)。
+よる、ファイルキャッシュ膨張の抑制——2026-09-13時点で世界中の言語
+(英語・日本語・中国語)でのGoogle検索・GitHub調査に着手済み(別途
+続報)。(3) より大きなメモリを持つ環境(クラウドインスタンス等)での
+再検証。(4) 安全装置の閾値・挙動の見直し(即killではなく、一定時間
+待って回収されるか確認してから判断する等)。
+
+### 🗺️ ロードマップ(2026-09-13追加、ユーザー指示により正式に記録)
+
+DeepSeek-V2-Lite-Chat実機検証(上記)で判明したメモリ制約への対応として、
+以下2項目をロードマップとして明記する(優先度・順序は次回セッション
+着手時に再検討可):
+
+- **[調査中] OSファイルキャッシュを迂回する読み込み方式**: Windowsの
+  `FILE_FLAG_NO_BUFFERING`(アンバッファードI/O、セクタサイズ境界への
+  アラインメント制約あり)、または`FILE_FLAG_SEQUENTIAL_SCAN`/
+  `FILE_FLAG_RANDOM_ACCESS`によるキャッシュ優先度ヒント、Linux/macOSの
+  `O_DIRECT`/`F_NOCACHE`とのクロスプラットフォーム対応方針を含め、
+  世界中の言語でのGoogle検索・GitHub調査を2026-09-13に開始した
+  (`deepseek_arch.rs`の`ModelWeights::tensor_f32`〈テンソルごとの
+  `seek`+`read`〉への適用を想定)。調査結果は本ファイルへ追記予定。
+  併せて、そもそも監視指標に`FreePhysicalMemory`(システム全体の空き
+  物理メモリ)を使ったこと自体が適切だったか(ページキャッシュは
+  OSが本来自動回収するリソースであり、プロセス自身のコミットサイズを
+  見るべきではなかったか)という診断的な疑問も調査対象に含めている。
+- **[未着手] より大きなメモリを持つ環境での再検証**:
+  この開発機(実測32GB RAM)では`deepseek-ai/DeepSeek-V2-Lite-Chat`
+  (15.7B、31.4GB)の生成完走に到達できなかった(上記HANDOFF参照)。
+  クラウドインスタンス等、より大きなメモリ(64GB以上を目安)を持つ
+  環境が利用可能になった際に、同じ`examples/
+  deepseek_v2_lite_real_weights_probe.rs`で再検証すること。ダウンロード
+  済みの30GBチェックポイント一式はこの開発機のスクラッチパッド
+  (`C:\Users\<user>\AppData\Local\Temp\claude\...\scratchpad\
+  deepseek-v2-lite-chat\`)に保持済みのため、同一マシンでの再検証には
+  再ダウンロード不要(別環境へ移す場合は転送が必要)。
 
 ## HANDOFF追記(2026-09-13(続き5)、DeepSeek-V3固有拡張(aux-loss-free補正・group-limited routing・sigmoidスコアリング)+分割済みsafetensors対応+実機検証の試算 / Follow-up: V3-specific MoE extensions + sharded safetensors support + real-checkpoint feasibility estimate
 
