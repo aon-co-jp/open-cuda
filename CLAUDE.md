@@ -89,6 +89,70 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-13(続き)、本物のDeepSeek-V2/V3 MLAアーキテクチャ`deepseek_arch.rs`新設(世界中の言語でのGoogle/GitHub調査に基づく) / Follow-up: added a real DeepSeek-V2/V3 MLA architecture module `deepseek_arch.rs`, based on multilingual Google/GitHub research)
+
+直前(本ファイル下方、2026-09-13エントリ)の`QwenModel`PCA較正版MLA風
+KVキャッシュ圧縮は、既存の標準Attentionモデルへの**事後(post-hoc)
+retrofit**であり本物のDeepSeek MLAではない、という限界をユーザーへ
+明示したところ、「その通り、本物のMLA実装のための設計・調査をせよ」
+との指示を受けた。世界中の言語(英語・日本語・中国語)でGoogle検索・
+GitHub調査を実施し、以下を実チェックポイント(`deepseek-ai/
+DeepSeek-V2-Lite-Chat`の実際の`config.json`)・実論文
+(arXiv:2405.04434)・HF公式`modeling_deepseek.py`から確認した:
+
+- テンソル名: `q_a_proj`/`q_a_layernorm`/`q_b_proj`(query側低ランク、
+  `q_lora_rank=null`の小型モデルでは`q_proj`直結)、
+  `kv_a_proj_with_mqa`/`kv_a_layernorm`/`kv_b_proj`(KV側低ランク、
+  MLAの核心)、`o_proj`。
+- forward計算順序: query/KVそれぞれ低ランクdown-proj→RMSNorm→
+  up-projで展開し、各ヘッドを「RoPEを適用しないnope部分」と
+  「RoPEを適用するrope専用部分(KVは全ヘッドMQA的に共有)」に分割する
+  decoupled RoPE。
+- absorb最適化(推論時にKV up-projをQ/O側へ吸収してKVキャッシュを
+  圧縮ベクトルのまま保持する技法、vLLM/SGLangで3〜7倍高速化と報告)は
+  実在するが、今回は正しさの検証を優先し**未実装**(次の最適化増分)。
+- MoE(DeepSeekMoE)は今回**意図的にスコープ外**——調査結果の推奨通り、
+  まずMLA構造そのものの正しさをdense FFNで検証すべきと判断した。
+
+これに基づき`open-cuda-llm/src/deepseek_arch.rs`を新設した
+(`DeepseekConfig`/`DeepseekModel`、`qwen_arch.rs`と同じ設計方針
+——RmsNorm/RoPE/SwiGLU MLPパターンを流用、`Linear`/`KvCacheHead`等の
+共有ヘルパーも再利用)。**正直な開示(誇張しない)**:
+- `q_lora_rank`が`None`(V2-Lite)/`Some`(V3)両経路をテストで検証。
+- QKᵀの`q`/`k`次元(`qk_nope_head_dim+qk_rope_head_dim`)と`v`の次元
+  (`v_head_dim`)が非対称(実チェックポイントでは192 vs 128)なため、
+  既存の共有`scaled_dot_product_attention`(単一head_dim前提)は
+  再利用できず、素朴なCPUループでQKᵀ・softmax・P·Vを直接計算する
+  実装にした(GPU/Vulkan/DXILディスパッチは対応していない——射影
+  計算〈`Linear::forward`〉はGPU対応するがAttentionコア自体はCPUのみ)。
+- `load()`は実在するテンソル名で読み込むが、MoE層(`mlp.experts.*`)は
+  読めないため、**実在するDeepSeek-V2/V2-Lite/V3の公開チェックポイントは
+  `first_k_dense_replace`以降の層で必ず失敗する**——これは仮想的な
+  「MLA構成だが全層dense FFN」なチェックポイント、または将来のMoE
+  対応後のための土台。
+- YaRN RoPEスケーリング(実V2-Liteの`config.json`が使用)は未対応、
+  素朴なRoPEのみ。
+- この開発機(GT730、VRAM 2GB)では実DeepSeekモデル(V2-Liteでも
+  15.7B)は実行不可能なため、実重みでの検証はランダム重み・極小構成の
+  構造的単体テスト(7本、全て成功)に限られる。
+
+続けて`aruaru-llm`側にも配線した(2026-09-13、同日): `qwen_generation.rs`
+と同じ設計で`deepseek_generation.rs`を新設し、
+`POST /v1/deepseek/select`(ローカルディレクトリ指定、`model_catalog`の
+自動ダウンロードカタログのidではなく生パス——理由は次段落)・
+`POST /v1/generate-deepseek`・`GET /v1/deepseek/status`を追加。
+**正直な開示**: `QWEN_CATALOG`のような自動ダウンロード用カタログは
+意図的に設けていない——実在の公開DeepSeekチェックポイントはMoEを
+含むため今すぐダウンロードしてロードできるものが無く、「ダウンロード
+すれば動く」と装ったカタログエントリを出すのは不正直なため。
+
+**次回への引き継ぎ**: (1) MoE(DeepSeekMoE、`n_routed_experts`/
+`n_shared_experts`/`num_experts_per_tok`)の実装——これが完了して
+初めて実在の公開チェックポイントがエンドツーエンドで動く。(2) absorb
+最適化(KVキャッシュのメモリ削減、正しさ確定後の性能増分)。(3) YaRN
+RoPEスケーリング対応。(4) Attentionコアの GPU/Vulkan ディスパッチ化
+(現状CPUのみ)。ソース一覧は`deepseek_arch.rs`のモジュールdoc参照。
+
 ## HANDOFF追記(2026-09-11、Qwen2/Qwen2.5系〈RoPE+GQA+RMSNorm+SwiGLU〉の新エンジン+MLA圧縮+実重み検証 / Follow-up: new Qwen2/Qwen2.5 (RoPE+GQA+RMSNorm+SwiGLU) engine + MLA compression + real-weight verification)
 
 2026年9月頭に話題になった中国発の小型高性能LLM(Qwen3.5系・

@@ -6,6 +6,35 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き)**: 世界中の言語(英語・日本語・中国語)
+> でのGoogle検索・GitHub調査に基づき、`open-cuda-llm`に本物の
+> DeepSeek-V2/V3 Multi-head Latent Attention (MLA) アーキテクチャ
+> `deepseek_arch.rs`(`DeepseekConfig`/`DeepseekModel`)を新設した——
+> 直下の2026-09-13エントリで明記した「MLA風」事後圧縮とは違い、実
+> チェックポイントのテンソル名(`q_a_proj`/`kv_a_proj_with_mqa`/
+> `kv_b_proj`等)・decoupled RoPE構造をそのまま実装している。
+> **正直な開示**: MoE(DeepSeekMoE)は未対応のため、実在する公開
+> チェックポイント(ほぼ全層MoE)は`first_k_dense_replace`以降で
+> ロード失敗する。absorb最適化・YaRN RoPE・GPUディスパッチも未対応。
+> `aruaru-llm`側にも`POST /v1/deepseek/select`(ローカルディレクトリ
+> 指定)・`POST /v1/generate-deepseek`を配線した。詳細は
+> [PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Based on multilingual (English/Japanese/Chinese) Google
+> and GitHub research, added a real DeepSeek-V2/V3 Multi-head Latent
+> Attention (MLA) architecture module `deepseek_arch.rs`
+> (`DeepseekConfig`/`DeepseekModel`) to `open-cuda-llm` — unlike the
+> post-hoc "MLA-style" compression noted in the entry right below,
+> this implements the actual checkpoint tensor names
+> (`q_a_proj`/`kv_a_proj_with_mqa`/`kv_b_proj`, etc.) and decoupled
+> RoPE structure. **Honest scope**: MoE (DeepSeekMoE) is not
+> supported, so real published checkpoints (almost entirely MoE
+> beyond the first layer) fail to load past `first_k_dense_replace`.
+> The absorb optimization, YaRN RoPE, and GPU dispatch are also not
+> yet implemented. Wired `POST /v1/deepseek/select` (local directory)
+> and `POST /v1/generate-deepseek` into `aruaru-llm` as well. See
+> [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13)**: `open-cuda-llm::QwenModel`へPCA較正版
 > MLA風KVキャッシュ圧縮(`enable_mla_kv_compression_calibrated`)を
 > 移植した——`GptModel`版は既にあったが、`QwenModel`側(GQA対応)は
