@@ -35,7 +35,7 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use opencuda_core::GpuDevice;
 
-use super::{argmax, apply_repetition_penalty, random_vec, tensor_f32, transpose, KvCacheHead, Linear, MlaHeadProjection, SplitMix64};
+use super::{argmax, apply_repetition_penalty, pca_top_directions, random_vec, tensor_f32, transpose, KvCacheHead, Linear, MlaHeadProjection, SplitMix64};
 
 /// Qwen2/Qwen2.5 dense アーキテクチャの設定。`config.json` の該当
 /// フィールドにそのまま対応する。
@@ -303,6 +303,72 @@ impl QwenModel {
         Ok(())
     }
 
+    /// [`enable_mla_kv_compression`]のPCA較正版(`GptModel::
+    /// enable_mla_kv_compression_calibrated`の移植、2026-09-13)。
+    ///
+    /// 前回のHANDOFFで「今回のスコープ外(次の増分)」と明記していた
+    /// PCA較正版を、`GptModel`側で確立済みの設計(`open-cuda-llm/src/
+    /// lib.rs`の`pca_top_directions`、非中心〈uncentered〉PCA、
+    /// K/V活性化を縦連結して単一基底を求める、直交基底のため
+    /// `up_proj=down_proj`の転置)をそのまま`QwenModel`(GQA、KVヘッド
+    /// 単位で射影)へ適用する。
+    ///
+    /// `GptModel`版は`forward_prefill_all_layers`(バッチ処理版)で
+    /// 較正データを集めるが、`QwenModel`にはまだその一括版が無いため、
+    /// `forward_step`をプロンプトのトークン数ぶん逐次呼び出して
+    /// キャッシュを埋める(結果は`GptModel`版と数学的に同じ——単に
+    /// 「1トークンずつ」か「まとめて」かの実行効率の違いのみ、
+    /// 較正に使う活性化統計そのものは変わらない)。
+    pub fn enable_mla_kv_compression_calibrated(&mut self, d_c: usize, device: &dyn GpuDevice, sample_prompts: &[Vec<u32>]) -> Result<()> {
+        let head_dim = self.config.head_dim();
+        ensure!(d_c > 0 && d_c < head_dim, "open-cuda-llm: QwenModel::enable_mla_kv_compression_calibrated: d_c={d_c} must satisfy 0 < d_c < head_dim={head_dim}");
+        ensure!(!sample_prompts.is_empty(), "open-cuda-llm: QwenModel::enable_mla_kv_compression_calibrated: sample_prompts must not be empty");
+        ensure!(
+            self.layers.iter().all(|l| l.mla.is_none()),
+            "open-cuda-llm: QwenModel::enable_mla_kv_compression_calibrated: some layers already have MLA compression \
+             enabled (calibration must run against the uncompressed model, otherwise it would collect already-lossy \
+             latents instead of real full-precision activations)"
+        );
+
+        let num_layers = self.config.num_layers;
+        let num_kv_heads = self.config.num_kv_heads;
+        let mut per_layer_head_rows: Vec<Vec<Vec<f32>>> = (0..num_layers).map(|_| vec![Vec::new(); num_kv_heads]).collect();
+
+        for prompt in sample_prompts {
+            ensure!(!prompt.is_empty(), "open-cuda-llm: QwenModel::enable_mla_kv_compression_calibrated: calibration prompt must not be empty");
+            let mut caches = self.new_caches();
+            for &token_id in prompt {
+                self.forward_step(device, token_id, &mut caches)?;
+            }
+            for (layer_idx, layer_caches) in caches.into_iter().enumerate() {
+                for (head_idx, cache_head) in layer_caches.kv.into_iter().enumerate() {
+                    let bucket = &mut per_layer_head_rows[layer_idx][head_idx];
+                    // proj=NoneでのforwardなのでKvCacheHead.k/.vはフル精度
+                    // (KvCacheHead::pushのdocコメント参照、GptModel版と同じ)。
+                    bucket.extend_from_slice(&cache_head.k);
+                    bucket.extend_from_slice(&cache_head.v);
+                }
+            }
+        }
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let mut projections = Vec::with_capacity(num_kv_heads);
+            for (head_idx, rows_flat) in per_layer_head_rows[layer_idx].iter().enumerate() {
+                let num_rows = rows_flat.len() / head_dim;
+                ensure!(
+                    num_rows >= d_c,
+                    "open-cuda-llm: QwenModel::enable_mla_kv_compression_calibrated: only {num_rows} calibration rows \
+                     collected for layer {layer_idx} kv_head {head_idx}, need >= d_c={d_c} for a meaningful PCA basis \
+                     (pass longer/more sample prompts)"
+                );
+                let (down_proj, up_proj) = pca_top_directions(rows_flat, num_rows, head_dim, d_c);
+                projections.push(MlaHeadProjection { down_proj, up_proj, d_c });
+            }
+            layer.mla = Some(projections);
+        }
+        Ok(())
+    }
+
     fn new_caches(&self) -> Vec<LayerCache> {
         (0..self.config.num_layers).map(|_| LayerCache::new(self.config.num_kv_heads)).collect()
     }
@@ -542,5 +608,53 @@ mod tests {
         // 呼び出し元のaruaru-llm側でカタログ経由のロードをE2E検証する)。
         let cfg = QwenConfig::tiny(16);
         assert_eq!(cfg.num_heads % cfg.num_kv_heads, 0);
+    }
+
+    /// [`QwenModel::enable_mla_kv_compression_calibrated`]の基本動作
+    /// (2026-09-13追加、`GptModel`版の移植)。合成の(=事前学習していない)
+    /// ランダム重みモデルでの検証のため、圧縮後の生成品質そのものは
+    /// 評価できない(意味のある品質評価には実学習済み重みが要る——
+    /// `GptModel`版の`calibrated_pca_mla_kv_compression_on_real_gpt2_weights`
+    /// と同じ制約)。ここで確認するのは「較正が成功し、パニックせず
+    /// 生成まで完走する」という配線レベルの正しさ。
+    #[test]
+    fn calibrated_pca_mla_kv_compression_completes_and_generates_without_panicking() {
+        let config = QwenConfig::tiny(64); // hidden=32, num_heads=4, num_kv_heads=2 => head_dim=8
+        let mut model = QwenModel::load_random(config, 55);
+        let device = device();
+        // 較正用プロンプト複数(各層・各KVヘッドともd_c=2以上の行数を
+        // 確保するため、十分な長さ・本数にする)。
+        let sample_prompts: Vec<Vec<u32>> = vec![vec![1, 2, 3, 4, 5, 6], vec![7, 8, 9, 10], vec![11, 12, 13, 14, 15]];
+        model.enable_mla_kv_compression_calibrated(2, device.as_ref(), &sample_prompts).unwrap();
+
+        let generated = model.generate(&device, &[1, 2, 3], 6).unwrap();
+        assert_eq!(generated.len(), 6);
+    }
+
+    /// 較正には`d_c >= head_dim`(圧縮になっていない)、空のプロンプト列、
+    /// 既に圧縮済みのモデルへの再較正、をそれぞれ拒否すること
+    /// (`GptModel`版と同じ不変条件)。
+    #[test]
+    fn calibrated_pca_mla_kv_compression_rejects_invalid_inputs() {
+        let config = QwenConfig::tiny(32); // head_dim=8
+        let device = device();
+
+        let mut model = QwenModel::load_random(config.clone(), 1);
+        assert!(model.enable_mla_kv_compression_calibrated(8, device.as_ref(), &[vec![1, 2, 3]]).is_err());
+        assert!(model.enable_mla_kv_compression_calibrated(0, device.as_ref(), &[vec![1, 2, 3]]).is_err());
+
+        let mut model2 = QwenModel::load_random(config.clone(), 2);
+        assert!(model2.enable_mla_kv_compression_calibrated(2, device.as_ref(), &[]).is_err());
+
+        // 較正データが少なすぎる(d_c未満の行数しか集まらない)場合は
+        // 意味のあるPCA基底を作れないため拒否する。
+        let mut model3 = QwenModel::load_random(config.clone(), 3);
+        assert!(model3.enable_mla_kv_compression_calibrated(4, device.as_ref(), &[vec![1]]).is_err());
+
+        // 既に(ランダム射影版で)圧縮済みのモデルへ較正版を重ねて
+        // 適用するのは拒否する(フル精度の活性化が既に失われているため)。
+        let mut model4 = QwenModel::load_random(config, 4);
+        model4.enable_mla_kv_compression(2, 999).unwrap();
+        assert!(model4.enable_mla_kv_compression_calibrated(2, device.as_ref(), &[vec![1, 2, 3, 4]]).is_err());
     }
 }

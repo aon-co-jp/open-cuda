@@ -275,3 +275,58 @@ thin public entry point. No existing kernel name's behavior or argument
 contract changed. This resolves the "generic N-buffer dispatch" item
 that `open-directx/PORTING.md` had recorded as its top-priority next
 step for real-GPU-verifying chain kernels with more than 3 buffers.
+
+## `QwenModel`へPCA較正版MLA風KVキャッシュ圧縮を移植(2026-09-13追加)
+
+セクション9(`GptModel`のMLA風低ランクKVキャッシュ圧縮)の続き。
+`QwenModel::enable_mla_kv_compression`(ランダム射影版)は既に実装
+済みだったが、そのdocコメント自身が「PCA較正版の`QwenModel`移植は
+今回のスコープ外(次の増分)」と明記していた——今回その次の増分を
+実施した。
+
+`GptModel::enable_mla_kv_compression_calibrated`(2026-08-08新設、
+非中心PCAで実際のK/V活性化統計から射影を較正する版)と同じ設計
+(`lib.rs`の`pca_top_directions`をそのまま再利用、直交基底のため
+`up_proj=down_proj`の転置)を、GQA(クエリヘッド数よりKVヘッド数が
+少ない場合がある)に対応する形で`QwenModel::enable_mla_kv_compression_
+calibrated`として移植した。`GptModel`版は`forward_prefill_all_layers`
+(バッチ処理)で較正データを集めるが、`QwenModel`にはまだその一括版が
+無いため`forward_step`をプロンプトのトークン数ぶん逐次呼び出す形に
+した(結果は数学的に同じ、実行効率のみの違い)。
+
+新規テスト2本(`QwenConfig::tiny`の合成ランダム重みで検証——実学習済み
+Qwen重みは本セッションでは未使用、`GptModel`版の`calibrated_pca_mla_
+kv_compression_on_real_gpt2_weights`が実GPT-2重み任意配置時のみ実行
+される既存の枠組みと同じ制約): 較正が成功し生成まで完走すること、
+および無効な入力(`d_c>=head_dim`、空プロンプト列、較正データ不足、
+既圧縮モデルへの再較正)を正しく拒否すること。
+
+`cargo test -p open-cuda-llm`: 全緑(57件、up from 55)。`cargo clippy`:
+`open-cuda-llm`自体はクリーン(依存クレート`opencuda-vulkan`に既存の
+無関係な`chunks_exact`系lint3件があるのみ、このセッションでは変更
+していない)。
+
+**正直な開示(このセクション9系全体に通底する制約、再確認)**: これは
+DeepSeek-V2/V3の実際のMLA(学習時から低ランク射影+decoupled RoPEを
+組み込んだアーキテクチャ、実チェックポイントの`kv_a_proj_with_mqa`/
+`kv_b_proj`/`q_a_proj`/`q_b_proj`等の専用テンソルが必要)ではない——
+**「MLA風」**、つまり既に標準Attentionで学習済みのモデルへ事後的に
+低ランクKVキャッシュ圧縮を後付けする手法である。ユーザーから
+「DeepSeekのMLA実装」という依頼があった際の候補としては、本当の
+DeepSeek-V2/V3チェックポイントを読み込む新規アーキテクチャモジュール
+(`qwen_arch.rs`と同じパターンの`deepseek_arch.rs`)を追加する方が
+本来の意味での「MLA実装」に近いが、これは重みローダー・KVキャッシュ
+構造・GPU側matmulディスパッチにまたがる大きな新規アーキテクチャ追加
+であり、今回はセクション9系の既存トラジェクトリ(既存コードが自ら
+「次の増分」と明記していた具体的なタスク)を優先して完了させた。
+`deepseek_arch.rs`の新設(実チェックポイント対応)は、別途まとまった
+セッションとして今後の課題に残す。
+
+**関連する既発見(混同の解消、参考)**: `open-cuda-llm::GptModel::
+analyze_layer_redundancy`(2026-09-01新設)のモジュールdocに、
+「DeepSeekの折りたたみ理論」という依頼を受けて調査した結果**「DeepSeekの
+foldingという技術は実在しない」**(DeepSeekの実際の効率化技術はMLA・
+FP8混合精度・DeepSeekMoEであり、「折りたたみ」ではない;混同の元は
+無関係の「Model Folding」論文〈ICLR 2025、Wang et al.〉)という結論が
+既に記録されている——今回のセッションで同じ疑問が改めて挙がったため、
+既存の調査結果をここに再度リンクして参照しやすくしておく。
