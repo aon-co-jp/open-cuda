@@ -6,6 +6,30 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13)**: `open-cuda-llm::QwenModel`へPCA較正版
+> MLA風KVキャッシュ圧縮(`enable_mla_kv_compression_calibrated`)を
+> 移植した——`GptModel`版は既にあったが、`QwenModel`側(GQA対応)は
+> ランダム射影版のみで、docコメント自身が「PCA較正版の移植は次の
+> 増分」と明記していたものへの対応。**正直な開示**: これは実際の
+> DeepSeek-V2/V3のMLA(学習時から低ランク射影を組み込んだ専用
+> アーキテクチャ)ではなく、既存モデルへの事後的な低ランクKVキャッシュ
+> 圧縮(「MLA風」)——本当の意味でのMLA実装(実チェックポイント対応の
+> 新規アーキテクチャモジュール)は別途まとまったセッションが必要な
+> 課題として記録した。詳細は[PORTING.md](PORTING.md)・
+> [CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Ported PCA-calibrated MLA-style KV-cache compression
+> (`enable_mla_kv_compression_calibrated`) to `open-cuda-llm::
+> QwenModel` — `GptModel` already had it, but `QwenModel` (GQA) only
+> had the random-projection variant, with its own doc comment noting
+> the calibrated port as the next increment. **Honest scope**: this is
+> not real DeepSeek-V2/V3 MLA (an architecture trained from scratch
+> with low-rank projections) but post-hoc compression applied to an
+> already-trained standard-attention model ("MLA-style") — genuine MLA
+> support (a new architecture module for real checkpoints) is recorded
+> as a separate, larger future task. See [PORTING.md](PORTING.md) /
+> [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-05)**: `hgemm`(F16)/`dgemm`(F64)へ実Vulkan
 > GPUディスパッチを実装した。`hgemm`は half 2要素を1uintへパックする
 > 専用シェーダ(`hgemm.comp`、`unpackHalf2x16`/`packHalf2x16`、追加の

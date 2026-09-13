@@ -3370,3 +3370,30 @@ QKV射影・softmax・P·V・KVキャッシュpushの演算自体は毎回実行
 無変更(完全加算)。詳細は`PORTING.md`「chain_n_buffer汎用Nバッファ
 ディスパッチ」節参照。`cargo test -p opencuda-vulkan --features
 real-vulkan`: 既存テストに回帰無し。
+
+## HANDOFF追記(2026-09-13) QwenModelへPCA較正版MLA風KVキャッシュ圧縮を移植(GptModel版の既存トラジェクトリを完了)
+
+ユーザーから「DeepSeekのMLA実装」の依頼を受け、`aruaru-llm`/
+`open-cuda-llm`を調査した結果、実際の作業対象は`open-cuda-llm`側
+(`GptModel`)に既にあり、`QwenModel::enable_mla_kv_compression`の
+docコメント自身が「PCA較正版の移植は次の増分」と明記していたことが
+判明。その次の増分(`enable_mla_kv_compression_calibrated`の
+`QwenModel`〈GQA対応〉への移植)を実施した。詳細は`PORTING.md`
+「QwenModelへPCA較正版MLA風KVキャッシュ圧縮を移植」節参照。
+
+`cargo test -p open-cuda-llm`: 全緑(57件)。`cargo clippy`:
+`open-cuda-llm`自体はクリーン(依存クレート`opencuda-vulkan`の既存
+無関係lintのみ)。
+
+**正直な開示**: これは実際のDeepSeek-V2/V3 MLA(学習時から低ランク
+射影+decoupled RoPEを組み込んだアーキテクチャ)ではなく、既存の
+「MLA風」事後圧縮の枠組みへの増分——本当の意味でのMLA実装
+(`deepseek_arch.rs`新設、実チェックポイント対応)は、重みローダー・
+KVキャッシュ構造・GPU側matmulディスパッチにまたがる大きな新規
+アーキテクチャ追加であり、別途まとまったセッションが必要な今後の
+課題として`PORTING.md`に記録した。
+
+また、`GptModel::analyze_layer_redundancy`のモジュールdocに既に
+記録されている「DeepSeekのfolding理論は実在しない」(実際は無関係の
+ICLR 2025「Model Folding」論文との混同)という調査結果を、今回同じ
+疑問が再提起されたため`PORTING.md`から参照しやすくした。
