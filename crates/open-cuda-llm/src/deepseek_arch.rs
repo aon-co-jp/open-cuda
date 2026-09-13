@@ -110,30 +110,46 @@
 //!   単体テストで検証したものであり、実V3チェックポイントでの実機
 //!   検証は行っていない(行うこと自体が非現実的)。
 //!
-//! **2026-09-13(続き5)追記・実機検証の具体的な試算**: より小型な
-//! `deepseek-ai/DeepSeek-V2-Lite-Chat`(15.7B、`n_group=1`・
+//! **2026-09-13(続き5)追記・実機検証の具体的な試算(当初の見送り判断)**:
+//! より小型な`deepseek-ai/DeepSeek-V2-Lite-Chat`(15.7B、`n_group=1`・
 //! `topk_method="greedy"`・`scoring_func="softmax"`——この実装が対応
-//! 済みの構成)についても、実際に`model.safetensors.index.json`を
-//! 取得して試算した結果、**この開発機での実ダウンロード・実ロード検証は
+//! 済みの構成)について、実際に`model.safetensors.index.json`を取得して
+//! 試算した結果、**当初はこの開発機での実ダウンロード・実ロード検証を
 //! 見送った**。理由: 実チェックポイントは31.4GB(bf16)・4分割
-//! (`model-00001-of-000004.safetensors`等)で配布されており(対応の
-//! ため`ModelWeights::load_sharded`を新設——下記参照)、現在のローダー
-//! 設計(各シャードの生バイト列を`ModelWeights`が一括保持しつつ、
-//! 全テンソルをf32へ変換して`DeepseekModel`が永続保持する)では、
-//! ピークメモリが「シャード生データ31.4GB」+「f32変換後の全重み
-//! (bf16の2倍、約62.8GB)」を同時に抱える構成になり得るため、
-//! 90GBを超えるメモリを要求する可能性が高い。この開発機の実測
-//! (`Get-CimInstance Win32_OperatingSystem`)は総RAM 32GB・空き16GB
-//! ——実行すればスワップの多発やプロセスのクラッシュ、最悪OS全体の
-//! 不安定化を招く恐れがあるため、**無理に実行せず見送った**
-//! (「実機検証した」と偽らず、リスクの実測値とともに正直に記録する)。
-//! かわりに、`ModelWeights::load_sharded`のロード経路そのものは、
-//! 合成の決定的な値で埋めた極小チェックポイントを2ファイルに分割して
-//! ディスクへ実際に書き出すテスト
-//! (`load_parses_sharded_safetensors_checkpoint_split_across_two_files`)
-//! で検証済み——分割ロードのロジック自体に欠陥が無いことは実際の
-//! ファイルI/Oを通して確認しているが、実DeepSeekチェックポイントの
-//! テンソル値そのものでの検証ではない。
+//! (`model-00001-of-000004.safetensors`等)で配布されており、当時の
+//! ローダー設計(各シャードの生バイト列を一括保持しつつ、全テンソルを
+//! f32へ変換して永続保持する)では、ピークメモリが90GBを超える可能性が
+//! 高いと判断したため(この開発機の実測総RAM32GB・空き16GB)。
+//!
+//! **2026-09-13(続き6)追記・遅延ロードによる再検討**: ユーザーから
+//! 「システムメモリで90GB超になるなら、HDDのキャッシュを用意しても
+//! ダメか」との指摘を受け、`ModelWeights`をヘッダのみ読み込み+
+//! テンソルごとのオンデマンド`seek`+`read`方式へ再設計し、さらに
+//! ルーティングされる個々のエキスパートを[`ExpertSlot::Lazy`]として
+//! 「実際にルーターに選ばれるまでディスクを読まない」設計にした
+//! (`ModelWeights`・`ExpertSlot`のdocコメント参照)。これにより
+//! 常時使う部分(attention・共有エキスパート・denseの層0のMLP・埋め込み)
+//! だけならf32で概算5GB程度に収まり、実チェックポイント
+//! (`hidden_size=2048`・`n_routed_experts=64`・`num_experts_per_tok=6`・
+//! `moe_intermediate_size=1408`)を**数トークンだけ生成する短い検証**
+//! なら、追加で読み込まれるエキスパート分(1トークンあたり最大
+//! `num_experts_per_tok×MoE層数`個、1個あたり約35MB)を足しても
+//! 十数GB程度に収まる見込みとなり、この開発機の空きRAM(16GB)内で
+//! 現実的になった——ただし生成トークン数が増えるほどルーティングが
+//! 広範囲のエキスパートに触れていき、最終的には元の約60GBという上限に
+//! 近づいていく点は変わらない(コンパートメント化された恒久的な解決
+//! ではなく、短い検証を可能にする設計改善)。この再計算に基づき実際に
+//! ダウンロード・実機検証を試みた結果は、このモジュールの直近のHANDOFF
+//! (`open-cuda/CLAUDE.md`)に記録する。
+//!
+//! `ModelWeights::load_sharded`のロード経路そのものは、合成の決定的な
+//! 値で埋めた極小チェックポイントを2ファイルに分割してディスクへ実際に
+//! 書き出すテスト
+//! (`load_parses_sharded_safetensors_checkpoint_split_across_two_files`)、
+//! および実際にMoE層を含む合成チェックポイントで`ExpertSlot::Lazy`が
+//! 正しく機能することを検証するテスト
+//! (`load_parses_moe_checkpoint_and_lazily_loads_selected_experts`)で
+//! 検証済み。
 //! - **学習専用ロジックは実装しない**(推論専用実装のため無関係):
 //!   auxiliary loss計算・逆伝播・expert-parallelism分散シャーディング
 //!   ・capacity factor等はすべて省略(調査で確認した通り、DeepSeek公式
@@ -472,7 +488,37 @@ struct DeepseekMoeMlp {
     /// 「V3固有拡張」参照)。
     e_score_correction_bias: Option<Vec<f32>>,
     shared_experts: DenseSwiGlu,
-    experts: Vec<DenseSwiGlu>,
+    experts: Vec<ExpertSlot>,
+}
+
+/// ルーティングされる個々のエキスパートの遅延ロード枠(2026-09-13続き6
+/// 追加、モジュールdoc「遅延ロード」参照)。`DeepSeekMoE`は1トークン
+/// あたり`num_experts_per_tok`個(実チェックポイントでは64個中6個等)
+/// しか使わないため、`DeepseekModel::load`時点では**メタデータ
+/// (テンソル名・shape)だけ**を保持し、実際にそのエキスパートが
+/// ルーターに選ばれて初めて`ModelWeights`からディスクを読んで
+/// `DenseSwiGlu`を構築・キャッシュする。`load_random`(テスト用ランダム
+/// 重み、規模が小さいので遅延の恩恵が無い)では最初から`Loaded`で
+/// 構築する。
+enum ExpertSlot {
+    Loaded(DenseSwiGlu),
+    Lazy { prefix: String, hidden: usize, intermediate: usize, cell: std::sync::OnceLock<DenseSwiGlu> },
+}
+
+impl ExpertSlot {
+    fn get(&self, weights: Option<&ModelWeights>) -> Result<&DenseSwiGlu> {
+        match self {
+            ExpertSlot::Loaded(d) => Ok(d),
+            ExpertSlot::Lazy { prefix, hidden, intermediate, cell } => {
+                if let Some(existing) = cell.get() {
+                    return Ok(existing);
+                }
+                let weights = weights.context("open-cuda-llm: DeepSeekMoE lazy expert requires ModelWeights but none was retained on this model (load_random path should never construct a Lazy slot)")?;
+                let loaded = load_dense_swiglu(weights, prefix, *hidden, *intermediate)?;
+                Ok(cell.get_or_init(|| loaded))
+            }
+        }
+    }
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -495,7 +541,7 @@ enum DeepseekMlp {
 }
 
 impl DeepseekMlp {
-    fn forward(&self, device: &dyn GpuDevice, x: &[f32], cfg: &DeepseekConfig) -> Result<Vec<f32>> {
+    fn forward(&self, device: &dyn GpuDevice, x: &[f32], cfg: &DeepseekConfig, weights: Option<&ModelWeights>) -> Result<Vec<f32>> {
         match self {
             DeepseekMlp::Dense(dense) => dense.forward(device, x),
             DeepseekMlp::Moe(moe) => {
@@ -544,20 +590,22 @@ impl DeepseekMlp {
                 ranked.sort_unstable_by(|&a, &b| select_scores[b].partial_cmp(&select_scores[a]).expect("open-cuda-llm: DeepSeekMoE router score must not be NaN"));
                 let selected = &ranked[..cfg.num_experts_per_tok];
 
-                let mut weights: Vec<f32> = selected.iter().map(|&i| original_scores[i]).collect();
+                let mut route_weights: Vec<f32> = selected.iter().map(|&i| original_scores[i]).collect();
                 if cfg.scoring_func == "sigmoid" || cfg.norm_topk_prob {
-                    let sum: f32 = weights.iter().sum();
-                    for w in &mut weights {
+                    let sum: f32 = route_weights.iter().sum();
+                    for w in &mut route_weights {
                         *w /= sum;
                     }
                 }
-                for w in &mut weights {
+                for w in &mut route_weights {
                     *w *= cfg.routed_scaling_factor;
                 }
 
                 let mut y = vec![0.0f32; x.len()];
-                for (&expert_idx, &weight) in selected.iter().zip(&weights) {
-                    let expert_out = moe.experts[expert_idx].forward(device, x)?;
+                for (&expert_idx, &weight) in selected.iter().zip(&route_weights) {
+                    // 選ばれたエキスパートだけをこの時点で遅延ロードする
+                    // (モジュールdoc「遅延ロード」参照、`ExpertSlot::get`)。
+                    let expert_out = moe.experts[expert_idx].get(weights)?.forward(device, x)?;
                     for (acc, v) in y.iter_mut().zip(&expert_out) {
                         *acc += weight * v;
                     }
@@ -597,7 +645,7 @@ impl DeepseekLayer {
                 gate: Linear::random(rng, hidden, cfg.n_routed_experts),
                 e_score_correction_bias: if cfg.topk_method == "noaux_tc" { Some(random_vec(rng, cfg.n_routed_experts, 0.02)) } else { None },
                 shared_experts: DenseSwiGlu::random(rng, hidden, cfg.moe_intermediate_size * cfg.n_shared_experts),
-                experts: (0..cfg.n_routed_experts).map(|_| DenseSwiGlu::random(rng, hidden, cfg.moe_intermediate_size)).collect(),
+                experts: (0..cfg.n_routed_experts).map(|_| ExpertSlot::Loaded(DenseSwiGlu::random(rng, hidden, cfg.moe_intermediate_size))).collect(),
             }))
         } else {
             DeepseekMlp::Dense(Box::new(DenseSwiGlu::random(rng, hidden, cfg.intermediate_size)))
@@ -641,6 +689,11 @@ pub struct DeepseekModel {
     layers: Vec<DeepseekLayer>,
     norm: RmsNorm,
     lm_head: Option<Linear>,
+    /// `load()`経由でロードされたモデルのみ`Some`(遅延ロードされる
+    /// `ExpertSlot::Lazy`がディスクを読むために必要、モジュールdoc
+    /// 「遅延ロード」参照)。`load_random`は全エキスパートを最初から
+    /// `Loaded`で構築するため`None`のままで問題ない。
+    weights: Option<ModelWeights>,
 }
 
 impl DeepseekModel {
@@ -650,7 +703,7 @@ impl DeepseekModel {
         let layers = (0..config.num_layers).map(|layer_idx| DeepseekLayer::random(&mut rng, &config, layer_idx)).collect();
         let norm = RmsNorm::identity(config.hidden_size, config.rms_norm_eps);
         let lm_head = if config.tie_word_embeddings { None } else { Some(Linear::random(&mut rng, config.hidden_size, config.vocab_size)) };
-        Self { config, embed_tokens, layers, norm, lm_head }
+        Self { config, embed_tokens, layers, norm, lm_head, weights: None }
     }
 
     /// 実在の学習済み重み(`config.json` + 単一ファイルの
@@ -748,7 +801,7 @@ impl DeepseekModel {
             Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
         };
 
-        Ok(Self { config, embed_tokens, layers, norm, lm_head })
+        Ok(Self { config, embed_tokens, layers, norm, lm_head, weights: Some(weights) })
     }
 
     fn new_caches(&self) -> Vec<LayerCache> {
@@ -854,7 +907,7 @@ impl DeepseekModel {
             // ---- MLP(dense SwiGLUまたはDeepSeekMoE)サブ層(pre-norm) ----
             let mut normed2 = hidden_state.clone();
             layer.post_attention_layernorm.forward_row(&mut normed2);
-            let mlp_out = layer.mlp.forward(device, &normed2, cfg)?;
+            let mlp_out = layer.mlp.forward(device, &normed2, cfg, self.weights.as_ref())?;
             for (h, m) in hidden_state.iter_mut().zip(&mlp_out) {
                 *h += m;
             }
@@ -908,21 +961,61 @@ impl DeepseekModel {
 /// 単一の`model.safetensors`、または`model.safetensors.index.json`+
 /// 複数の`model-NNNNN-of-MMMMM.safetensors`という分割済み(sharded)
 /// チェックポイントの両方を透過的に読めるようにする抽象化
-/// (2026-09-13追加、`load()`のdocコメント参照)。各シャードの生バイト列
-/// (`shard_bytes`)を保持し、テンソル名ごとにどのシャードに含まれるかを
-/// `tensor_shard`(名前→`shard_bytes`のインデックス)で引く。
-/// `safetensors::SafeTensors`はバイト列を借用するだけの薄いビューで
-/// ヘッダ解析コストのみ(データ自体のコピーは無い)なので、テンソル
-/// アクセスのたびに対象シャードだけ`deserialize`し直しても実用上問題ない
-/// (自己参照構造体を避けるための単純な設計判断)。
+/// (2026-09-13追加、`load()`のdocコメント参照)。
+///
+/// **2026-09-13(続き6)設計変更(遅延ロード)**: 当初は各シャードの
+/// 生バイト列を丸ごとメモリへ読み込んでいたが(全シャード合計で
+/// 実チェックポイントの場合31.4GB)、ユーザーから「システムメモリで
+/// 90GB超になるなら、HDDのキャッシュを用意してもダメか」との指摘を
+/// 受け再設計した。OSのページキャッシュは`std::fs::read`した内容を
+/// 裏で自動キャッシュするだけで、Rustプロセス自身が二重に確保する
+/// ヒープメモリ(変換後のf32配列)を減らしはしない——真の問題は
+/// 「全テンソルを一括でf32へ変換し永続保持する」設計そのものだった。
+///
+/// そこで、各safetensorsファイルの**ヘッダ(数KB程度)だけ**を起動時に
+/// 読み、テンソルごとの位置(ファイルパス・バイトオフセット・dtype・
+/// shape)だけを`tensor_meta`に記録する。実データは
+/// [`tensor_f32`](Self::tensor_f32)が呼ばれた時点で該当バイト範囲だけ
+/// `seek`+`read`し、その場でf32へ変換する(ディスクを実質的な
+/// バッキングストアとして使う設計)。さらにDeepSeekMoEの疎性
+/// (1トークンあたり`n_routed_experts`個中`num_experts_per_tok`個しか
+/// 使わない)を活かし、ルーティングされる個々のエキスパートは
+/// [`ExpertSlot::Lazy`]として「実際に選ばれるまでこの`tensor_f32`すら
+/// 呼ばない」設計にした(モジュールdoc・`ExpertSlot`参照)——これにより
+/// 常駐メモリは「常時使う部分(attention・共有エキスパート・denseの
+/// MLP)+実際に選ばれたエキスパートの累積」だけで済み、モデル全体を
+/// 一括でf32展開する必要が無くなる。
 struct ModelWeights {
-    shard_bytes: Vec<Vec<u8>>,
-    tensor_shard: std::collections::HashMap<String, usize>,
+    /// テンソル名 → (ファイルパス, ファイル内でのデータ開始バイト位置,
+    /// dtype/shape/data_offsetsを含むsafetensorsヘッダのJSONエントリ)。
+    tensor_meta: std::collections::HashMap<String, (std::path::PathBuf, u64, serde_json::Value)>,
 }
 
 #[derive(serde::Deserialize)]
 struct SafetensorsIndex {
     weight_map: std::collections::HashMap<String, String>,
+}
+
+/// safetensorsファイルの先頭ヘッダだけを読む(データ本体は読まない)。
+/// フォーマット: 先頭8バイトがヘッダ長(リトルエンディアンu64)、続く
+/// その長さぶんがJSONヘッダ、以降がテンソル実データ
+/// (<https://github.com/huggingface/safetensors>の仕様通り)。戻り値は
+/// (データ本体の開始バイト位置, `__metadata__`を除いたヘッダのJSON map)。
+fn read_safetensors_header(path: &Path) -> Result<(u64, serde_json::Map<String, serde_json::Value>)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open-cuda-llm: failed to open {}", path.display()))?;
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf).with_context(|| format!("open-cuda-llm: failed to read safetensors header length from {}", path.display()))?;
+    let header_len = u64::from_le_bytes(len_buf);
+    let mut header_buf = vec![0u8; header_len as usize];
+    file.read_exact(&mut header_buf).with_context(|| format!("open-cuda-llm: failed to read safetensors header from {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&header_buf).with_context(|| format!("open-cuda-llm: failed to parse safetensors header JSON in {}", path.display()))?;
+    let mut map = match value {
+        serde_json::Value::Object(m) => m,
+        _ => anyhow::bail!("open-cuda-llm: safetensors header in {} is not a JSON object", path.display()),
+    };
+    map.remove("__metadata__");
+    Ok((8 + header_len, map))
 }
 
 impl ModelWeights {
@@ -932,15 +1025,15 @@ impl ModelWeights {
             Self::load_sharded(dir, &index_path)
         } else {
             let path = dir.join("model.safetensors");
-            let bytes = std::fs::read(&path).with_context(|| format!("open-cuda-llm: failed to read {}", path.display()))?;
-            let names: Vec<String> = safetensors::SafeTensors::deserialize(&bytes).context("open-cuda-llm: failed to parse model.safetensors")?.names().into_iter().map(|s| s.to_string()).collect();
-            let tensor_shard = names.into_iter().map(|n| (n, 0usize)).collect();
-            Ok(Self { shard_bytes: vec![bytes], tensor_shard })
+            let (data_start, header) = read_safetensors_header(&path)?;
+            let tensor_meta = header.into_iter().map(|(name, entry)| (name, (path.clone(), data_start, entry))).collect();
+            Ok(Self { tensor_meta })
         }
     }
 
     /// `model.safetensors.index.json`(`weight_map`: テンソル名→ファイル名)
-    /// を読み、参照される各シャードファイルを一度だけ読み込む。実在する
+    /// を読み、参照される各シャードファイルの**ヘッダだけ**を一度ずつ
+    /// 読む(データ本体は読まない、モジュールdoc参照)。実在する
     /// `deepseek-ai/DeepSeek-V2-Lite-Chat`で実際に確認した形式
     /// (`model-00001-of-000004.safetensors`等、4分割・合計31.4GB)。
     fn load_sharded(dir: &Path, index_path: &Path) -> Result<Self> {
@@ -948,29 +1041,61 @@ impl ModelWeights {
         let index: SafetensorsIndex = serde_json::from_slice(&index_bytes).context("open-cuda-llm: failed to parse model.safetensors.index.json")?;
         ensure!(!index.weight_map.is_empty(), "open-cuda-llm: model.safetensors.index.json has an empty weight_map");
 
-        let mut filename_to_shard: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut shard_bytes: Vec<Vec<u8>> = Vec::new();
-        let mut tensor_shard: std::collections::HashMap<String, usize> = std::collections::HashMap::with_capacity(index.weight_map.len());
+        let mut header_cache: std::collections::HashMap<String, (u64, serde_json::Map<String, serde_json::Value>)> = std::collections::HashMap::new();
+        let mut tensor_meta = std::collections::HashMap::with_capacity(index.weight_map.len());
         for (tensor_name, filename) in index.weight_map {
-            let shard_idx = match filename_to_shard.get(&filename) {
-                Some(&idx) => idx,
-                None => {
-                    let shard_path = dir.join(&filename);
-                    let bytes = std::fs::read(&shard_path).with_context(|| format!("open-cuda-llm: failed to read shard {}", shard_path.display()))?;
-                    let idx = shard_bytes.len();
-                    shard_bytes.push(bytes);
-                    filename_to_shard.insert(filename, idx);
-                    idx
-                }
-            };
-            tensor_shard.insert(tensor_name, shard_idx);
+            if !header_cache.contains_key(&filename) {
+                let shard_path = dir.join(&filename);
+                let header = read_safetensors_header(&shard_path)?;
+                header_cache.insert(filename.clone(), header);
+            }
+            let (data_start, header) = &header_cache[&filename];
+            let entry = header.get(&tensor_name).with_context(|| format!("open-cuda-llm: tensor '{tensor_name}' listed in model.safetensors.index.json but not found in {filename}'s own header"))?.clone();
+            tensor_meta.insert(tensor_name, (dir.join(&filename), *data_start, entry));
         }
-        Ok(Self { shard_bytes, tensor_shard })
+        Ok(Self { tensor_meta })
+    }
+
+    /// 該当テンソルの実データバイト範囲だけをディスクから`seek`+`read`し、
+    /// その場でf32へ変換する(モジュールdoc「遅延ロード」参照——モデル
+    /// 全体を一括で読み込まない設計の核心部分)。`safetensors`クレートは
+    /// バッファ全体からの解析しかサポートしないため、読み取った実データ
+    /// バイト列だけを内容とする「1テンソルだけのsafetensorsバッファ」を
+    /// その場で組み立てて`SafeTensors::deserialize`に通す(dtype変換
+    /// ロジック自体は既存の`tensor_f32`をそのまま再利用するための
+    /// 実装上の工夫、二重実装を避ける)。
+    /// 実データを読まず、そのテンソル名がヘッダ上に存在するかだけを
+    /// 確認する(`load_mlp`の遅延エキスパート契約チェック用)。
+    fn contains(&self, name: &str) -> bool {
+        self.tensor_meta.contains_key(name)
     }
 
     fn tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
-        let &shard_idx = self.tensor_shard.get(name).with_context(|| format!("open-cuda-llm: tensor '{name}' not found in checkpoint"))?;
-        let tensors = safetensors::SafeTensors::deserialize(&self.shard_bytes[shard_idx]).context("open-cuda-llm: failed to re-parse a shard's safetensors header")?;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (path, data_start, entry) = self.tensor_meta.get(name).with_context(|| format!("open-cuda-llm: tensor '{name}' not found in checkpoint"))?;
+        let offsets = entry.get("data_offsets").and_then(|v| v.as_array()).with_context(|| format!("open-cuda-llm: tensor '{name}' header entry is missing 'data_offsets'"))?;
+        let begin = offsets[0].as_u64().context("open-cuda-llm: data_offsets[0] is not a u64")?;
+        let end = offsets[1].as_u64().context("open-cuda-llm: data_offsets[1] is not a u64")?;
+        ensure!(end >= begin, "open-cuda-llm: tensor '{name}' has invalid data_offsets [{begin}, {end}]");
+
+        let mut file = std::fs::File::open(path).with_context(|| format!("open-cuda-llm: failed to open {}", path.display()))?;
+        file.seek(SeekFrom::Start(data_start + begin)).with_context(|| format!("open-cuda-llm: failed to seek in {}", path.display()))?;
+        let mut raw = vec![0u8; (end - begin) as usize];
+        file.read_exact(&mut raw).with_context(|| format!("open-cuda-llm: failed to read tensor '{name}' data from {}", path.display()))?;
+
+        let mut synthetic_entry = entry.clone();
+        synthetic_entry["data_offsets"] = serde_json::json!([0, raw.len()]);
+        let mut synthetic_header = serde_json::Map::new();
+        synthetic_header.insert(name.to_string(), synthetic_entry);
+        let header_json = serde_json::to_vec(&serde_json::Value::Object(synthetic_header)).context("open-cuda-llm: failed to build synthetic safetensors header")?;
+
+        let mut buf = Vec::with_capacity(8 + header_json.len() + raw.len());
+        buf.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&header_json);
+        buf.extend_from_slice(&raw);
+
+        let tensors = safetensors::SafeTensors::deserialize(&buf).with_context(|| format!("open-cuda-llm: failed to re-parse synthetic single-tensor buffer for '{name}'"))?;
         tensor_f32(&tensors, name)
     }
 }
@@ -991,9 +1116,20 @@ fn load_mlp(weights: &ModelWeights, layer_prefix: &str, config: &DeepseekConfig,
             None
         };
         let shared_experts = load_dense_swiglu(weights, &format!("{layer_prefix}.mlp.shared_experts"), hidden, config.moe_intermediate_size * config.n_shared_experts)?;
+        // ── ルーティングされる個々のエキスパートは遅延ロード ──
+        // (モジュールdoc「遅延ロード」・`ExpertSlot`参照)。実データは
+        // 読まないが、テンソル名の存在だけは`load()`の時点で検証し、
+        // 壊れたチェックポイントを生成の途中ではなくロード時点で
+        // 検知できるようにする(`ExpertSlot::get`が呼ばれるまで実データを
+        // 読まない設計でも、契約違反の早期発見は諦めない)。
         let mut experts = Vec::with_capacity(config.n_routed_experts);
         for e in 0..config.n_routed_experts {
-            experts.push(load_dense_swiglu(weights, &format!("{layer_prefix}.mlp.experts.{e}"), hidden, config.moe_intermediate_size)?);
+            let prefix = format!("{layer_prefix}.mlp.experts.{e}");
+            ensure!(
+                weights.contains(&format!("{prefix}.gate_proj.weight")),
+                "open-cuda-llm: layer {layer_idx}: expert {e} tensor '{prefix}.gate_proj.weight' not found in checkpoint"
+            );
+            experts.push(ExpertSlot::Lazy { prefix, hidden, intermediate: config.moe_intermediate_size, cell: std::sync::OnceLock::new() });
         }
         Ok(DeepseekMlp::Moe(Box::new(DeepseekMoeMlp { gate, e_score_correction_bias, shared_experts, experts })))
     } else {
@@ -1251,6 +1387,104 @@ mod tests {
         let device = device();
         let generated = model.generate(&device, &[1, 2, 3], 4).unwrap();
         assert_eq!(generated.len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **2026-09-13(続き6)追加**: `DeepseekModel::load`が実際にDeepSeekMoE
+    /// 層(`first_k_dense_replace=1`で層0=dense・層1=MoE)を含む合成
+    /// safetensorsから読み込み、遅延ロードされる`ExpertSlot::Lazy`が
+    /// 実際にディスクから正しく読めることを検証する(ここまでの
+    /// `deepseekmoe_*`系テストは全て`load_random`〈=`ExpertSlot::Loaded`〉
+    /// 経由だったため、`load()`から`ExpertSlot::Lazy`が正しく機能する
+    /// ことの直接的な回帰テストが無かった——ユーザー指摘を受けた
+    /// メモリ最適化〈遅延ロード〉の実装そのものを検証する)。
+    #[test]
+    fn load_parses_moe_checkpoint_and_lazily_loads_selected_experts() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use std::collections::HashMap;
+
+        let vocab = 12usize;
+        let hidden = 8usize;
+        let num_heads = 2usize;
+        let kv_lora_rank = 4usize;
+        let qk_nope = 2usize;
+        let qk_rope = 2usize;
+        let v_dim = 2usize;
+        let q_head_dim = qk_nope + qk_rope;
+        let intermediate = 8usize;
+        let kv_a_dim = kv_lora_rank + qk_rope;
+        let kv_b_out = num_heads * (qk_nope + v_dim);
+        let attn_out_dim = num_heads * v_dim;
+        let n_routed_experts = 4usize;
+        let n_shared_experts = 1usize;
+        let num_experts_per_tok = 2usize;
+        let moe_intermediate = 4usize;
+
+        let mut rng = SplitMix64::new(4242);
+        let mut buffers: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>, rng: &mut SplitMix64| {
+            let len: usize = shape.iter().product();
+            let bytes: Vec<u8> = random_vec(rng, len, 0.1).iter().flat_map(|v| v.to_le_bytes()).collect();
+            buffers.push((name, shape, bytes));
+        };
+
+        push("model.embed_tokens.weight".to_string(), vec![vocab, hidden], &mut rng);
+        for layer_idx in 0..2 {
+            let p = format!("model.layers.{layer_idx}");
+            push(format!("{p}.input_layernorm.weight"), vec![hidden], &mut rng);
+            push(format!("{p}.self_attn.q_proj.weight"), vec![num_heads * q_head_dim, hidden], &mut rng);
+            push(format!("{p}.self_attn.kv_a_proj_with_mqa.weight"), vec![kv_a_dim, hidden], &mut rng);
+            push(format!("{p}.self_attn.kv_a_layernorm.weight"), vec![kv_lora_rank], &mut rng);
+            push(format!("{p}.self_attn.kv_b_proj.weight"), vec![kv_b_out, kv_lora_rank], &mut rng);
+            push(format!("{p}.self_attn.o_proj.weight"), vec![hidden, attn_out_dim], &mut rng);
+            push(format!("{p}.post_attention_layernorm.weight"), vec![hidden], &mut rng);
+            if layer_idx == 0 {
+                // first_k_dense_replace=1 なので層0はdense。
+                push(format!("{p}.mlp.gate_proj.weight"), vec![intermediate, hidden], &mut rng);
+                push(format!("{p}.mlp.up_proj.weight"), vec![intermediate, hidden], &mut rng);
+                push(format!("{p}.mlp.down_proj.weight"), vec![hidden, intermediate], &mut rng);
+            } else {
+                // 層1はMoE。
+                push(format!("{p}.mlp.gate.weight"), vec![n_routed_experts, hidden], &mut rng);
+                push(format!("{p}.mlp.shared_experts.gate_proj.weight"), vec![moe_intermediate * n_shared_experts, hidden], &mut rng);
+                push(format!("{p}.mlp.shared_experts.up_proj.weight"), vec![moe_intermediate * n_shared_experts, hidden], &mut rng);
+                push(format!("{p}.mlp.shared_experts.down_proj.weight"), vec![hidden, moe_intermediate * n_shared_experts], &mut rng);
+                for e in 0..n_routed_experts {
+                    push(format!("{p}.mlp.experts.{e}.gate_proj.weight"), vec![moe_intermediate, hidden], &mut rng);
+                    push(format!("{p}.mlp.experts.{e}.up_proj.weight"), vec![moe_intermediate, hidden], &mut rng);
+                    push(format!("{p}.mlp.experts.{e}.down_proj.weight"), vec![hidden, moe_intermediate], &mut rng);
+                }
+            }
+        }
+        push("model.norm.weight".to_string(), vec![hidden], &mut rng);
+
+        let mut views: HashMap<String, TensorView> = HashMap::new();
+        for (name, shape, bytes) in &buffers {
+            views.insert(name.clone(), TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap());
+        }
+        let serialized = safetensors::serialize(&views, &None).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("open-cuda-llm-deepseek-moe-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), serialized).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"vocab_size":{vocab},"hidden_size":{hidden},"num_hidden_layers":2,"num_attention_heads":{num_heads},
+                "kv_lora_rank":{kv_lora_rank},"qk_nope_head_dim":{qk_nope},"qk_rope_head_dim":{qk_rope},"v_head_dim":{v_dim},
+                "intermediate_size":{intermediate},"tie_word_embeddings":true,
+                "first_k_dense_replace":1,"n_routed_experts":{n_routed_experts},"n_shared_experts":{n_shared_experts},
+                "num_experts_per_tok":{num_experts_per_tok},"moe_intermediate_size":{moe_intermediate},
+                "scoring_func":"softmax","topk_method":"greedy"}}"#
+            ),
+        )
+        .unwrap();
+
+        let model = DeepseekModel::load(&dir).expect("DeepseekModel::load should read a MoE checkpoint and lazily load only the experts actually selected");
+        let device = device();
+        let generated = model.generate(&device, &[1, 2, 3], 5).unwrap();
+        assert_eq!(generated.len(), 5);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

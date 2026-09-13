@@ -89,6 +89,66 @@ SET構成(GPU/CPU実行パイプラインの実装先)。
   実行・INT4/INT8量子化等)。
 - `CHANGELOG.md` — バージョン履歴。
 
+## HANDOFF追記(2026-09-13(続き6)、遅延ロード(ヘッダのみ読み込み+オンデマンドseek+read+エキスパート単位の遅延読み込み)への再設計、実機検証を実施 / Follow-up: redesigned to lazy loading (header-only parsing + on-demand seek+read + per-expert lazy loading), attempted real-checkpoint verification
+
+直前(本ファイル下方の2026-09-13(続き5)エントリ)で「ピークメモリが
+90GB超になる見込みのため実機検証を見送った」と報告したところ、
+ユーザーから「システムメモリで90GB超になるなら、HDDのキャッシュを
+用意してもダメか」との指摘を受けた。
+
+**回答・設計上の教訓**: OSのページキャッシュは`std::fs::read`した
+内容を裏で自動キャッシュするだけで、Rustプロセス自身が二重に確保する
+ヒープメモリ(変換後のf32配列)を減らしはしない——「ディスクキャッシュを
+足す」という発想では解決しない。真の問題は「全テンソルを一括でf32へ
+変換し永続保持する」設計そのものだった。正しい解決策は、safetensors
+ファイルを**ヘッダのみ**読み、実データは必要になった瞬間にディスクから
+該当バイト範囲だけ`seek`+`read`する設計への変更、かつDeepSeekMoEの
+疎性(1トークンあたり64個中6個のエキスパートしか使わない)を活かして
+**実際に選択されたエキスパートだけを遅延ロード**すること。
+
+**実装した変更**(`deepseek_arch.rs`):
+- `ModelWeights`を全面再設計。旧: 各シャードの生バイト列
+  (`shard_bytes: Vec<Vec<u8>>`)を丸ごと保持。新:
+  `read_safetensors_header`でヘッダ(数KB)だけを読み、テンソル名→
+  (ファイルパス, データ開始位置, dtype/shape/data_offsetsのJSON
+  エントリ)を`tensor_meta`に記録。`tensor_f32`はその場で該当バイト
+  範囲だけ`seek`+`read`し、「1テンソルだけの合成safetensorsバッファ」
+  を組み立てて既存の`tensor_f32`(dtype変換ロジック)を再利用する
+  (二重実装を避ける実装上の工夫)。
+- 新設`ExpertSlot`enum(`Loaded(DenseSwiGlu)`/`Lazy{prefix,hidden,
+  intermediate,cell:OnceLock<DenseSwiGlu>}`)。`load()`経由の
+  `DeepseekMoeMlp.experts`は全て`Lazy`(テンソル名の存在確認のみ、
+  データは読まない)、`load_random`(テスト用)は`Loaded`のまま。
+  `ExpertSlot::get`が呼ばれた(=そのエキスパートがルーターに実際に
+  選ばれた)時点で初めて`load_dense_swiglu`を呼びディスクを読む。
+- `DeepseekModel`に`weights: Option<ModelWeights>`フィールドを追加
+  (`load()`のみ`Some`、遅延読み込みに必要——`load_random`は`None`)。
+  `DeepseekMlp::forward`のシグネチャへ`weights: Option<&ModelWeights>`
+  を追加。
+
+新規テスト`load_parses_moe_checkpoint_and_lazily_loads_selected_experts`
+(実際にMoE層を含む合成safetensorsを`load()`経由で読み、`ExpertSlot::Lazy`
+が正しく機能することを検証)を追加。クレート全体71本成功、clippy警告
+0件(deepseek_arch関連)。
+
+**新しいメモリ試算**: 実チェックポイント(`hidden_size=2048`・
+`n_routed_experts=64`・`num_experts_per_tok=6`・
+`moe_intermediate_size=1408`・27層、うち26層MoE)で、常時使う部分
+(attention・共有エキスパート・層0のdense MLP・embed_tokens)だけなら
+f32で概算5GB程度。1トークンあたり追加で読まれるエキスパートは最大
+`6×26=156`個(1個約35MB)で約5.4GB——**短い検証(数トークン生成)なら
+合計十数GB程度に収まる見込み**となり、この開発機の空きRAM(16GB)内で
+現実的になった。ただし生成が長くなるほどルーティングが広範囲の
+エキスパートに触れていくため(coupon collector的に、数十トークンで
+ほぼ全64個に触れ得る)、最終的には元の約60GBという上限に近づいていく
+——恒久的な解決ではなく「短い検証を可能にする設計改善」である点を
+正直に記録する。
+
+**この再計算に基づき、実際に`deepseek-ai/DeepSeek-V2-Lite-Chat`
+(31.4GB・4分割)のダウンロードを開始し、実機検証を試みた**——結果は
+このエントリの直後、続報として記録する(ダウンロード完了・ロード・
+生成の成否、実測メモリ使用量を含む)。
+
 ## HANDOFF追記(2026-09-13(続き5)、DeepSeek-V3固有拡張(aux-loss-free補正・group-limited routing・sigmoidスコアリング)+分割済みsafetensors対応+実機検証の試算 / Follow-up: V3-specific MoE extensions + sharded safetensors support + real-checkpoint feasibility estimate
 
 ユーザーから「V3系固有の拡張...世界中の言語で設計と開発の為にGoogle検索と

@@ -6,6 +6,27 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き6)**: ユーザー指摘「HDDのキャッシュを
+> 用意してもダメか」を受け、`ModelWeights`をヘッダのみ読み込み+
+> オンデマンド`seek`+`read`方式へ再設計し、ルーティングされる個々の
+> エキスパートを実際に選ばれるまでディスクを読まない`ExpertSlot::Lazy`
+> とした。これにより常時使う部分だけならf32で概算5GB程度、短い検証
+> (数トークン生成)なら十数GB程度に収まる見込みとなり、直下のエントリで
+> 「見送った」実機検証を実際に試みた——結果は[CLAUDE.md](CLAUDE.md)の
+> 続報エントリ参照。新規テスト1本追加、クレート全体71本成功。
+>
+> *English*: Following the user's question ("wouldn't a disk cache
+> help?"), redesigned `ModelWeights` to parse only safetensors headers
+> and seek+read tensor data on demand, and made routed experts
+> (`ExpertSlot::Lazy`) load from disk only when actually selected by
+> the router. This brings the always-resident footprint down to ~5GB
+> (f32) and a short verification run (a few generated tokens) to
+> roughly 10-20GB — within this dev machine's free RAM — so the
+> real-checkpoint verification scoped out in the entry below was
+> actually attempted. See the follow-up entry in
+> [CLAUDE.md](CLAUDE.md) for the outcome. 1 new test added, full
+> crate suite (71 tests) passing.
+
 > 📌 **最近の更新(2026-09-13続き5)**: `DeepseekModel`にDeepSeek-V3固有の
 > MoE拡張(aux-loss-free補正・group-limited routing・sigmoidスコア
 > リング)を実装、加えて実チェックポイントが分割済み(sharded、4分割・
