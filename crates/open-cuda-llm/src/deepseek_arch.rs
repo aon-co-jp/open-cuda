@@ -1036,9 +1036,39 @@ struct SafetensorsIndex {
 /// その長さぶんがJSONヘッダ、以降がテンソル実データ
 /// (<https://github.com/huggingface/safetensors>の仕様通り)。戻り値は
 /// (データ本体の開始バイト位置, `__metadata__`を除いたヘッダのJSON map)。
+/// **2026-09-13(続き7)追加**: 世界中の言語(英語・日本語・中国語)での
+/// Google検索・GitHub調査に基づく軽量な対策その1(調査結果の推奨順位
+/// では「まず監視指標を直す」の次に位置する、低コストな二次対策)。
+/// `FILE_FLAG_RANDOM_ACCESS`(Windows)を指定してファイルを開くと、OSへ
+/// 「このファイルはシーケンシャルではなくランダムにアクセスする」と
+/// ヒントを与え、先読み〈read-ahead〉を抑制する——`ModelWeights`の
+/// アクセスパターン(テンソルごとに散発的な`seek`+`read`)そのものに
+/// 合致する。**正直な開示**: これはキャッシュの完全な迂回ではなく
+/// (`FILE_FLAG_NO_BUFFERING`と違いセクタアラインメント制約は無く
+/// `unsafe`も不要)、あくまでキャッシュ管理の優先度ヒントに過ぎない
+/// ——調査結果でも「これだけでは今回実測された膨張を確実に防げるとは
+/// 限らない」と明記されている。まず`FreePhysicalMemory`ではなく
+/// `Available MBytes`相当を見るよう監視指標を直すことが本質的な修正、
+/// という調査結論に基づき、この関数は「効果は限定的だが実装コストが
+/// 非常に低いので併用しておく」という位置づけで追加した。Windows以外
+/// (Linux/macOS)では対応するフラグを指定せず素の`File::open`にフォール
+/// バックする(クロスプラットフォーム対応、`#[cfg(windows)]`/
+/// `#[cfg(unix)]`で分岐する既存の`open-cpu`の設計方針を踏襲)。
+#[cfg(windows)]
+fn open_for_random_access(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
+    std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_RANDOM_ACCESS).open(path)
+}
+
+#[cfg(not(windows))]
+fn open_for_random_access(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 fn read_safetensors_header(path: &Path) -> Result<(u64, serde_json::Map<String, serde_json::Value>)> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path).with_context(|| format!("open-cuda-llm: failed to open {}", path.display()))?;
+    let mut file = open_for_random_access(path).with_context(|| format!("open-cuda-llm: failed to open {}", path.display()))?;
     let mut len_buf = [0u8; 8];
     file.read_exact(&mut len_buf).with_context(|| format!("open-cuda-llm: failed to read safetensors header length from {}", path.display()))?;
     let header_len = u64::from_le_bytes(len_buf);
@@ -1114,7 +1144,7 @@ impl ModelWeights {
         let end = offsets[1].as_u64().context("open-cuda-llm: data_offsets[1] is not a u64")?;
         ensure!(end >= begin, "open-cuda-llm: tensor '{name}' has invalid data_offsets [{begin}, {end}]");
 
-        let mut file = std::fs::File::open(path).with_context(|| format!("open-cuda-llm: failed to open {}", path.display()))?;
+        let mut file = open_for_random_access(path).with_context(|| format!("open-cuda-llm: failed to open {}", path.display()))?;
         file.seek(SeekFrom::Start(data_start + begin)).with_context(|| format!("open-cuda-llm: failed to seek in {}", path.display()))?;
         let mut raw = vec![0u8; (end - begin) as usize];
         file.read_exact(&mut raw).with_context(|| format!("open-cuda-llm: failed to read tensor '{name}' data from {}", path.display()))?;
