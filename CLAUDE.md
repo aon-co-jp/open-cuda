@@ -149,6 +149,75 @@ f32で概算5GB程度。1トークンあたり追加で読まれるエキスパ�
 自体が回線速度の都合で予想外に遅く(約1時間強かかった)完了したため、
 続けて実機検証を実施した。結果は次のエントリ(実機検証結果)参照。
 
+## HANDOFF追記(2026-09-13(続き7)) DeepSeek-V2-Lite-Chat実機検証・再挑戦: FILE_FLAG_RANDOM_ACCESSヒント追加で生成が完走(重要な成果) / Follow-up: real-checkpoint verification retry — generation completed after adding the FILE_FLAG_RANDOM_ACCESS hint
+
+直前(本ファイル下方の2026-09-13(続き6・実機検証結果)エントリ)で
+「生成開始直後にメモリ危険域へ到達し安全装置がプロセスをkillした」と
+報告した後、ユーザーから「OSファイルキャッシュを迂回する読み込み方式を
+世界中の言語でGoogle検索とGithub調査して」との指示を受け調査を実施。
+調査結果の要点(詳細は`deepseek_arch.rs`のモジュールdoc「2026-09-13
+(続き7)追加」コメント参照):
+
+1. **診断的な指摘(調査結果より)**: 前回の安全装置が監視していた
+   `Win32_OperatingSystem.FreePhysicalMemory`は「完全に空いている
+   物理ページ」のみを示し、OSが必要に応じて回収可能なStandby
+   (再利用可能なファイルキャッシュ)を含まない——Microsoft公式の
+   TechNet解説でも、正しい枯渇判定には`Available MBytes`
+   (Free+Zero+Standbyの合計)を見るべきとされている。前回の安全装置は
+   健全なキャッシュ膨張を「枯渇」と誤診断していた可能性が高いという
+   指摘を受けた。
+2. **推奨された低コストな対策**: (1)監視指標を`Available MBytes`相当へ
+   修正することを最優先とし、(2)`FILE_FLAG_RANDOM_ACCESS`
+   (Windows、先読み〈read-ahead〉を抑制するヒント、セクタアラインメント
+   制約も`unsafe`も不要)を軽量な二次対策として併用、(3)本格的な
+   `FILE_FLAG_NO_BUFFERING`〈完全なキャッシュ迂回、セクタアラインメント
+   処理が必要で実装コストが高い〉は(1)(2)で解決しない場合のみ検討、
+   という優先順位。
+
+**実装した対策**: `deepseek_arch.rs`に`open_for_random_access`関数を
+新設(`#[cfg(windows)]`で`FILE_FLAG_RANDOM_ACCESS`〈`0x1000_0000`〉を
+`OpenOptionsExt::custom_flags`経由で指定、Windows以外は素の
+`File::open`にフォールバック——`open-cpu`と同じクロスプラットフォーム
+分岐方針)。`read_safetensors_header`・`tensor_f32`の両方のファイル
+オープン箇所をこれに置き換えた。新規テストは無し(既存14本のテストで
+回帰が無いことを確認済み——ファイルI/Oフラグの変更はロジックに影響
+しないため)。
+
+**再検証の結果(重要、正直に記録)**: 同じ`deepseek-ai/
+DeepSeek-V2-Lite-Chat`(スクラッチパッドに保持済みの30GBチェックポイント、
+再ダウンロード不要)で、監視指標を`Get-Counter '\Memory\Available
+MBytes'`(前回の`FreePhysicalMemory`から変更)に直した上で再実行した
+ところ、**今回は生成が最後まで完走した**——`DeepseekModel::load`が
+18.2秒、続く3トークンの生成が**96.8秒(約0.03トークン/秒)で完走**し、
+出力`"\n\n\n"`(チャットテンプレート無しの素の貪欲デコードのため、
+意味のある応答ではないが、アーキテクチャ全体〈MLA+DeepSeekMoE+decoupled
+RoPE+遅延ロード〉がエンドツーエンドで実際に動作したことの実証としては
+十分)を得た。生成中のプロセスメモリは前回同様22GB程度まで増加したが、
+**その後Windowsのワーキングセットトリミング(OSによる正常なメモリ
+再利用)で自然に3GB程度まで縮小し、クラッシュや強制終了は一切発生
+しなかった**——プロセス終了後、システムの空きメモリ(`Available
+MBytes`)は25.6GBまで正常に回復した。
+
+**正直な考察**: どちらの対策(監視指標の修正/`FILE_FLAG_RANDOM_ACCESS`)
+が実際に効いたかは今回の実験だけでは切り分けられていない——
+`FILE_FLAG_RANDOM_ACCESS`が先読みを抑制してページキャッシュ膨張
+そのものを抑えた可能性、あるいは単に監視指標を直したことで(実際の
+メモリ状態は前回と同程度でも)誤って早期killされなくなり、OS自身の
+ワーキングセットトリミングが機能する時間的猶予ができた可能性の両方が
+考えられる。速度(0.03トークン/秒)は実用的な水準には遠く、GPU
+ディスパッチ化(未着手)無しでの実運用は非現実的だが、**「この開発機で
+DeepSeek-V2-Lite-ChatのMLA+MoEアーキテクチャがエンドツーエンドで
+実際に動くことを実機で確認できた」という事実は誇張なく記録できる**。
+
+**次回への引き継ぎ**: (1) どちらの対策が効いたかの切り分け実験
+(監視指標のみ戻す/`FILE_FLAG_RANDOM_ACCESS`のみ戻す、の2パターンで
+再実験)。(2) 生成速度の改善(GPU/Vulkanディスパッチ化、absorb
+最適化)。(3) 複数トークン・複数プロンプトでの追加実機検証(今回は
+3トークンのみ、ルーティングが広範囲のエキスパートに触れる長い生成での
+挙動は未確認)。(4) 上記のロードマップ項目(より小さいVRAM/RAM要求の
+チェックポイント探索、より大きなメモリを持つ環境での再検証)は、
+今回生成が完走したことで優先度を下げてよいか要検討。
+
 ## HANDOFF追記(2026-09-13(続き6・実機検証結果)) DeepSeek-V2-Lite-Chat実機検証: ロードは成功、生成開始直後にメモリ危険域到達で安全停止 / Real-checkpoint verification result: load succeeded, generation triggered a safety kill on critical memory pressure
 
 `deepseek-ai/DeepSeek-V2-Lite-Chat`(31.4GB・4分割、実際にダウンロード

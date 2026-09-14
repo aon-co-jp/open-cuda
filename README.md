@@ -6,6 +6,31 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き7・実機検証再挑戦で成功)**: 世界中の
+> 言語でのGoogle検索・GitHub調査に基づき、`FILE_FLAG_RANDOM_ACCESS`
+> ヒント(Windows、先読み抑制)を追加し、監視指標も
+> `FreePhysicalMemory`から`Available MBytes`(OSが回収可能な
+> キャッシュを含む正しい「空き」指標)へ修正した上で
+> `deepseek-ai/DeepSeek-V2-Lite-Chat`を再検証したところ、**今回は
+> クラッシュなく生成が完走した**(ロード18.2秒、3トークン生成96.8秒
+> ≒0.03 tok/s)。生成中にプロセスメモリは一時22GB程度まで増加したが、
+> Windowsのワーキングセットトリミングで自然に縮小し安全に完了した。
+> 速度は実用水準に遠いが、MLA+DeepSeekMoE+decoupled RoPE+遅延ロードが
+> この開発機でエンドツーエンドに動作することを実機で確認できた。
+> 詳細は[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Following multilingual research, added a
+> `FILE_FLAG_RANDOM_ACCESS` hint (Windows, suppresses read-ahead) and
+> fixed the monitoring metric from `FreePhysicalMemory` to `Available
+> MBytes` (the correct "available" figure including OS-reclaimable
+> cache). Re-verifying `deepseek-ai/DeepSeek-V2-Lite-Chat` with these
+> fixes, **generation completed without a crash this time** (18.2s
+> load, 96.8s for 3 tokens, ~0.03 tok/s). Process memory briefly rose
+> to ~22GB during generation but shrank naturally via Windows working
+> set trimming. Speed is far from practical, but the full MLA +
+> DeepSeekMoE + decoupled RoPE + lazy-loading pipeline was confirmed
+> working end-to-end on real hardware. See [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き6・実機検証結果)**: 実際に
 > `deepseek-ai/DeepSeek-V2-Lite-Chat`(31.4GB)をダウンロードし実機検証を
 > 実施。**ロードは成功**(遅延ロード設計により19.9秒で完了)したが、
