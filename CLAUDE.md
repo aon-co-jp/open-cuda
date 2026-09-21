@@ -3819,3 +3819,9 @@ KVキャッシュ構造・GPU側matmulディスパッチにまたがる大きな
 記録されている「DeepSeekのfolding理論は実在しない」(実際は無関係の
 ICLR 2025「Model Folding」論文との混同)という調査結果を、今回同じ
 疑問が再提起されたため`PORTING.md`から参照しやすくした。
+
+## HANDOFF追記(2026-09-21、NPU層の再設計の入口) / HANDOFF addendum (2026-09-21, entry point for the NPU-layer redesign)
+
+**日本語**: ユーザー指示「open-cpu・open-directx・open-cuda・aruaru-llmを見直して開発し直して」に対し、実機3種(OPPO Reno11 A / moto g53y / arrows We2 Plus予定)+エミュレータで測定し、`DEVELOPMENT-NEXT.md`に「NPU層の再設計メモ」を記録した。要点: 統合の背骨はVulkan Compute(NPU層は未実装)/NNAPIはAndroid 15で非推奨→LiteRT+ベンダーアクセラレーター/OPPOでMediaTekのAPUが一括計算でCPU比6〜7倍/「折りたたみ」の正式名はModel Folding(ICLR 2025)/東芝SQBM+は組合せ最適化でLLM圧縮ではない。**次**: `GpuDevice`の外側にアクセラレーター種別(CPU/GPU/NPU/DSP)と能力交渉の層を設計(NPU実行はAndroid側、Rustは結果受け取りの境界のみ)。
+
+**English**: For the request to review and redevelop the four repos, I measured on three real phones (OPPO Reno11 A / moto g53y / arrows We2 Plus pending) plus an emulator and recorded "NPU層の再設計メモ" in `DEVELOPMENT-NEXT.md`. Key points: Vulkan Compute stays the spine (no NPU layer yet); NNAPI is deprecated in Android 15 → LiteRT + vendor accelerators; MediaTek APU is 6-7x faster than CPU on batched compute (OPPO); the proper name of the "folding" idea is Model Folding (ICLR 2025); Toshiba SQBM+ is combinatorial optimization, not LLM compression. **Next**: design an accelerator-kind (CPU/GPU/NPU/DSP) and capability-negotiation layer outside `GpuDevice` (NPU execution on the Android side; Rust defines the result boundary only).

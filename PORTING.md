@@ -377,3 +377,9 @@ FP8混合精度・DeepSeekMoEであり、「折りたたみ」ではない;混�
 無関係の「Model Folding」論文〈ICLR 2025、Wang et al.〉)という結論が
 既に記録されている——今回のセッションで同じ疑問が改めて挙がったため、
 既存の調査結果をここに再度リンクして参照しやすくしておく。
+
+## 追記(2026-09-21): NPU/モバイルGPUの移植メモ / NPU and mobile-GPU porting notes
+
+**日本語**: モバイルNPUは端末ごとに経路が違う: MediaTek=NNAPIの`mtk-*_shim`(実機OPPOで確認)、Qualcomm=NNAPIドライバー無し(LiteRTのQNN/HTP、v69以降)、Tensor/Exynos=各ベンダー。RustのGpuDevice抽象にNPUを直接載せず、Android側(LiteRT/NNAPI)で実行して結果を受ける境界を定義する方針。モバイルGPUはVulkan Compute(実機: Adreno 619 / Mali-G68 MC4がVulkan対応と確認)で統合済みの設計を維持。詳細は`DEVELOPMENT-NEXT.md`。
+
+**English**: Mobile NPU paths differ per device: MediaTek = NNAPI `mtk-*_shim` (verified on OPPO), Qualcomm = no NNAPI driver (LiteRT QNN/HTP, v69+), Tensor/Exynos = vendor stacks. Rather than putting NPUs directly under the Rust `GpuDevice` abstraction, run them on the Android side (LiteRT/NNAPI) and define a result boundary. Mobile GPUs stay on Vulkan Compute (Adreno 619 and Mali-G68 MC4 confirmed Vulkan-capable). See `DEVELOPMENT-NEXT.md`.
