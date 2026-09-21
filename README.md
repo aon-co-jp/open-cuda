@@ -435,3 +435,7 @@ cargo run -p vulkan_info
 ## ライセンス
 
 Apache-2.0
+
+## 2026-09-21: NPU層の再設計メモ / NPU-layer redesign notes
+
+日本語: 実機(OPPO Reno11 A / moto g53y)での測定とLiteRT/NNAPIの調査結果を`DEVELOPMENT-NEXT.md`に記録。 / English: measurements on real phones and the LiteRT/NNAPI survey are recorded in `DEVELOPMENT-NEXT.md`.
