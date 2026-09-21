@@ -112,7 +112,7 @@ Android実機(OPPO Reno11 A / moto g53y 5G / arrows We2 Plus予定)とエミュ�
 ### 実測で分かった事実(誇張しない)
 - **端末のNNAPI加速器は端末次第**。moto g53y(Snapdragon 480+, SM4350)は`nnapi-reference`(Android標準のCPU実装)しか無く、
   NNAPI経由のNPU/DSP利用は不可能(実機で列挙して確認、`NnapiProbe`)。QualcommはNNAPIのNPUドライバーを出していない。
-- **以前の「NNAPIで3〜8倍速い」は誤認だった**。比較相手が素朴なKotlinのループで、速かった実体はTFLite自身のCPUカーネル
+- **以前の「NNAPIで3〜8倍速い」は(比較相手が悪く)誤認だった。ただしOPPOでは、正しい基準でも一括計算で6〜7倍の本物の加速が別途確認できた(下表)**。比較相手が素朴なKotlinのループで、速かった実体はTFLite自身のCPUカーネル
   (NNAPIなしでも同じ速度)。CPU側にJITウォームアップも無く、測定が偏っていた。以後は「NNAPIなしのTFLite CPU」を基準にし、
   加速器を名前指定して測り、1.3倍以上速く品質ゲートも通った場合だけ「効いている」と判定する(`MatVecSelector`)。
 - 1組のコサイン類似度のような小さな計算は、NNAPI起動のオーバーヘッドで常にCPUが速い。行列×ベクトルのような大きな計算だけが対象。
@@ -137,7 +137,7 @@ Android実機(OPPO Reno11 A / moto g53y 5G / arrows We2 Plus予定)とエミュ�
 | 端末 | SoC | 見立て |
 |---|---|---|
 | moto g53y 5G | Snapdragon 480+ (SM4350) | NNAPI加速器なし(確定)。LiteRTのQNN対応(v69以降)にも該当しない見込み。GPU(Adreno 619)はVulkan Compute経由が本命 |
-| OPPO Reno11 A | MediaTek Dimensity 7050 (MT6877V), APU 550 | LiteRT NeuroPilot対応リスト外だが、NNAPI側にMediaTekドライバーがある可能性(以前の実機テストで一部ノードが委譲された)。`NnapiProbe`で名前を確認する |
+| OPPO Reno11 A | MediaTek Dimensity 7050 (MT6877V), APU 550 | **実機検証済み(2026-09-21)**: NNAPIに`mtk-neuron_shim`/`mtk-mdla_shim`/`mtk-dsp_shim`が実在。行列16384x768・64クエリ一括でfp16が**TFLite CPU(4スレッド)比 6〜7倍**(77.9ms→11.0ms、誤差3.6e-4、上位10件一致1.0)。1クエリなど小さい計算はCPUが速い(起動オーバーヘッド)。`mtk-dsp_shim`はCPUと同等でNPUの利得なし。int8は近似(誤差約2%)で、現状の実装ではfp16より遅い(ホスト側の量子化変換が律速) |
 | arrows We2 Plus M06 | Snapdragon 7s Gen 2 | Hexagon NPUあり。LiteRT QNN対応(HTP世代)に該当するかは実機で確認が必要 |
 
 ### 見直しの方針(4リポジトリ)
