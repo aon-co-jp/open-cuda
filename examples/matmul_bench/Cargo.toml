@@ -14,3 +14,6 @@ anyhow.workspace = true
 [[bin]]
 name = "matmul_bench"
 path = "src/main.rs"
+
+[build-dependencies]
+opencuda-shader-build.workspace = true

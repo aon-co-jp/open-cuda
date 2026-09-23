@@ -9,6 +9,7 @@ members = [
     "crates/opencuda-ir",
     "crates/opencuda-blas",
     "crates/opencuda-multidev",
+    "crates/opencuda-shader-build",
     "crates/open-cuda-bert",
     "crates/open-cuda-llm",
     "crates/open-cuda-whisper",
@@ -56,6 +57,7 @@ opencuda-directx = { path = "crates/opencuda-directx" }
 opencuda-ir = { path = "crates/opencuda-ir" }
 opencuda-blas = { path = "crates/opencuda-blas" }
 opencuda-multidev = { path = "crates/opencuda-multidev" }
+opencuda-shader-build = { path = "crates/opencuda-shader-build" }
 
 [profile.release]
 opt-level = 3

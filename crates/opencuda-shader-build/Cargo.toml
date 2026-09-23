@@ -1,0 +1,11 @@
+[package]
+name = "opencuda-shader-build"
+version = "0.1.0"
+edition = "2021"
+description = "build.rs から呼ぶ共通GLSL→SPIR-Vコンパイルヘルパー(glslcラッパー)"
+license = "MIT"
+repository = "https://github.com/aon-co-jp/open-cuda"
+
+[lib]
+name = "opencuda_shader_build"
+path = "src/lib.rs"

@@ -23,3 +23,10 @@ opencuda-vulkan = { workspace = true, features = ["real-vulkan"] }
 # `real-dx12`のwindowsクレート依存が`cfg(windows)`配下のためビルドに
 # 影響しない。
 opencuda-directx = { workspace = true, features = ["real-dx12"] }
+
+[build-dependencies]
+# 2026-09-23追加: tests/hgemm_dgemm_vulkan_bench.rsが`../../../examples/{hgemm,dgemm}_vulkan_real/shaders/*.spv`を
+# include_bytes!で読むが、その.spvはexamples側のbuild.rsでしか生成されない(かつ`.gitignore`対象で
+# Git管理外)。opencuda-blas自体のテストとしても、依存先のexample crateをビルドしなくても
+# 独立して`cargo test -p opencuda-blas`が通るよう、ここでも同じ.compを自前でコンパイルしておく。
+opencuda-shader-build.workspace = true
