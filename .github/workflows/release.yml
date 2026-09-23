@@ -1,0 +1,77 @@
+name: Release diagnostic binaries
+
+# タグ(例: v0.4.2)をpushすると、GPU診断CLI(`vulkan_info`example)を
+# Linux(x86_64-unknown-linux-gnu)・Windows(x86_64)向けにビルドし、GitHub
+# Releasesへ添付する(2026-09-23新設、ユーザー指示「open-cpu/open-directx/
+# open-cudaも診断ツールとしてopen-englishへ同梱し、個別に自動バージョン
+# アップできるように」への対応、open-cpu/aruaru-llm向けrelease.ymlと
+# 同じ構成を踏襲)。
+#
+# 正直な開示: `vulkan_info`は`real-vulkan`機能(ash "loaded"、実行時に
+# vulkan-1.dll/libvulkan.soを動的ロード)でビルドするため、CIランナー
+# (GPU/Vulkanドライバ無し)でも**ビルド自体は通る**が、**実行はできない**
+# (ここではビルド・パッケージのみ行い、CI上での実行検証はしない)。実際の
+# 動作確認は実Vulkan環境を持つ利用者側マシンで行われる(open-english側の
+# コンポーネント自動更新が「新版を1回実行してexit 0を確認」という形で
+# 担う)。open-directxはウィンドウ・実GPU描画が前提のサンプル
+# (render_triangle等)のみで、CI環境で意味のある「診断」を返すテキストのみ
+# の実行ファイルが無いため、今回のリリース対象には含めない
+# (open-cuda/CLAUDE.mdまたはopen-directx/CLAUDE.mdへの記載を検討)。
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Linux (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build diagnostic CLI
+        run: cargo build --release -p vulkan_info
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/vulkan_info dist/opencuda-vulkan-info
+          tar -czf opencuda-diag-linux-x86_64.tar.gz -C dist opencuda-vulkan-info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencuda-diag-linux-x86_64
+          path: opencuda-diag-linux-x86_64.tar.gz
+
+  build-windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build diagnostic CLI
+        run: cargo build --release -p vulkan_info
+      - name: Package portable zip (opencuda-diag-windows-x86_64.zip)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-zip | Out-Null
+          Copy-Item target\release\vulkan_info.exe dist-zip\opencuda-vulkan-info.exe
+          Compress-Archive -Path dist-zip\opencuda-vulkan-info.exe -DestinationPath opencuda-diag-windows-x86_64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencuda-diag-windows-x86_64
+          path: opencuda-diag-windows-x86_64.zip
+
+  release:
+    name: GitHub Releaseへ添付
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            opencuda-diag-linux-x86_64/opencuda-diag-linux-x86_64.tar.gz
+            opencuda-diag-windows-x86_64/opencuda-diag-windows-x86_64.zip
