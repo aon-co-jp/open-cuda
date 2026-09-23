@@ -16,3 +16,6 @@ anyhow.workspace = true
 [[bin]]
 name = "hgemm_vulkan_real"
 path = "src/main.rs"
+
+[build-dependencies]
+opencuda-shader-build.workspace = true

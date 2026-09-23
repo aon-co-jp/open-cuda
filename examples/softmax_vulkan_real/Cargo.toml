@@ -14,3 +14,6 @@ anyhow.workspace = true
 [[bin]]
 name = "softmax_vulkan_real"
 path = "src/main.rs"
+
+[build-dependencies]
+opencuda-shader-build.workspace = true

@@ -13,3 +13,6 @@ anyhow.workspace = true
 [[bin]]
 name = "vector_add_vulkan_real"
 path = "src/main.rs"
+
+[build-dependencies]
+opencuda-shader-build.workspace = true
