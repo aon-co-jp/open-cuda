@@ -33,6 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout sibling path dependency (open-cpu)
+        # aruaru-llm/.github/workflows/release.ymlで既に踏んだのと同じ
+        # 罠(open-cudaのCargo.tomlは`../open-cpu`へpath依存する)。
+        run: git clone --depth=1 https://github.com/aon-co-jp/open-cpu.git ../open-cpu
       - name: Build diagnostic CLI
         run: cargo build --release -p vulkan_info
       - name: Package
@@ -50,6 +54,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout sibling path dependency (open-cpu)
+        run: git clone --depth=1 https://github.com/aon-co-jp/open-cpu.git ../open-cpu
       - name: Build diagnostic CLI
         run: cargo build --release -p vulkan_info
       - name: Package portable zip (opencuda-diag-windows-x86_64.zip)
