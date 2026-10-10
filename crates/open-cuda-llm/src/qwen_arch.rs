@@ -569,18 +569,42 @@ impl QwenModel {
         }
         match &self.lm_head {
             Some(head) => head.forward(device, &x, seq),
-            None => Ok(self.tied_logits(&x, seq)),
+            None => Ok(self.tied_logits(device, &x, seq)),
         }
     }
 
-    /// 重み共有(tie_word_embeddings)の語彙ロジット。語彙が大きい(15 万語)ので、スレッドで分担する。
-    fn tied_logits(&self, x: &[f32], seq: usize) -> Vec<f32> {
+    /// 重み共有(tie_word_embeddings)の語彙ロジット(`seq` 行 × `vocab_size` 列、行優先)。語彙が大きい(15 万語)ので計算の大半を占める。
+    /// 埋め込み表(`vocab × hidden`、行優先)をそのまま `A` として、`C' = E · Xᵀ`(`vocab × seq`)を 1 回の `sgemm`
+    /// (CPU では AVX2 カーネル)で求め、転置して返す(埋め込み表の転置コピーを作らずに済む)。`sgemm` が使えないときは素朴なスレッド分担へ。
+    fn tied_logits(&self, device: &dyn GpuDevice, x: &[f32], seq: usize) -> Vec<f32> {
+        let hidden = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        let mut xt = vec![0.0f32; hidden * seq];
+        for i in 0..seq {
+            for h in 0..hidden {
+                xt[h * seq + i] = x[i * hidden + h];
+            }
+        }
+        let mut c = vec![0.0f32; vocab * seq];
+        if opencuda_blas::sgemm(device, vocab, hidden, seq, 1.0, &self.embed_tokens, &xt, 0.0, &mut c, None).is_ok() {
+            let mut logits = vec![0.0f32; seq * vocab];
+            for v in 0..vocab {
+                for i in 0..seq {
+                    logits[i * vocab + v] = c[v * seq + i];
+                }
+            }
+            return logits;
+        }
+        self.tied_logits_threads(x, seq)
+    }
+
+    /// `tied_logits` の素朴なスレッド分担版(`sgemm` が使えないときの代替、試験の参照にも使う)。
+    fn tied_logits_threads(&self, x: &[f32], seq: usize) -> Vec<f32> {
         let hidden = self.config.hidden_size;
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; seq * vocab];
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
         let chunk = vocab.div_ceil(threads);
-        // 各スレッドが語彙の一部(列の範囲)を、全位置について計算する。
         let parts: Vec<(usize, Vec<f32>)> = std::thread::scope(|sc| {
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
@@ -777,6 +801,19 @@ mod tests {
         let scored = model.score_continuations(&device, &ids[..1], &[ids[1..].to_vec()]).unwrap();
         let sum: f32 = lp[1..].iter().sum();
         assert!((scored[0] - sum).abs() < 1e-3, "{} vs {sum}", scored[0]);
+    }
+
+    #[test]
+    fn tied_logits_via_sgemm_match_the_threaded_reference() {
+        let model = QwenModel::load_random(QwenConfig::tiny(97), 21);
+        let device = device();
+        let x: Vec<f32> = (0..5 * 32).map(|i| ((i * 13) % 17) as f32 / 17.0 - 0.5).collect();
+        let a = model.tied_logits(device.as_ref(), &x, 5);
+        let b = model.tied_logits_threads(&x, 5);
+        assert_eq!(a.len(), b.len());
+        for (u, v) in a.iter().zip(&b) {
+            assert!((u - v).abs() < 1e-4, "{u} vs {v}");
+        }
     }
 
     #[test]
