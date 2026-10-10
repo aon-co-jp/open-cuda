@@ -648,6 +648,22 @@ impl QwenModel {
         Ok(out)
     }
 
+    /// 文章の各トークンの対数確率(直前までの文脈つき)を返す。先頭トークンには文脈が無いので `0.0`。
+    /// 「この文字の並びは不自然(確率が極端に低い)」という OCR の誤読の検出に使う。1 回のバッチ prefill で済む。
+    pub fn token_logprobs(&self, device: &std::sync::Arc<dyn GpuDevice>, ids: &[u32]) -> Result<Vec<f32>> {
+        ensure!(!ids.is_empty(), "open-cuda-llm: ids must not be empty");
+        let vocab = self.config.vocab_size;
+        let mut caches = self.new_caches();
+        let logits = self.forward_prefill_per_position(device.as_ref(), ids, &mut caches)?;
+        let mut out = Vec::with_capacity(ids.len());
+        out.push(0.0);
+        for i in 1..ids.len() {
+            let row = log_softmax_row(&logits[(i - 1) * vocab..i * vocab]);
+            out.push(row[ids[i] as usize]);
+        }
+        Ok(out)
+    }
+
     /// 文脈 `prefix_ids` の次に来る確率が高いトークンを上位 `k` 個(トークン ID, 対数確率)で返す。
     /// かすれて何も読めない箇所の候補をモデル自身に挙げさせる用途。
     pub fn top_next_tokens(&self, device: &std::sync::Arc<dyn GpuDevice>, prefix_ids: &[u32], k: usize) -> Result<Vec<(u32, f32)>> {
@@ -748,6 +764,19 @@ mod tests {
         let top = model.top_next_tokens(&device, &prefix, 3).unwrap();
         assert_eq!(top.len(), 3);
         assert!(top[0].1 >= top[1].1 && top[1].1 >= top[2].1);
+    }
+
+    #[test]
+    fn token_logprobs_match_scoring() {
+        let model = QwenModel::load_random(QwenConfig::tiny(48), 5);
+        let device = device();
+        let ids = [3u32, 9, 1, 7];
+        let lp = model.token_logprobs(&device, &ids).unwrap();
+        assert_eq!(lp.len(), 4);
+        assert_eq!(lp[0], 0.0);
+        let scored = model.score_continuations(&device, &ids[..1], &[ids[1..].to_vec()]).unwrap();
+        let sum: f32 = lp[1..].iter().sum();
+        assert!((scored[0] - sum).abs() < 1e-3, "{} vs {sum}", scored[0]);
     }
 
     #[test]
