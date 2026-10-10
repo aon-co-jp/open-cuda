@@ -117,6 +117,14 @@ impl RmsNorm {
     }
 }
 
+/// 1 行のロジットを対数確率(log-softmax)にする。
+fn log_softmax_row(row: &[f32]) -> Vec<f32> {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = row.iter().map(|v| (v - max).exp()).sum();
+    let lse = max + sum.ln();
+    row.iter().map(|v| v - lse).collect()
+}
+
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
@@ -466,6 +474,193 @@ impl QwenModel {
         Ok(logits)
     }
 
+    // ---- 文脈つき候補の採点(OCR の穴埋めなど、短い穴を前後の文脈で埋める用途) ----
+
+    /// `token_ids` を一括(バッチ)で処理する。KV キャッシュには `caches` が持つ長さの続きとして追加され、
+    /// **全位置**の次トークン予測のロジット(`token_ids.len() * vocab_size` のフラット配列)を返す。
+    /// 1 トークンずつ処理する `forward_step` と数値的に同じ結果になる(試験で確認)が、重み行列の読み出しを
+    /// 全トークンで共有できるため、プロンプトが長いほど速い。MLA 圧縮が有効なモデルは未対応。
+    fn forward_prefill_per_position(&self, device: &dyn GpuDevice, token_ids: &[u32], caches: &mut [LayerCache]) -> Result<Vec<f32>> {
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+        let head_dim = cfg.head_dim();
+        let heads_per_kv = cfg.num_heads / cfg.num_kv_heads;
+        let seq = token_ids.len();
+        ensure!(seq > 0, "open-cuda-llm: token_ids must not be empty");
+        ensure!(self.layers.iter().all(|l| l.mla.is_none()), "open-cuda-llm: batched prefill does not support MLA-compressed KV caches");
+        let pos0 = caches[0].kv[0].n;
+        ensure!(pos0 + seq <= cfg.max_seq_len, "open-cuda-llm: sequence too long ({} > {})", pos0 + seq, cfg.max_seq_len);
+
+        let mut x = vec![0.0f32; seq * hidden];
+        for (i, &t) in token_ids.iter().enumerate() {
+            let tok = t as usize;
+            ensure!(tok < cfg.vocab_size, "open-cuda-llm: token id {tok} out of vocab range {}", cfg.vocab_size);
+            x[i * hidden..(i + 1) * hidden].copy_from_slice(&self.embed_tokens[tok * hidden..(tok + 1) * hidden]);
+        }
+        let rope: Vec<(Vec<f32>, Vec<f32>)> = (0..seq).map(|i| rope_cos_sin(head_dim, cfg.rope_theta, pos0 + i)).collect();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            let mut normed = x.clone();
+            for row in normed.chunks_exact_mut(hidden) {
+                layer.input_layernorm.forward_row(row);
+            }
+            let q = layer.q_proj.forward(device, &normed, seq)?;
+            let k = layer.k_proj.forward(device, &normed, seq)?;
+            let v = layer.v_proj.forward(device, &normed, seq)?;
+            let kv_dim = cfg.num_kv_heads * head_dim;
+            for i in 0..seq {
+                let (cos, sin) = &rope[i];
+                for kvh in 0..cfg.num_kv_heads {
+                    let mut k_h = k[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim].to_vec();
+                    apply_rope(&mut k_h, cos, sin);
+                    cache.kv[kvh].push(device, &k_h, &v[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim], None, None)?;
+                }
+            }
+            // 因果的アテンション: 位置 i のクエリは、キャッシュ先頭から pos0+i までを見る。
+            let mut context = vec![0.0f32; seq * hidden];
+            for qh in 0..cfg.num_heads {
+                let kvh = qh / heads_per_kv;
+                let kc = &cache.kv[kvh].k;
+                let vc = &cache.kv[kvh].v;
+                for i in 0..seq {
+                    let mut q_h = q[i * hidden + qh * head_dim..i * hidden + (qh + 1) * head_dim].to_vec();
+                    apply_rope(&mut q_h, &rope[i].0, &rope[i].1);
+                    let n = pos0 + i + 1;
+                    let mut scores = vec![0.0f32; n];
+                    let mut max = f32::NEG_INFINITY;
+                    for (j, sc) in scores.iter_mut().enumerate() {
+                        let kr = &kc[j * head_dim..(j + 1) * head_dim];
+                        *sc = q_h.iter().zip(kr).map(|(a, b)| a * b).sum::<f32>() * scale;
+                        max = max.max(*sc);
+                    }
+                    let mut sum = 0.0f32;
+                    for sc in scores.iter_mut() {
+                        *sc = (*sc - max).exp();
+                        sum += *sc;
+                    }
+                    let out = &mut context[i * hidden + qh * head_dim..i * hidden + (qh + 1) * head_dim];
+                    for (j, sc) in scores.iter().enumerate() {
+                        let w = sc / sum;
+                        for (o, vv) in out.iter_mut().zip(&vc[j * head_dim..(j + 1) * head_dim]) {
+                            *o += w * vv;
+                        }
+                    }
+                }
+            }
+            let attn_out = layer.o_proj.forward(device, &context, seq)?;
+            for (h, a) in x.iter_mut().zip(&attn_out) {
+                *h += a;
+            }
+            let mut normed2 = x.clone();
+            for row in normed2.chunks_exact_mut(hidden) {
+                layer.post_attention_layernorm.forward_row(row);
+            }
+            let gate = layer.gate_proj.forward(device, &normed2, seq)?;
+            let up = layer.up_proj.forward(device, &normed2, seq)?;
+            let mlp_hidden: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
+            let mlp_out = layer.down_proj.forward(device, &mlp_hidden, seq)?;
+            for (h, m) in x.iter_mut().zip(&mlp_out) {
+                *h += m;
+            }
+        }
+        for row in x.chunks_exact_mut(hidden) {
+            self.norm.forward_row(row);
+        }
+        match &self.lm_head {
+            Some(head) => head.forward(device, &x, seq),
+            None => Ok(self.tied_logits(&x, seq)),
+        }
+    }
+
+    /// 重み共有(tie_word_embeddings)の語彙ロジット。語彙が大きい(15 万語)ので、スレッドで分担する。
+    fn tied_logits(&self, x: &[f32], seq: usize) -> Vec<f32> {
+        let hidden = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        let mut logits = vec![0.0f32; seq * vocab];
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
+        let chunk = vocab.div_ceil(threads);
+        // 各スレッドが語彙の一部(列の範囲)を、全位置について計算する。
+        let parts: Vec<(usize, Vec<f32>)> = std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let (lo, hi) = ((t * chunk).min(vocab), ((t + 1) * chunk).min(vocab));
+                    sc.spawn(move || {
+                        let mut part = vec![0.0f32; seq * (hi - lo)];
+                        for (vi, row) in self.embed_tokens[lo * hidden..hi * hidden].chunks_exact(hidden).enumerate() {
+                            for i in 0..seq {
+                                part[i * (hi - lo) + vi] = row.iter().zip(&x[i * hidden..(i + 1) * hidden]).map(|(a, b)| a * b).sum();
+                            }
+                        }
+                        (lo, part)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+        for (lo, part) in parts {
+            if part.is_empty() {
+                continue;
+            }
+            let w = part.len() / seq;
+            for i in 0..seq {
+                logits[i * vocab + lo..i * vocab + lo + w].copy_from_slice(&part[i * w..(i + 1) * w]);
+            }
+        }
+        logits
+    }
+
+    fn truncate_caches(&self, caches: &mut [LayerCache], new_n: usize) {
+        let head_dim = self.config.head_dim();
+        for layer in caches.iter_mut() {
+            for head in layer.kv.iter_mut() {
+                head.truncate(new_n, head_dim);
+            }
+        }
+    }
+
+    /// 文脈 `prefix_ids` のあとに各 `continuations[i]` が続く確率の**対数(自然対数の和)**を返す。
+    /// OCR でかすれた箇所の候補(候補の文字列+そのすぐ後ろの文脈)を、前の文脈つきで採点する用途。
+    /// 前の文脈の KV キャッシュは 1 回だけ作り、候補ごとに巻き戻して再利用する。
+    /// `prefix_ids` は空にできない(先頭トークンに文脈が要る。呼び出し側で先頭語を付ける)。
+    pub fn score_continuations(&self, device: &std::sync::Arc<dyn GpuDevice>, prefix_ids: &[u32], continuations: &[Vec<u32>]) -> Result<Vec<f32>> {
+        ensure!(!prefix_ids.is_empty(), "open-cuda-llm: prefix must not be empty");
+        let device_ref = device.as_ref();
+        let vocab = self.config.vocab_size;
+        let mut caches = self.new_caches();
+        let prefix_logits = self.forward_prefill_per_position(device_ref, prefix_ids, &mut caches)?;
+        let last_prefix = log_softmax_row(&prefix_logits[(prefix_ids.len() - 1) * vocab..prefix_ids.len() * vocab]);
+        let mut out = Vec::with_capacity(continuations.len());
+        for cont in continuations {
+            if cont.is_empty() {
+                out.push(0.0);
+                continue;
+            }
+            self.truncate_caches(&mut caches, prefix_ids.len());
+            let logits = self.forward_prefill_per_position(device_ref, cont, &mut caches)?;
+            let mut lp = last_prefix[cont[0] as usize];
+            for i in 1..cont.len() {
+                let row = log_softmax_row(&logits[(i - 1) * vocab..i * vocab]);
+                lp += row[cont[i] as usize];
+            }
+            out.push(lp);
+        }
+        Ok(out)
+    }
+
+    /// 文脈 `prefix_ids` の次に来る確率が高いトークンを上位 `k` 個(トークン ID, 対数確率)で返す。
+    /// かすれて何も読めない箇所の候補をモデル自身に挙げさせる用途。
+    pub fn top_next_tokens(&self, device: &std::sync::Arc<dyn GpuDevice>, prefix_ids: &[u32], k: usize) -> Result<Vec<(u32, f32)>> {
+        ensure!(!prefix_ids.is_empty(), "open-cuda-llm: prefix must not be empty");
+        let vocab = self.config.vocab_size;
+        let mut caches = self.new_caches();
+        let logits = self.forward_prefill_per_position(device.as_ref(), prefix_ids, &mut caches)?;
+        let row = log_softmax_row(&logits[(prefix_ids.len() - 1) * vocab..prefix_ids.len() * vocab]);
+        let mut idx: Vec<usize> = (0..vocab).collect();
+        idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
+        Ok(idx.into_iter().take(k).map(|i| (i as u32, row[i])).collect())
+    }
+
     /// 貪欲デコード(繰り返しペナルティ付き)で`max_new_tokens`個生成する。
     /// `GptModel::generate_with_repetition_penalty`と同じ呼び出し規約。
     pub fn generate(&self, device: &std::sync::Arc<dyn GpuDevice>, prompt_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
@@ -517,6 +712,42 @@ mod tests {
 
     fn device() -> Arc<dyn GpuDevice> {
         CpuDevice::new(0)
+    }
+
+    /// バッチ prefill が、1 トークンずつの forward_step と同じロジットになること(候補採点の土台)。
+    #[test]
+    fn batched_prefill_matches_stepwise_logits_and_scoring_is_consistent() {
+        let model = QwenModel::load_random(QwenConfig::tiny(48), 11);
+        let device = device();
+        let ids = [3u32, 9, 1, 7, 20, 5];
+        let mut c1 = model.new_caches();
+        let batched = model.forward_prefill_per_position(device.as_ref(), &ids, &mut c1).unwrap();
+        let mut c2 = model.new_caches();
+        for (i, &t) in ids.iter().enumerate() {
+            let step = model.forward_step(device.as_ref(), t, &mut c2).unwrap();
+            for (a, b) in step.iter().zip(&batched[i * 48..(i + 1) * 48]) {
+                assert!((a - b).abs() < 1e-3, "pos {i}: {a} vs {b}");
+            }
+        }
+        // 採点: 手計算(forward_step の対数確率の和)と一致。
+        let prefix = [3u32, 9];
+        let conts = vec![vec![1u32, 7], vec![20u32], vec![]];
+        let scores = model.score_continuations(&device, &prefix, &conts).unwrap();
+        let mut caches = model.new_caches();
+        let mut logits = Vec::new();
+        for &t in &prefix {
+            logits = model.forward_step(device.as_ref(), t, &mut caches).unwrap();
+        }
+        let mut expect = 0.0;
+        for &t in &conts[0] {
+            expect += log_softmax_row(&logits)[t as usize];
+            logits = model.forward_step(device.as_ref(), t, &mut caches).unwrap();
+        }
+        assert!((scores[0] - expect).abs() < 1e-3, "{} vs {expect}", scores[0]);
+        assert!(scores[1] < 0.0 && scores[2] == 0.0);
+        let top = model.top_next_tokens(&device, &prefix, 3).unwrap();
+        assert_eq!(top.len(), 3);
+        assert!(top[0].1 >= top[1].1 && top[1].1 >= top[2].1);
     }
 
     #[test]
