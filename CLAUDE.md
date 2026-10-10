@@ -3825,3 +3825,15 @@ ICLR 2025「Model Folding」論文との混同)という調査結果を、今回
 **日本語**: ユーザー指示「open-cpu・open-directx・open-cuda・aruaru-llmを見直して開発し直して」に対し、実機3種(OPPO Reno11 A / moto g53y / arrows We2 Plus予定)+エミュレータで測定し、`DEVELOPMENT-NEXT.md`に「NPU層の再設計メモ」を記録した。要点: 統合の背骨はVulkan Compute(NPU層は未実装)/NNAPIはAndroid 15で非推奨→LiteRT+ベンダーアクセラレーター/OPPOでMediaTekのAPUが一括計算でCPU比6〜7倍/「折りたたみ」の正式名はModel Folding(ICLR 2025)/東芝SQBM+は組合せ最適化でLLM圧縮ではない。**次**: `GpuDevice`の外側にアクセラレーター種別(CPU/GPU/NPU/DSP)と能力交渉の層を設計(NPU実行はAndroid側、Rustは結果受け取りの境界のみ)。
 
 **English**: For the request to review and redevelop the four repos, I measured on three real phones (OPPO Reno11 A / moto g53y / arrows We2 Plus pending) plus an emulator and recorded "NPU層の再設計メモ" in `DEVELOPMENT-NEXT.md`. Key points: Vulkan Compute stays the spine (no NPU layer yet); NNAPI is deprecated in Android 15 → LiteRT + vendor accelerators; MediaTek APU is 6-7x faster than CPU on batched compute (OPPO); the proper name of the "folding" idea is Model Folding (ICLR 2025); Toshiba SQBM+ is combinatorial optimization, not LLM compression. **Next**: design an accelerator-kind (CPU/GPU/NPU/DSP) and capability-negotiation layer outside `GpuDevice` (NPU execution on the Android side; Rust defines the result boundary only).
+
+## 2026-10-10 開発停止時点の記録(OCR かすれ補正・AI 文脈補完) / Status at stop (faded-text rescue & AI context completion)
+
+### 日本語
+- `open-cuda-llm::QwenModel` に追加: バッチ prefill(`forward_prefill_per_position`、非公開)、**`score_continuations(prefix, continuations)`**(文脈のあとに各候補が続く対数尤度の和。文脈の KV キャッシュは 1 回だけ作って巻き戻して再利用)、**`top_next_tokens(prefix, k)`**、**`token_logprobs(ids)`**(各トークンの対数確率。誤読の検出用)。語彙が大きい重み共有(tie_word_embeddings)のロジット計算はスレッドで分担。1 トークンずつの `forward_step` と数値一致することを試験で確認(試験 12 件)。MLA 圧縮が有効なモデルは未対応。
+- 用途: `aruaru-llm` の OCR 補完(`/v1/ocr/scan` / `fill` / `propose`)。字形の照合は `opencuda_blas::sgemm`(行列積)で、`aruaru-llm` の `/v1/ocr/glyph-rank` から呼ぶ(頻出約 9,200 字形 × 289 位置で 1 升約 14 ms、CPU デバイス)。
+- 未了: Qwen2.5-3B 以上(分割 safetensors)の読み込み、バッチ prefill の GPU 経路、候補採点の並列化。
+
+### English
+- Added to `open-cuda-llm::QwenModel`: batched prefill (`forward_prefill_per_position`, private), **`score_continuations(prefix, continuations)`** (summed log-likelihood of each continuation after a prefix; the prefix KV cache is built once and rewound for each candidate), **`top_next_tokens(prefix, k)`**, **`token_logprobs(ids)`** (per-token log-probabilities, for misread detection). The tied-embedding vocabulary logits are computed across threads. Verified numerically identical to token-by-token `forward_step` (12 tests). MLA-compressed models are not supported.
+- Used by: OCR completion in `aruaru-llm` (`/v1/ocr/scan` / `fill` / `propose`). Glyph matching is one `opencuda_blas::sgemm` call from `aruaru-llm`'s `/v1/ocr/glyph-rank` (~14 ms per cell for ~9,200 glyphs × 289 positions on the CPU device).
+- Open: loading Qwen2.5-3B and larger (sharded safetensors), a GPU path for batched prefill, parallel candidate scoring.

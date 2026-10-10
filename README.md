@@ -439,3 +439,15 @@ Apache-2.0
 ## 2026-09-21: NPU層の再設計メモ / NPU-layer redesign notes
 
 日本語: 実機(OPPO Reno11 A / moto g53y)での測定とLiteRT/NNAPIの調査結果を`DEVELOPMENT-NEXT.md`に記録。 / English: measurements on real phones and the LiteRT/NNAPI survey are recorded in `DEVELOPMENT-NEXT.md`.
+
+## 2026-10-10 開発停止時点の記録(OCR かすれ補正・AI 文脈補完) / Status at stop (faded-text rescue & AI context completion)
+
+### 日本語
+- `open-cuda-llm::QwenModel` に追加: バッチ prefill(`forward_prefill_per_position`、非公開)、**`score_continuations(prefix, continuations)`**(文脈のあとに各候補が続く対数尤度の和。文脈の KV キャッシュは 1 回だけ作って巻き戻して再利用)、**`top_next_tokens(prefix, k)`**、**`token_logprobs(ids)`**(各トークンの対数確率。誤読の検出用)。語彙が大きい重み共有(tie_word_embeddings)のロジット計算はスレッドで分担。1 トークンずつの `forward_step` と数値一致することを試験で確認(試験 12 件)。MLA 圧縮が有効なモデルは未対応。
+- 用途: `aruaru-llm` の OCR 補完(`/v1/ocr/scan` / `fill` / `propose`)。字形の照合は `opencuda_blas::sgemm`(行列積)で、`aruaru-llm` の `/v1/ocr/glyph-rank` から呼ぶ(頻出約 9,200 字形 × 289 位置で 1 升約 14 ms、CPU デバイス)。
+- 未了: Qwen2.5-3B 以上(分割 safetensors)の読み込み、バッチ prefill の GPU 経路、候補採点の並列化。
+
+### English
+- Added to `open-cuda-llm::QwenModel`: batched prefill (`forward_prefill_per_position`, private), **`score_continuations(prefix, continuations)`** (summed log-likelihood of each continuation after a prefix; the prefix KV cache is built once and rewound for each candidate), **`top_next_tokens(prefix, k)`**, **`token_logprobs(ids)`** (per-token log-probabilities, for misread detection). The tied-embedding vocabulary logits are computed across threads. Verified numerically identical to token-by-token `forward_step` (12 tests). MLA-compressed models are not supported.
+- Used by: OCR completion in `aruaru-llm` (`/v1/ocr/scan` / `fill` / `propose`). Glyph matching is one `opencuda_blas::sgemm` call from `aruaru-llm`'s `/v1/ocr/glyph-rank` (~14 ms per cell for ~9,200 glyphs × 289 positions on the CPU device).
+- Open: loading Qwen2.5-3B and larger (sharded safetensors), a GPU path for batched prefill, parallel candidate scoring.
