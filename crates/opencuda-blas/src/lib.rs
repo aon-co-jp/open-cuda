@@ -2808,6 +2808,12 @@ mod tests {
             }
         };
 
+        // このテストはNVIDIA実機向け。それ以外のVulkanデバイス(WSLのソフトウェア実装など)ではスキップする。
+        if !matches!(vulkan_device.info().vendor, GpuVendor::Nvidia { .. }) {
+            eprintln!("skipping sgemm_auto_dispatch test: the Vulkan device is not NVIDIA hardware");
+            return;
+        }
+
         // 実機がベンダー別スタブ経路(cuBLAS等)ではなくVulkanGenericへ
         // フォールバックすると自動選択されていることをまず直接確認する。
         assert_eq!(
