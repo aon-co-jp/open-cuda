@@ -34,7 +34,7 @@ members = [
 version = "0.4.1"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["石塚正浩（MASAHIRO ISHIZUKA）"]
+authors = ["石 塚 正 浩（MASAHIRO ISHIZUKA）"]
 repository = "https://github.com/aon-co-jp/open-cuda"
 rust-version = "1.75"
 
