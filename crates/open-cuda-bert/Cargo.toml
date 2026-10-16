@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "BERT系エンコーダのforward pass実装(opencuda-blasのGEMM/Attentionカーネル上で動く、文埋め込み用)"
 
 [dependencies]
+sonic-rs = "0.3"
 opencuda-core.workspace = true
 opencuda-blas.workspace = true
 anyhow.workspace = true

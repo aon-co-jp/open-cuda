@@ -285,7 +285,7 @@ impl BertModel {
     pub fn load(dir: &Path) -> Result<Self> {
         let config_json = std::fs::read_to_string(dir.join("config.json"))
             .with_context(|| format!("open-cuda-bert: failed to read config.json in {dir:?}"))?;
-        let config: BertConfig = serde_json::from_str(&config_json).context("open-cuda-bert: failed to parse config.json")?;
+        let config: BertConfig = sonic_rs::from_str(&config_json).context("open-cuda-bert: failed to parse config.json")?;
 
         let weights_bytes = std::fs::read(dir.join("model.safetensors"))
             .with_context(|| format!("open-cuda-bert: failed to read model.safetensors in {dir:?}"))?;

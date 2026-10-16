@@ -235,7 +235,7 @@ impl QwenModel {
     /// 未対応(`GptModel::load`と同じ制約——単一ファイルのモデルのみ)。
     pub fn load(dir: &Path) -> Result<Self> {
         let config_bytes = std::fs::read(dir.join("config.json")).with_context(|| format!("open-cuda-llm: failed to read {}/config.json", dir.display()))?;
-        let config: QwenConfig = serde_json::from_slice(&config_bytes).context("open-cuda-llm: failed to parse Qwen config.json")?;
+        let config: QwenConfig = sonic_rs::from_slice(&config_bytes).context("open-cuda-llm: failed to parse Qwen config.json")?;
         ensure!(
             config.num_heads > 0 && config.num_kv_heads > 0 && config.num_heads % config.num_kv_heads == 0,
             "open-cuda-llm: num_attention_heads ({}) must be a positive multiple of num_key_value_heads ({})",

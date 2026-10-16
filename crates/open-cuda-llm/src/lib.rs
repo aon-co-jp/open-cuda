@@ -1512,7 +1512,7 @@ impl GptModel {
     pub fn load(dir: &Path) -> Result<Self> {
         let config_json = std::fs::read_to_string(dir.join("config.json"))
             .with_context(|| format!("open-cuda-llm: failed to read config.json in {dir:?}"))?;
-        let raw_config: GPT2Config = serde_json::from_str(&config_json).context("open-cuda-llm: failed to parse config.json")?;
+        let raw_config: GPT2Config = sonic_rs::from_str(&config_json).context("open-cuda-llm: failed to parse config.json")?;
         // GPTQ 等の整数量子化ブロック(あれば `Conv1D` 重みは
         // `.qweight`/`.scales`/`.qzeros` から逆量子化してロードする)。
         let quant: Option<QuantizationConfig> = raw_config.quantization_config.clone();

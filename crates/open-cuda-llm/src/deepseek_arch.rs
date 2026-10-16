@@ -759,7 +759,7 @@ impl DeepseekModel {
     /// (`ModelWeights`参照)。
     pub fn load(dir: &Path) -> Result<Self> {
         let config_bytes = std::fs::read(dir.join("config.json")).with_context(|| format!("open-cuda-llm: failed to read {}/config.json", dir.display()))?;
-        let config: DeepseekConfig = serde_json::from_slice(&config_bytes).context("open-cuda-llm: failed to parse DeepSeek config.json")?;
+        let config: DeepseekConfig = sonic_rs::from_slice(&config_bytes).context("open-cuda-llm: failed to parse DeepSeek config.json")?;
         ensure!(config.num_heads > 0, "open-cuda-llm: num_attention_heads must be > 0");
         ensure!(config.qk_rope_head_dim % 2 == 0, "open-cuda-llm: qk_rope_head_dim ({}) must be even (rotate_half RoPE pairs dimensions)", config.qk_rope_head_dim);
         if let Some(q_lora_rank) = config.q_lora_rank {
@@ -1103,7 +1103,7 @@ impl ModelWeights {
     /// (`model-00001-of-000004.safetensors`等、4分割・合計31.4GB)。
     fn load_sharded(dir: &Path, index_path: &Path) -> Result<Self> {
         let index_bytes = std::fs::read(index_path).with_context(|| format!("open-cuda-llm: failed to read {}", index_path.display()))?;
-        let index: SafetensorsIndex = serde_json::from_slice(&index_bytes).context("open-cuda-llm: failed to parse model.safetensors.index.json")?;
+        let index: SafetensorsIndex = sonic_rs::from_slice(&index_bytes).context("open-cuda-llm: failed to parse model.safetensors.index.json")?;
         ensure!(!index.weight_map.is_empty(), "open-cuda-llm: model.safetensors.index.json has an empty weight_map");
 
         let mut header_cache: std::collections::HashMap<String, (u64, serde_json::Map<String, serde_json::Value>)> = std::collections::HashMap::new();
