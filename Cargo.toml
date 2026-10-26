@@ -46,7 +46,7 @@ tracing = "0.1"
 half = "2"
 
 # aon-co-jp 共通の CPU 命令セット検出・ディスパッチ基盤
-open-cpu = { path = "../open-cpu" }
+open-cpu = { git = "https://github.com/aon-co-jp/open-cpu" }
 
 # 内部crate
 opencuda-core = { path = "crates/opencuda-core" }
