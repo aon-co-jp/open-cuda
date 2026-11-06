@@ -1072,9 +1072,11 @@ fn read_safetensors_header(path: &Path) -> Result<(u64, serde_json::Map<String, 
     let mut len_buf = [0u8; 8];
     file.read_exact(&mut len_buf).with_context(|| format!("open-cuda-llm: failed to read safetensors header length from {}", path.display()))?;
     let header_len = u64::from_le_bytes(len_buf);
+    // 壊れた/悪意あるファイルの長さ欄で巨大な領域を確保しないよう上限を設ける(safetensors の実用上のヘッダーは数MB以内)。
+    anyhow::ensure!(header_len <= 256 * 1024 * 1024, "open-cuda-llm: safetensors header length {header_len} in {} is unreasonably large", path.display());
     let mut header_buf = vec![0u8; header_len as usize];
     file.read_exact(&mut header_buf).with_context(|| format!("open-cuda-llm: failed to read safetensors header from {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_slice(&header_buf).with_context(|| format!("open-cuda-llm: failed to parse safetensors header JSON in {}", path.display()))?;
+    let value: serde_json::Value = sonic_rs::from_slice(&header_buf).with_context(|| format!("open-cuda-llm: failed to parse safetensors header JSON in {}", path.display()))?;
     let mut map = match value {
         serde_json::Value::Object(m) => m,
         _ => anyhow::bail!("open-cuda-llm: safetensors header in {} is not a JSON object", path.display()),
@@ -1571,5 +1573,38 @@ mod tests {
         assert_eq!(generated.len(), 10);
         let all_same = generated.iter().all(|&t| t == generated[0]);
         assert!(!all_same, "position-dependent RoPE should prevent total degeneration into a single repeated token");
+    }
+}
+
+#[cfg(test)]
+mod safetensors_header_tests {
+    use super::*;
+
+    fn write_file(name: &str, header: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("open-cuda-llm-{name}-{}.safetensors", std::process::id()));
+        let mut data = (header.len() as u64).to_le_bytes().to_vec();
+        data.extend_from_slice(header);
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    #[test]
+    fn reads_header_and_drops_metadata() {
+        let p = write_file("ok", br#"{"__metadata__":{"format":"pt"},"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#);
+        let (start, map) = read_safetensors_header(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert!(start > 8);
+        assert!(map.contains_key("w") && !map.contains_key("__metadata__"));
+    }
+
+    #[test]
+    fn rejects_non_object_and_absurd_length() {
+        let p = write_file("arr", b"[1,2]");
+        assert!(read_safetensors_header(&p).is_err());
+        std::fs::remove_file(&p).ok();
+        let q = std::env::temp_dir().join(format!("open-cuda-llm-big-{}.safetensors", std::process::id()));
+        std::fs::write(&q, u64::MAX.to_le_bytes()).unwrap();
+        assert!(read_safetensors_header(&q).is_err());
+        std::fs::remove_file(&q).ok();
     }
 }

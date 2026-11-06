@@ -3991,3 +3991,6 @@ Reading into `serde_json::Value` gives almost no speed-up even with SIMD (188 ms
 - **WASM по-прежнему остаётся технологией для интерфейса.** Изменилось лишь то, что вызываемый им API теперь построен на Connect.
 - Интерфейсы, форма которых задана внешним стандартом (ACME, обратные вызовы OAuth, вебхуки сторонних сервисов, проверки работоспособности, статические файлы, OTLP), остаются обычным HTTP.
 - **Если есть сомнения — выбирайте Connect.**
+
+## JSON の読み込み(2026-11-06)
+JSON を読む所は、設定ファイル(`config.json`)・safetensors のインデックスはすでに `sonic_rs`。残っていた safetensors のヘッダー(`deepseek_arch::read_safetensors_header`)を `serde_json::from_slice` から `sonic_rs::from_slice` に替え、ヘッダー長の欄で巨大な領域を確保しないよう上限(256 MiB)を追加(壊れた/悪意あるファイル対策)。モデルのファイルはローカルの信頼できる入力なので `rust-json` への依存は足していない(リポジトリ間の Cargo 依存を避ける方針)。試験を2件追加、`cargo test -p open-cuda-llm --lib` 全通過(75件)。
