@@ -3095,7 +3095,7 @@ mod tests {
         for (name, shape, bytes) in &buffers {
             views.insert(name.clone(), TensorView::new(dtype, shape.clone(), bytes).unwrap());
         }
-        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let serialized = safetensors::serialize(&views, None).unwrap();
 
         let dir = std::env::temp_dir().join(format!("open-cuda-llm-synthetic-gpt2-{dir_suffix}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3209,7 +3209,7 @@ mod tests {
         views.insert("transformer.wte.weight".into(), TensorView::new(Dtype::I8, vec![2, 4], &wte).unwrap());
         // 残りは合成モデルの最小構成(f32)——ここでは wte だけ I8 で足りる
         // ように、フルモデルではなく tensor_f32 単体を叩いて確認する。
-        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let serialized = safetensors::serialize(&views, None).unwrap();
         let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
         let out = tensor_f32(&st, "transformer.wte.weight").unwrap();
         assert_eq!(out, vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0]);
@@ -3267,7 +3267,7 @@ mod tests {
         views.insert("h.0.attn.c_attn.qweight".into(), TensorView::new(Dtype::I32, vec![in_dim / pack, out_dim], &qw_b).unwrap());
         views.insert("h.0.attn.c_attn.qzeros".into(), TensorView::new(Dtype::I32, vec![1, out_dim / pack], &qz_b).unwrap());
         views.insert("h.0.attn.c_attn.scales".into(), TensorView::new(Dtype::F32, vec![1, out_dim], &scales_bytes).unwrap());
-        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let serialized = safetensors::serialize(&views, None).unwrap();
         let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
 
         let qc = QuantizationConfig {
@@ -3345,7 +3345,7 @@ mod tests {
         views.insert("h.0.attn.c_attn.qweight".into(), TensorView::new(Dtype::I32, vec![in_dim, packed_out], &qw_b).unwrap());
         views.insert("h.0.attn.c_attn.qzeros".into(), TensorView::new(Dtype::I32, vec![num_groups, packed_out], &qz_b).unwrap());
         views.insert("h.0.attn.c_attn.scales".into(), TensorView::new(Dtype::F32, vec![num_groups, out_dim], &sc_b).unwrap());
-        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let serialized = safetensors::serialize(&views, None).unwrap();
         let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
 
         let qc = QuantizationConfig {
@@ -3406,7 +3406,7 @@ mod tests {
         views.insert("h.0.mlp.c_fc.qweight".into(), TensorView::new(Dtype::I32, vec![in_dim, out_dim / pack], &qw_b).unwrap());
         views.insert("h.0.mlp.c_fc.qzeros".into(), TensorView::new(Dtype::I32, vec![num_groups, out_dim / pack], &qz_b).unwrap());
         views.insert("h.0.mlp.c_fc.scales".into(), TensorView::new(Dtype::F32, vec![num_groups, out_dim], &sc_b).unwrap());
-        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let serialized = safetensors::serialize(&views, None).unwrap();
         let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
 
         let qc = QuantizationConfig {
@@ -3446,7 +3446,7 @@ mod tests {
     #[test]
     fn load_conv1d_gptq_rejects_awq_method() {
         let empty: std::collections::HashMap<String, safetensors::tensor::TensorView> = std::collections::HashMap::new();
-        let serialized = safetensors::serialize(&empty, &None).unwrap();
+        let serialized = safetensors::serialize(&empty, None).unwrap();
         let st = safetensors::SafeTensors::deserialize(&serialized).unwrap();
         let qc = QuantizationConfig {
             bits: 4,

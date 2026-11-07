@@ -1434,7 +1434,7 @@ mod tests {
                 views.insert(name.clone(), TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap());
                 weight_map.insert(name.clone(), shard_name.to_string());
             }
-            let serialized = safetensors::serialize(&views, &None).unwrap();
+            let serialized = safetensors::serialize(&views, None).unwrap();
             std::fs::write(dir.join(shard_name), serialized).unwrap();
         }
 
@@ -1530,7 +1530,7 @@ mod tests {
         for (name, shape, bytes) in &buffers {
             views.insert(name.clone(), TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap());
         }
-        let serialized = safetensors::serialize(&views, &None).unwrap();
+        let serialized = safetensors::serialize(&views, None).unwrap();
 
         let dir = std::env::temp_dir().join(format!("open-cuda-llm-deepseek-moe-load-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

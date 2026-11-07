@@ -18,7 +18,7 @@ default = []
 real-vulkan = ["dep:ash"]
 
 [dependencies.ash]
-version = "0.37"
+version = "0.38"
 default-features = false
 features = ["loaded"]
 optional = true

@@ -9,25 +9,25 @@ rust-version.workspace = true
 description = "自己回帰デコーダ(GPT系、KVキャッシュ付き貪欲デコード)のforward pass実装。前回のマーケティング調査ロードマップで言う「1位vLLM相当」のMVP(バッチ処理・PagedAttention・連続バッチング等の本家vLLMの中核最適化は未実装、単一シーケンスの逐次デコードのみ)"
 
 [dependencies]
-sonic-rs = "0.3"
+sonic-rs = "0.5"
 opencuda-core.workspace = true
 opencuda-blas.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-safetensors = "0.4"
+safetensors = "0.8"
 # 2026-09-01追加: safetensorsローダーのF16/BF16→f32変換用(FP8は自前
 # デコーダ)。対話ファインチューニング済みGPT-2互換モデル(DialoGPT等、
 # F16配布)やDeepSeek-V3系(FP8配布)を`GptModel::load`が読めるようにする。
 half = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # 2026-08-08新設: PCA較正版MLA圧縮(`enable_mla_kv_compression_calibrated`)の
 # 固有値分解(実活性化統計の共分散行列からの主成分抽出)用。純Rust実装
 # (LAPACK/BLASバックエンド不要)のため、このマシンにCUDA/ROCm/oneAPI
 # ツールチェインが無くてもビルド・実行できる(既存のcuBLAS等スタブと同じ
 # 「検証可能な範囲でのみ実装する」方針に合致)。
-nalgebra = "0.33"
+nalgebra = "0.35"
 
 [dev-dependencies]
 opencuda-cpu.workspace = true

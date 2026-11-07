@@ -57,14 +57,14 @@ impl VulkanDevice {
 
         let app_name = CString::new("OpenCUDA").unwrap();
         let engine_name = CString::new("OpenCUDA").unwrap();
-        let app_info = vk::ApplicationInfo::builder()
+        let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .application_version(vk::make_api_version(0, 0, 3, 0))
             .engine_name(&engine_name)
             .engine_version(vk::make_api_version(0, 0, 3, 0))
             .api_version(vk::API_VERSION_1_1);
 
-        let instance_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+        let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
         let instance = unsafe { entry.create_instance(&instance_info, None) }.context(
             "vkCreateInstance failed. Update the GPU driver, or verify the Vulkan Runtime/SDK install",
         )?;
@@ -152,11 +152,10 @@ impl VulkanDevice {
         };
 
         let priorities = [1.0f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::builder()
+        let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
-            .queue_priorities(&priorities)
-            .build()];
-        let device_info = vk::DeviceCreateInfo::builder()
+            .queue_priorities(&priorities)];
+        let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_features(&enabled_features);
         let device = match unsafe { instance.create_device(physical_device, &device_info, None) }
@@ -170,7 +169,7 @@ impl VulkanDevice {
         };
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-        let pool_info = vk::CommandPoolCreateInfo::builder()
+        let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let command_pool = match unsafe { device.create_command_pool(&pool_info, None) }
@@ -274,11 +273,10 @@ impl VulkanDevice {
         // Use VK_WHOLE_SIZE so the range stays valid even when the nonCoherentAtomSize
         // alignment is larger than the requested copy length. The allocation is mapped
         // from offset 0 to its full memory-requirements size.
-        let range = vk::MappedMemoryRange::builder()
+        let range = vk::MappedMemoryRange::default()
             .memory(memory)
             .offset(0)
-            .size(vk::WHOLE_SIZE)
-            .build();
+            .size(vk::WHOLE_SIZE);
         unsafe { self.device.flush_mapped_memory_ranges(&[range]) }
             .context("vkFlushMappedMemoryRanges failed")?;
         Ok(())
@@ -289,11 +287,10 @@ impl VulkanDevice {
             return Ok(());
         }
         // Use VK_WHOLE_SIZE for the same reason as flush_if_needed.
-        let range = vk::MappedMemoryRange::builder()
+        let range = vk::MappedMemoryRange::default()
             .memory(memory)
             .offset(0)
-            .size(vk::WHOLE_SIZE)
-            .build();
+            .size(vk::WHOLE_SIZE);
         unsafe { self.device.invalidate_mapped_memory_ranges(&[range]) }
             .context("vkInvalidateMappedMemoryRanges failed")?;
         Ok(())
@@ -847,54 +844,53 @@ impl VulkanDevice {
         let words = bytes_to_u32_words(spirv)?;
 
         unsafe {
-            let shader_info = vk::ShaderModuleCreateInfo::builder().code(&words);
+            let shader_info = vk::ShaderModuleCreateInfo::default().code(&words);
             let shader_module = self.device.create_shader_module(&shader_info, None)
                 .context("vkCreateShaderModule failed")?;
 
             let bindings: Vec<vk::DescriptorSetLayoutBinding> =
                 (0..buffers.len() as u32).map(storage_binding).collect();
-            let set_layout_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
+            let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
             let set_layout = self.device.create_descriptor_set_layout(&set_layout_info, None)
                 .context("vkCreateDescriptorSetLayout failed")?;
 
             let push_ranges = if push_constants.is_empty() {
                 Vec::new()
             } else {
-                vec![vk::PushConstantRange::builder()
+                vec![vk::PushConstantRange::default()
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
                     .offset(0)
-                    .size(push_constants.len() as u32)
-                    .build()]
+                    .size(push_constants.len() as u32)]
             };
             let set_layouts = [set_layout];
-            let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
+            let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&set_layouts)
                 .push_constant_ranges(&push_ranges);
             let pipeline_layout = self.device.create_pipeline_layout(&pipeline_layout_info, None)
                 .context("vkCreatePipelineLayout failed")?;
 
             let entry_name = CString::new(entry).context("SPIR-V entry contains NUL byte")?;
-            let stage = vk::PipelineShaderStageCreateInfo::builder()
+            let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(shader_module)
                 .name(&entry_name);
-            let pipeline_info = vk::ComputePipelineCreateInfo::builder()
-                .stage(stage.build())
+            let pipeline_info = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
                 .layout(pipeline_layout);
             let pipeline = self.device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info.build()], None)
+                .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
                 .map_err(|(_, e)| anyhow!("vkCreateComputePipelines failed: {e:?}"))?[0];
 
             let pool_sizes = [vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: buffers.len() as u32,
             }];
-            let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder()
+            let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&pool_sizes);
             let descriptor_pool = self.device.create_descriptor_pool(&descriptor_pool_info, None)
                 .context("vkCreateDescriptorPool failed")?;
-            let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(descriptor_pool)
                 .set_layouts(&set_layouts);
             let descriptor_set = self.device.allocate_descriptor_sets(&alloc_info)
@@ -911,13 +907,13 @@ impl VulkanDevice {
                 .collect();
             self.device.update_descriptor_sets(&writes, &[]);
 
-            let alloc = vk::CommandBufferAllocateInfo::builder()
+            let alloc = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1);
             let cmd = self.device.allocate_command_buffers(&alloc)
                 .context("vkAllocateCommandBuffers failed")?[0];
-            let begin = vk::CommandBufferBeginInfo::builder();
+            let begin = vk::CommandBufferBeginInfo::default();
             self.device.begin_command_buffer(cmd, &begin)
                 .context("vkBeginCommandBuffer failed")?;
             self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -941,10 +937,10 @@ impl VulkanDevice {
             self.device.cmd_dispatch(cmd, cfg.grid.0, cfg.grid.1, cfg.grid.2);
             self.device.end_command_buffer(cmd).context("vkEndCommandBuffer failed")?;
 
-            let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd));
-            let fence_info = vk::FenceCreateInfo::builder();
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            let fence_info = vk::FenceCreateInfo::default();
             let fence = self.device.create_fence(&fence_info, None).context("vkCreateFence failed")?;
-            self.device.queue_submit(self.queue, &[submit.build()], fence)
+            self.device.queue_submit(self.queue, &[submit], fence)
                 .context("vkQueueSubmit failed")?;
             self.device.wait_for_fences(&[fence], true, u64::MAX)
                 .context("vkWaitForFences failed")?;
@@ -972,7 +968,7 @@ impl GpuDevice for VulkanDevice {
             return Err(GpuError::OutOfMemory(0).into());
         }
         unsafe {
-            let buffer_info = vk::BufferCreateInfo::builder()
+            let buffer_info = vk::BufferCreateInfo::default()
                 .size(bytes as u64)
                 .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -980,7 +976,7 @@ impl GpuDevice for VulkanDevice {
                 .context("vkCreateBuffer failed")?;
             let req = self.device.get_buffer_memory_requirements(buffer);
             let (memory_type, coherent) = self.find_host_visible_memory_type(req.memory_type_bits)?;
-            let alloc_info = vk::MemoryAllocateInfo::builder()
+            let alloc_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(memory_type);
             let memory = self.device.allocate_memory(&alloc_info, None)
@@ -1178,22 +1174,20 @@ fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
     }
 }
 
-fn storage_binding(binding: u32) -> vk::DescriptorSetLayoutBinding {
-    vk::DescriptorSetLayoutBinding::builder()
+fn storage_binding(binding: u32) -> vk::DescriptorSetLayoutBinding<'static> {
+    vk::DescriptorSetLayoutBinding::default()
         .binding(binding)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        .build()
 }
 
 fn descriptor_write(set: vk::DescriptorSet, binding: u32, info: &[vk::DescriptorBufferInfo]) -> vk::WriteDescriptorSet {
-    vk::WriteDescriptorSet::builder()
+    vk::WriteDescriptorSet::default()
         .dst_set(set)
         .dst_binding(binding)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
         .buffer_info(info)
-        .build()
 }
 
 fn bytes_to_u32_words(bytes: &[u8]) -> Result<Vec<u32>> {
