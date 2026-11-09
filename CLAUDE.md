@@ -3994,3 +3994,7 @@ Reading into `serde_json::Value` gives almost no speed-up even with SIMD (188 ms
 
 ## JSON の読み込み(2026-11-06)
 JSON を読む所は、設定ファイル(`config.json`)・safetensors のインデックスはすでに `sonic_rs`。残っていた safetensors のヘッダー(`deepseek_arch::read_safetensors_header`)を `serde_json::from_slice` から `sonic_rs::from_slice` に替え、ヘッダー長の欄で巨大な領域を確保しないよう上限(256 MiB)を追加(壊れた/悪意あるファイル対策)。モデルのファイルはローカルの信頼できる入力なので `rust-json` への依存は足していない(リポジトリ間の Cargo 依存を避ける方針)。試験を2件追加、`cargo test -p open-cuda-llm --lib` 全通過(75件)。
+
+## 配備方針に対する判断(2026-11-09、共有基盤)
+- 判断: `open-cuda`は**ライブラリのまま**`aruaru-llm`に内蔵して使い、独立した共有サービスは作らない。理由: VPSにGPUが無く(CPU経路のみ)、呼び出しは全て`aruaru-llm`経由で、`aruaru-llm`が1プロセスで全サイトに共有されているため、サイトごとの導入は既に不要。別サービス化すると行列・モデル二重ロードが増えるだけ。受付制御は`aruaru-llm`(`src/admission.rs`)で行う。
+- Decision: `open-cuda` stays a library embedded in the single shared `aruaru-llm` process (no GPU on the VPS, all calls go through aruaru-llm); a separate service would only add queues and double model loads.
