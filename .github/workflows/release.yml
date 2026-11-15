@@ -69,9 +69,31 @@ jobs:
           name: opencuda-diag-windows-x86_64
           path: opencuda-diag-windows-x86_64.zip
 
+
+  build-windows-arm64:
+    name: Windows ARM64 (Snapdragon, aarch64)
+    runs-on: windows-11-arm
+    continue-on-error: true  # Snapdragon (Windows on ARM64); never blocks the release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout sibling path dependency (open-cpu)
+        run: git clone --depth=1 https://github.com/aon-co-jp/open-cpu.git ../open-cpu
+      - name: Build diagnostic CLI
+        run: cargo build --release -p vulkan_info
+      - name: Package portable zip (opencuda-diag-windows-aarch64.zip)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-zip | Out-Null
+          Copy-Item target\release\vulkan_info.exe dist-zip\opencuda-vulkan-info.exe
+          Compress-Archive -Path dist-zip\opencuda-vulkan-info.exe -DestinationPath opencuda-diag-windows-aarch64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencuda-diag-windows-aarch64
+          path: opencuda-diag-windows-aarch64.zip
+
   release:
     name: GitHub Releaseへ添付
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-windows-arm64]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
