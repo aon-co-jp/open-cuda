@@ -878,7 +878,7 @@ pub fn scaled_dot_product_attention_with_spirv_and_softmax(
 /// バック経路として使う(GPU経路が選べない/`softmax_spirv`が`None`の場合)。
 fn cpu_row_softmax(scores: &[f32], seq_len: usize) -> Vec<f32> {
     let mut probs = vec![0.0f32; seq_len * seq_len];
-    probs.par_chunks_mut(seq_len).zip(scores.par_chunks(seq_len)).for_each(|(out_row, in_row)| {
+    let row_softmax = |(out_row, in_row): (&mut [f32], &[f32])| {
         let max = in_row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
         for (o, &s) in out_row.iter_mut().zip(in_row.iter()) {
@@ -891,7 +891,13 @@ fn cpu_row_softmax(scores: &[f32], seq_len: usize) -> Vec<f32> {
                 *o /= sum;
             }
         }
-    });
+    };
+    // 短い系列ではrayonへの投入費用のほうが大きい(sgemm_cpuと同じ理由)。直接計算する。
+    if seq_len.saturating_mul(seq_len) < 262_144 {
+        probs.chunks_mut(seq_len).zip(scores.chunks(seq_len)).for_each(row_softmax);
+    } else {
+        probs.par_chunks_mut(seq_len).zip(scores.par_chunks(seq_len)).for_each(row_softmax);
+    }
     probs
 }
 

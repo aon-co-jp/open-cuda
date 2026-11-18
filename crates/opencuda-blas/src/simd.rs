@@ -369,7 +369,11 @@ pub fn sgemm_cpu(
     // ここで明示的に検査する(呼び出し側の`sgemm`は既に検査済みだが、
     // この関数を直接呼ぶ経路〈autotune等〉もあるため)。
     assert_eq!(c.len(), m * n, "sgemm_cpu: c.len()={} != m*n={}", c.len(), m * n);
-    c.par_chunks_mut(n).enumerate().for_each(|(row, c_row)| {
+    // 小さな演算(1行のデコード・短い系列のアテンションなど)は、rayonへ投入する費用
+    // (別スレッドへの受け渡しと待ち合わせ)のほうが計算そのものより大きい。実測で、GPT-2の
+    // CPU推論が1トークン約1秒かかり、rayonのスレッド数を増やすほど遅くなった(4本5秒→32本20秒)。
+    // 並列にしても1行(m=1)は1チャンクにしかならないので、小さい場合は呼び出し元のスレッドで直接計算する。
+    let go = |(row, c_row): (usize, &mut [f32])| {
         let a_row = &a[row * k..row * k + k];
         if transpose_b {
             for (col, cv) in c_row.iter_mut().enumerate() {
@@ -387,8 +391,16 @@ pub fn sgemm_cpu(
                 *cv = alpha * av + beta * *cv;
             }
         }
-    });
+    };
+    if m <= 1 || m.saturating_mul(k).saturating_mul(n) < PAR_GEMM_MIN_WORK {
+        c.chunks_mut(n).enumerate().for_each(go);
+    } else {
+        c.par_chunks_mut(n).enumerate().for_each(go);
+    }
 }
+
+/// これ未満の積和演算数(m*k*n)のGEMMは、rayonを使わず直接計算する。
+const PAR_GEMM_MIN_WORK: usize = 4_000_000;
 
 fn dot_i8_scalar(a: &[u8], b: &[i8]) -> i32 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x as i32 * y as i32).sum()
