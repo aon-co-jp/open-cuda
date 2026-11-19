@@ -1653,12 +1653,23 @@ pub fn sgemm_fp8_weight(
             let mut buf = vec![0f32; w];
             for i in 0..k {
                 let base = i * n + j0;
-                for jj in 0..w {
-                    let idx = base + jj;
-                    buf[jj] = lut[b.data[idx] as usize] * b.scales[idx / b.group_size];
+                // 1ブロックが同じスケールを共有する(group_size==nなど)なら、除算とスケール乗算を
+                // 要素ごとにせず、係数側へ畳み込む(内側ループがLUT参照+積和だけになる)。
+                let g0 = base / b.group_size;
+                let same = (base + w - 1) / b.group_size == g0;
+                let sc0 = b.scales[g0];
+                if same {
+                    for jj in 0..w {
+                        buf[jj] = lut[b.data[base + jj] as usize];
+                    }
+                } else {
+                    for jj in 0..w {
+                        let idx = base + jj;
+                        buf[jj] = lut[b.data[idx] as usize] * b.scales[idx / b.group_size];
+                    }
                 }
                 for r in 0..m {
-                    let av = a[r * k + i];
+                    let av = a[r * k + i] * if same { sc0 } else { 1.0 };
                     if av == 0.0 {
                         continue;
                     }
