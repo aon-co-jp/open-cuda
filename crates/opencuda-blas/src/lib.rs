@@ -1450,24 +1450,37 @@ fn f8_to_f32(b: u8, fmt: Fp8Format) -> f32 {
 /// 正確に行う(対称クランプの `launch_quantize_kernel` は流用できない)。
 /// NaN / ±inf コードは候補から除外する。
 fn f8_nearest(v: f32, fmt: Fp8Format) -> u8 {
+    // 2026-11-19: 要素ごとに256コードを総当たりしていたのをやめ、(値,コード)の昇順表を
+    // 一度だけ作って二分探索する。同誤差のときは小さいコードを選ぶ(旧実装と同じ結果)。
+    use std::sync::OnceLock;
+    static T_E4M3: OnceLock<Vec<(f32, u8)>> = OnceLock::new();
+    static T_E5M2: OnceLock<Vec<(f32, u8)>> = OnceLock::new();
     if v == 0.0 {
         return 0; // 符号付きゼロは +0 に丸める
     }
-    let mut best = 0u8;
-    let mut best_err = f32::INFINITY;
-    for code in 0u16..256 {
-        let code = code as u8;
-        let d = f8_to_f32(code, fmt);
-        if !d.is_finite() {
-            continue;
-        }
-        let err = (d - v).abs();
-        if err < best_err {
-            best_err = err;
-            best = code;
+    let table = match fmt {
+        Fp8Format::E4M3 => &T_E4M3,
+        Fp8Format::E5M2 => &T_E5M2,
+    }
+    .get_or_init(|| {
+        let mut t: Vec<(f32, u8)> = (0u16..256).map(|c| (f8_to_f32(c as u8, fmt), c as u8)).filter(|(d, _)| d.is_finite()).collect();
+        t.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        t
+    });
+    if v.is_nan() {
+        return 0;
+    }
+    let pos = table.partition_point(|&(d, _)| d < v);
+    let mut best = (f32::INFINITY, 0u8);
+    for idx in [pos.wrapping_sub(1), pos, pos + 1, pos.wrapping_sub(2)] {
+        if let Some(&(d, code)) = table.get(idx) {
+            let err = (d - v).abs();
+            if err < best.0 || (err == best.0 && code < best.1) {
+                best = (err, code);
+            }
         }
     }
-    best
+    best.1
 }
 
 /// FP8 量子化済みテンソル(グループ単位スケール + 1バイト/値の FP8 コード)。
@@ -1493,10 +1506,16 @@ fn quantize_fp8(
     // みホスト側で行う——INT4 のニブルパッキングをホスト側で行うのと同じ
     // 役割分担。
     let scales = group_scales(input, group_size, format.max_normal());
-    let scaled = launch_scale_kernel(device, input, &scales, group_size)?;
-    let data: Vec<u8> = scaled
+    // 2026-11-19: 要素ごとのデバイスカーネル起動(CPUバックエンドで極端に遅い、
+    // 1.5Bの読み込みが約340秒)をやめ、ホストでrayon並列に直接スケールして丸める。結果は同一。
+    let _ = device;
+    let data: Vec<u8> = input
         .par_iter()
-        .map(|&x| f8_nearest(x, format))
+        .enumerate()
+        .map(|(i, &x)| {
+            let sc = scales[i / group_size];
+            f8_nearest(if sc == 0.0 { 0.0 } else { x / sc }, format)
+        })
         .collect();
     Ok(QuantizedFp8Tensor {
         data,
@@ -1622,22 +1641,42 @@ pub fn sgemm_fp8_weight(
     use rayon::prelude::*;
     let lut: Vec<f32> = (0..=255u8).map(|v| f8_to_f32(v, b.format)).collect();
     let mut c = vec![0f32; m * n];
-    const BLOCK: usize = 512;
-    for row in 0..m {
-        let a_row = &a[row * k..(row + 1) * k];
-        c[row * n..(row + 1) * n].par_chunks_mut(BLOCK).enumerate().for_each(|(bi, out)| {
+    const BLOCK: usize = 256;
+    let nblocks = n.div_ceil(BLOCK);
+    // 列ブロックごとに並列。各重み要素は1回だけ復元し、全行(m)へ使い回す。
+    let parts: Vec<Vec<f32>> = (0..nblocks)
+        .into_par_iter()
+        .map(|bi| {
             let j0 = bi * BLOCK;
-            for (i, &av) in a_row.iter().enumerate() {
-                if av == 0.0 {
-                    continue;
-                }
+            let w = BLOCK.min(n - j0);
+            let mut acc = vec![0f32; m * w];
+            let mut buf = vec![0f32; w];
+            for i in 0..k {
                 let base = i * n + j0;
-                for (jj, o) in out.iter_mut().enumerate() {
+                for jj in 0..w {
                     let idx = base + jj;
-                    *o += av * lut[b.data[idx] as usize] * b.scales[idx / b.group_size];
+                    buf[jj] = lut[b.data[idx] as usize] * b.scales[idx / b.group_size];
+                }
+                for r in 0..m {
+                    let av = a[r * k + i];
+                    if av == 0.0 {
+                        continue;
+                    }
+                    let out = &mut acc[r * w..(r + 1) * w];
+                    for jj in 0..w {
+                        out[jj] += av * buf[jj];
+                    }
                 }
             }
-        });
+            acc
+        })
+        .collect();
+    for (bi, acc) in parts.iter().enumerate() {
+        let j0 = bi * BLOCK;
+        let w = BLOCK.min(n - j0);
+        for r in 0..m {
+            c[r * n + j0..r * n + j0 + w].copy_from_slice(&acc[r * w..(r + 1) * w]);
+        }
     }
     Ok(c)
 }
