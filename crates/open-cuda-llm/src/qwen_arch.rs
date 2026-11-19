@@ -487,7 +487,14 @@ impl QwenModel {
         let heads_per_kv = cfg.num_heads / cfg.num_kv_heads;
         let seq = token_ids.len();
         ensure!(seq > 0, "open-cuda-llm: token_ids must not be empty");
-        ensure!(self.layers.iter().all(|l| l.mla.is_none()), "open-cuda-llm: batched prefill does not support MLA-compressed KV caches");
+        if self.layers.iter().any(|l| l.mla.is_some()) {
+            // MLA圧縮KVキャッシュはバッチprefill非対応のため、1トークンずつ(結果は同じロジット並び)。
+            let mut out = Vec::with_capacity(seq * cfg.vocab_size);
+            for &t in token_ids {
+                out.extend(self.forward_step(device, t, caches)?);
+            }
+            return Ok(out);
+        }
         let pos0 = caches[0].kv[0].n;
         ensure!(pos0 + seq <= cfg.max_seq_len, "open-cuda-llm: sequence too long ({} > {})", pos0 + seq, cfg.max_seq_len);
 
@@ -740,8 +747,8 @@ struct Shards<'a> {
 }
 
 impl<'a> Shards<'a> {
-    fn new(buffers: &'a [Vec<u8>], weight_map: std::collections::HashMap<String, usize>) -> Result<Self> {
-        let files = buffers.iter().map(|b| safetensors::SafeTensors::deserialize(b).context("open-cuda-llm: failed to parse a safetensors file")).collect::<Result<Vec<_>>>()?;
+    fn new(buffers: &'a [memmap2::Mmap], weight_map: std::collections::HashMap<String, usize>) -> Result<Self> {
+        let files = buffers.iter().map(|b| safetensors::SafeTensors::deserialize(&b[..]).context("open-cuda-llm: failed to parse a safetensors file")).collect::<Result<Vec<_>>>()?;
         Ok(Self { files, weight_map })
     }
 
@@ -756,13 +763,20 @@ struct WeightIndex {
     weight_map: std::collections::HashMap<String, String>,
 }
 
+/// 重みファイルをメモリマップする(全体をRAMへ読み込まず、必要なページだけOSが読む。
+/// f32展開との二重確保でピークが跳ね上がるのを避ける、2026-11-19)。
+fn map_file(p: &Path) -> Result<memmap2::Mmap> {
+    let f = std::fs::File::open(p).with_context(|| format!("open-cuda-llm: failed to open {}", p.display()))?;
+    // SAFETY: 読み取り専用。読込中に他プロセスが同ファイルを書き換えない前提(モデル重みは不変)。
+    unsafe { memmap2::Mmap::map(&f) }.with_context(|| format!("open-cuda-llm: failed to mmap {}", p.display()))
+}
+
 /// 単一の`model.safetensors`、または`index.json`が指す全シャードを読む。
 /// 戻り値: (各ファイルのバイト列, テンソル名→バイト列番号。単一ファイルなら空)。
-fn read_weight_files(dir: &Path, index_path: &Path) -> Result<(Vec<Vec<u8>>, std::collections::HashMap<String, usize>)> {
+fn read_weight_files(dir: &Path, index_path: &Path) -> Result<(Vec<memmap2::Mmap>, std::collections::HashMap<String, usize>)> {
     if !index_path.exists() {
         let p = dir.join("model.safetensors");
-        let data = std::fs::read(&p).with_context(|| format!("open-cuda-llm: failed to read {}", p.display()))?;
-        return Ok((vec![data], Default::default()));
+        return Ok((vec![map_file(&p)?], Default::default()));
     }
     let bytes = std::fs::read(index_path).with_context(|| format!("open-cuda-llm: failed to read {}", index_path.display()))?;
     let index: WeightIndex = sonic_rs::from_slice(&bytes).context("open-cuda-llm: failed to parse model.safetensors.index.json")?;
@@ -774,11 +788,11 @@ fn read_weight_files(dir: &Path, index_path: &Path) -> Result<(Vec<Vec<u8>>, std
         let n = file_ids.len();
         file_ids.entry(f.clone()).or_insert(n);
     }
-    let mut buffers = vec![Vec::new(); file_ids.len()];
+    let mut slots: Vec<Option<memmap2::Mmap>> = (0..file_ids.len()).map(|_| None).collect();
     for (f, id) in &file_ids {
-        let p = dir.join(f);
-        buffers[*id] = std::fs::read(&p).with_context(|| format!("open-cuda-llm: failed to read shard {}", p.display()))?;
+        slots[*id] = Some(map_file(&dir.join(f))?);
     }
+    let buffers = slots.into_iter().flatten().collect::<Vec<_>>();
     let map = index.weight_map.into_iter().map(|(k, f)| (k, file_ids[&f])).collect();
     Ok((buffers, map))
 }
