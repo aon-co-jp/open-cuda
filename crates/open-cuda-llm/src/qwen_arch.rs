@@ -217,6 +217,8 @@ pub struct QwenModel {
     norm: RmsNorm,
     /// `tie_word_embeddings=true`なら`None`(`embed_tokens`を転置して使う)。
     lm_head: Option<Linear>,
+    /// 層スキップ(層の感度測定・深さ方向の剪定用、2026-11-19)。空なら全層を使う。
+    skip: Vec<bool>,
 }
 
 impl QwenModel {
@@ -226,7 +228,7 @@ impl QwenModel {
         let layers = (0..config.num_layers).map(|_| QwenLayer::random(&mut rng, &config)).collect();
         let norm = RmsNorm::identity(config.hidden_size, config.rms_norm_eps);
         let lm_head = if config.tie_word_embeddings { None } else { Some(Linear::random(&mut rng, config.hidden_size, config.vocab_size)) };
-        Self { config, embed_tokens, layers, norm, lm_head }
+        Self { config, embed_tokens, layers, norm, lm_head, skip: Vec::new() }
     }
 
     /// 実在の学習済み重み(Qwen2/Qwen2.5、`config.json` + 単一ファイルの
@@ -294,7 +296,22 @@ impl QwenModel {
             Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
         };
 
-        Ok(Self { config, embed_tokens, layers, norm, lm_head })
+        Ok(Self { config, embed_tokens, layers, norm, lm_head, skip: Vec::new() })
+    }
+
+    /// 指定した層を計算から外す(残差接続のおかげで素通しになる)。層0は位置計算に使うため不可。
+    pub fn set_skipped_layers(&mut self, idx: &[usize]) -> Result<()> {
+        let mut skip = vec![false; self.layers.len()];
+        for &i in idx {
+            ensure!(i > 0 && i < self.layers.len(), "open-cuda-llm: skipped layer {i} out of range (layer 0 cannot be skipped)");
+            skip[i] = true;
+        }
+        self.skip = skip;
+        Ok(())
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// KVキャッシュをヘッドあたり`head_dim`次元から`d_c`次元(`d_c < head_dim`)
@@ -407,7 +424,10 @@ impl QwenModel {
         ensure!(tok < cfg.vocab_size, "open-cuda-llm: token id {tok} out of vocab range {}", cfg.vocab_size);
         let mut hidden_state = self.embed_tokens[tok * hidden..(tok + 1) * hidden].to_vec();
 
-        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+        for (li, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
+            if self.skip.get(li).copied().unwrap_or(false) {
+                continue;
+            }
             // ---- Attention サブ層(pre-norm) ----
             let mut normed = hidden_state.clone();
             layer.input_layernorm.forward_row(&mut normed);
@@ -518,7 +538,10 @@ impl QwenModel {
         let rope: Vec<(Vec<f32>, Vec<f32>)> = (0..seq).map(|i| rope_cos_sin(head_dim, cfg.rope_theta, pos0 + i)).collect();
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+        for (li, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
+            if self.skip.get(li).copied().unwrap_or(false) {
+                continue;
+            }
             let mut normed = x.clone();
             for row in normed.chunks_exact_mut(hidden) {
                 layer.input_layernorm.forward_row(row);

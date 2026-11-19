@@ -36,6 +36,22 @@ fn main() -> Result<()> {
         model.enable_mla_kv_compression_calibrated(d_c, device.as_ref(), &prompts)?;
         calib_s = t.elapsed().as_secs_f32();
     }
+    // QWEN_SKIP=3,5 のように指定した層を飛ばす。QWEN_SWEEP=1 なら各層を1つずつ飛ばしてppl・速度を表示。
+    if std::env::var("QWEN_SWEEP").is_ok() {
+        let ids = tok.encode(EVAL)?;
+        for i in 1..model.num_layers() {
+            model.set_skipped_layers(&[i])?;
+            let t = Instant::now();
+            let lp = model.token_logprobs(&device, &ids)?;
+            let ppl = (-(lp.iter().sum::<f32>() / lp.len() as f32)).exp();
+            println!("SWEEP skip_layer={i} ppl={ppl:.3} eval_s={:.1}", t.elapsed().as_secs_f32());
+        }
+        return Ok(());
+    }
+    if let Ok(v) = std::env::var("QWEN_SKIP") {
+        let idx: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        model.set_skipped_layers(&idx)?;
+    }
     let ids = tok.encode(EVAL)?;
     let t = Instant::now();
     let lp = model.token_logprobs(&device, &ids)?;
