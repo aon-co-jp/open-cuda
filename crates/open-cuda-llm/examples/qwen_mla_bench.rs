@@ -48,6 +48,58 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // QWEN_SEARCH=K: 飛ばす層をK個選ぶ。貪欲法(1つずつ最良を追加)と焼きなまし(入れ替え近傍)を比べる。
+    if let Ok(k) = std::env::var("QWEN_SEARCH") {
+        let k: usize = k.parse()?;
+        let ids = tok.encode(EVAL)?;
+        let n = model.num_layers();
+        let evals = std::cell::Cell::new(0usize);
+        let eval = |set: &[usize], model: &mut QwenModel| -> Result<f32> {
+            evals.set(evals.get() + 1);
+            model.set_skipped_layers(set)?;
+            let lp = model.token_logprobs(&device, &ids)?;
+            Ok((-(lp.iter().sum::<f32>() / lp.len() as f32)).exp())
+        };
+        let mut greedy: Vec<usize> = Vec::new();
+        let mut gp = 0.0;
+        for _ in 0..k {
+            let mut best = (f32::INFINITY, 0usize);
+            for i in 1..n {
+                if greedy.contains(&i) { continue; }
+                let mut c = greedy.clone();
+                c.push(i);
+                let p = eval(&c, &mut model)?;
+                if p < best.0 { best = (p, i); }
+            }
+            greedy.push(best.1);
+            gp = best.0;
+        }
+        let greedy_evals = evals.get();
+        println!("SEARCH greedy k={k} set={greedy:?} ppl={gp:.3} evals={greedy_evals}");
+        // 焼きなまし: 同じ評価回数の予算で、1層を入れ替える近傍を探索。
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = |m: usize| -> usize { state ^= state << 13; state ^= state >> 7; state ^= state << 17; (state % m as u64) as usize };
+        let mut cur: Vec<usize> = (0..k).map(|j| 1 + (j * (n - 1)) / k).collect();
+        let mut cur_p = eval(&cur, &mut model)?;
+        let (mut best_set, mut best_p) = (cur.clone(), cur_p);
+        let budget = greedy_evals;
+        let mut t = 2.0f32;
+        while evals.get() < greedy_evals + budget {
+            let pos = rnd(k);
+            let cand = 1 + rnd(n - 1);
+            if cur.contains(&cand) { continue; }
+            let mut next = cur.clone();
+            next[pos] = cand;
+            let p = eval(&next, &mut model)?;
+            let accept = p < cur_p || ((cur_p.ln() - p.ln()) / (t * 0.1)).exp() > (rnd(1000) as f32 / 1000.0);
+            if accept { cur = next; cur_p = p; }
+            if cur_p < best_p { best_p = cur_p; best_set = cur.clone(); }
+            t = (t * 0.97).max(0.05);
+        }
+        best_set.sort();
+        println!("SEARCH anneal k={k} set={best_set:?} ppl={best_p:.3} evals={}", evals.get() - greedy_evals);
+        return Ok(());
+    }
     if let Ok(v) = std::env::var("QWEN_SKIP") {
         let idx: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         model.set_skipped_layers(&idx)?;
