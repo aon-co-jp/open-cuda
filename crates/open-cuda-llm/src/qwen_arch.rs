@@ -234,6 +234,17 @@ impl QwenModel {
     /// (`model-00001-of-00002.safetensors`等)のsharded checkpointには
     /// 未対応(`GptModel::load`と同じ制約——単一ファイルのモデルのみ)。
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_with(dir, None)
+    }
+
+    /// [`load`](Self::load)の変種。`fp8`を渡すと、各線形層の重みを読むたびにFP8へ量子化し、
+    /// f32の元重みをすぐ捨てる(常駐メモリは約1/4、7B級を32GB機へ載せるための経路、2026-11-19)。
+    /// 埋め込み・正規化・biasはf32のまま。
+    pub fn load_fp8(dir: &Path, device: &dyn GpuDevice, format: opencuda_blas::Fp8Format) -> Result<Self> {
+        Self::load_with(dir, Some((device, format)))
+    }
+
+    fn load_with(dir: &Path, fp8: Option<(&dyn GpuDevice, opencuda_blas::Fp8Format)>) -> Result<Self> {
         let config_bytes = std::fs::read(dir.join("config.json")).with_context(|| format!("open-cuda-llm: failed to read {}/config.json", dir.display()))?;
         let config: QwenConfig = sonic_rs::from_slice(&config_bytes).context("open-cuda-llm: failed to parse Qwen config.json")?;
         ensure!(
@@ -260,14 +271,14 @@ impl QwenModel {
             let p = format!("model.layers.{i}");
             layers.push(QwenLayer {
                 input_layernorm: RmsNorm { weight: tensors.f32(&format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
-                q_proj: load_linear(&tensors, &format!("{p}.self_attn.q_proj"), hidden, hidden)?,
-                k_proj: load_linear(&tensors, &format!("{p}.self_attn.k_proj"), hidden, kv_dim)?,
-                v_proj: load_linear(&tensors, &format!("{p}.self_attn.v_proj"), hidden, kv_dim)?,
-                o_proj: load_linear(&tensors, &format!("{p}.self_attn.o_proj"), hidden, hidden)?,
+                q_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.q_proj"), hidden, hidden)?,
+                k_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.k_proj"), hidden, kv_dim)?,
+                v_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.v_proj"), hidden, kv_dim)?,
+                o_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.o_proj"), hidden, hidden)?,
                 post_attention_layernorm: RmsNorm { weight: tensors.f32(&format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
-                gate_proj: load_linear(&tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)?,
-                up_proj: load_linear(&tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
-                down_proj: load_linear(&tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
+                gate_proj: load_linear_q(&fp8, &tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)?,
+                up_proj: load_linear_q(&fp8, &tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
+                down_proj: load_linear_q(&fp8, &tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
                 mla: None,
             });
         }
@@ -800,6 +811,15 @@ fn read_weight_files(dir: &Path, index_path: &Path) -> Result<(Vec<memmap2::Mmap
 /// 標準的な`nn.Linear`(`[out_dim, in_dim]`行優先で保存、GPT-2の
 /// `Conv1D`とは転置関係が逆)から`Linear`を組み立てる。biasテンソルが
 /// 無ければ(Qwen2の`o_proj`/MLP系はbias無し)ゼロベクトルにする。
+fn load_linear_q(fp8: &Option<(&dyn GpuDevice, opencuda_blas::Fp8Format)>, tensors: &Shards, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
+    let mut l = load_linear(tensors, prefix, in_dim, out_dim)?;
+    if let Some((device, format)) = fp8 {
+        l.quantize_to_fp8(*device, *format)?;
+        l.weight_t = Vec::new(); // f32を解放(forwardはfp8_weightを優先して使う)
+    }
+    Ok(l)
+}
+
 fn load_linear(tensors: &Shards, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
     let raw = tensors.f32(&format!("{prefix}.weight"))?;
     ensure!(raw.len() == out_dim * in_dim, "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}", raw.len(), out_dim, in_dim);

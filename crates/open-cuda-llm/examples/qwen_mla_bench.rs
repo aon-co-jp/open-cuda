@@ -25,9 +25,10 @@ fn main() -> Result<()> {
     let d_c: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let tok = GptTokenizer::load(&dir)?;
     let t0 = Instant::now();
-    let mut model = QwenModel::load(&dir)?;
-    let load_s = t0.elapsed().as_secs_f32();
+    let fp8 = std::env::var("QWEN_FP8").is_ok();
     let device: Arc<dyn GpuDevice> = CpuDevice::new(0);
+    let mut model = if fp8 { QwenModel::load_fp8(&dir, device.as_ref(), opencuda_blas::Fp8Format::E4M3)? } else { QwenModel::load(&dir)? };
+    let load_s = t0.elapsed().as_secs_f32();
     let mut calib_s = 0.0;
     if d_c > 0 {
         let prompts: Vec<Vec<u32>> = CALIB.iter().map(|t| tok.encode(t)).collect::<Result<_>>()?;
@@ -48,7 +49,7 @@ fn main() -> Result<()> {
     let dim = if d_c > 0 { d_c } else { 128 };
     let kv_bytes = 28 * 2 * 2 * dim * 4;
     println!(
-        "RESULT d_c={d_c} load_s={load_s:.1} calib_s={calib_s:.1} eval_tokens={} eval_s={eval_s:.1} ppl={ppl:.3} gen_s={gen_s:.1} kv_bytes_per_token={kv_bytes} gen_ids={:?}",
+        "RESULT fp8={fp8} d_c={d_c} load_s={load_s:.1} calib_s={calib_s:.1} eval_tokens={} eval_s={eval_s:.1} ppl={ppl:.3} gen_s={gen_s:.1} kv_bytes_per_token={kv_bytes} gen_ids={:?}",
         ids.len(),
         gen
     );
