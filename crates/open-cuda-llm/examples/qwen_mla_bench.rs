@@ -17,6 +17,12 @@ const CALIB: &[&str] = &[
     "Photosynthesis is the process by which green plants convert sunlight, water and carbon dioxide into glucose and oxygen.",
 ];
 const EVAL: &str = "Machine learning models are trained on large datasets to recognise patterns. Once trained, they can make predictions on new data, but their quality depends on how well the training data represents the real world. 日本語の文章でも同じことが言えます。";
+const HELDOUT: &[&str] = &[
+    "The committee met on Tuesday to discuss the budget, and after a long debate the members agreed to postpone the final vote until next month.",
+    "In a small village by the sea, an old fisherman repaired his nets every morning while the children played on the beach nearby.",
+    "To install the package, run the setup script, then open the configuration file and set the server address and the port number.",
+    "昨日は雨が降っていたので、友達と一緒に家でゲームをして、夜はカレーを作って食べました。",
+];
 const PROMPT: &str = "Explain in two sentences why the sky is blue.";
 
 fn main() -> Result<()> {
@@ -109,6 +115,13 @@ fn main() -> Result<()> {
     let lp = model.token_logprobs(&device, &ids)?;
     let eval_s = t.elapsed().as_secs_f32();
     let ppl = (-(lp.iter().sum::<f32>() / lp.len() as f32)).exp();
+    let mut held = 0.0f32;
+    for t in HELDOUT {
+        let hi = tok.encode(t)?;
+        let hl = model.token_logprobs(&device, &hi)?;
+        held += (-(hl.iter().sum::<f32>() / hl.len() as f32)).exp().ln();
+    }
+    let heldout_ppl = (held / HELDOUT.len() as f32).exp();
     let p = tok.encode(PROMPT)?;
     let t = Instant::now();
     let gen = model.generate(&device, &p, 24)?;
@@ -117,7 +130,7 @@ fn main() -> Result<()> {
     let dim = if d_c > 0 { d_c } else { 128 };
     let kv_bytes = 28 * 2 * 2 * dim * 4;
     println!(
-        "RESULT fp8={fp8} d_c={d_c} load_s={load_s:.1} calib_s={calib_s:.1} eval_tokens={} eval_s={eval_s:.1} ppl={ppl:.3} gen_s={gen_s:.1} kv_bytes_per_token={kv_bytes} gen_ids={:?}",
+        "RESULT fp8={fp8} d_c={d_c} load_s={load_s:.1} calib_s={calib_s:.1} eval_tokens={} eval_s={eval_s:.1} ppl={ppl:.3} heldout_ppl={heldout_ppl:.3} gen_s={gen_s:.1} kv_bytes_per_token={kv_bytes} gen_ids={:?}",
         ids.len(),
         gen
     );
