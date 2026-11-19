@@ -244,27 +244,27 @@ impl QwenModel {
         );
         ensure!(config.hidden_size % config.num_heads == 0, "open-cuda-llm: hidden_size ({}) must be divisible by num_attention_heads ({})", config.hidden_size, config.num_heads);
 
-        let weights_path = dir.join("model.safetensors");
-        let data = std::fs::read(&weights_path).with_context(|| format!("open-cuda-llm: failed to read {}", weights_path.display()))?;
-        let tensors = safetensors::SafeTensors::deserialize(&data).context("open-cuda-llm: failed to parse model.safetensors")?;
+        let index_path = dir.join("model.safetensors.index.json");
+        let (buffers, weight_map) = read_weight_files(dir, &index_path)?;
+        let tensors = Shards::new(&buffers, weight_map)?;
 
         let hidden = config.hidden_size;
         let head_dim = config.head_dim();
         let kv_dim = config.num_kv_heads * head_dim;
 
-        let embed_tokens = tensor_f32(&tensors, "model.embed_tokens.weight")?;
+        let embed_tokens = tensors.f32("model.embed_tokens.weight")?;
         ensure!(embed_tokens.len() == config.vocab_size * hidden, "open-cuda-llm: model.embed_tokens.weight has {} elements, expected {}x{}", embed_tokens.len(), config.vocab_size, hidden);
 
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
             let p = format!("model.layers.{i}");
             layers.push(QwenLayer {
-                input_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
+                input_layernorm: RmsNorm { weight: tensors.f32(&format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
                 q_proj: load_linear(&tensors, &format!("{p}.self_attn.q_proj"), hidden, hidden)?,
                 k_proj: load_linear(&tensors, &format!("{p}.self_attn.k_proj"), hidden, kv_dim)?,
                 v_proj: load_linear(&tensors, &format!("{p}.self_attn.v_proj"), hidden, kv_dim)?,
                 o_proj: load_linear(&tensors, &format!("{p}.self_attn.o_proj"), hidden, hidden)?,
-                post_attention_layernorm: RmsNorm { weight: tensor_f32(&tensors, &format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
+                post_attention_layernorm: RmsNorm { weight: tensors.f32(&format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
                 gate_proj: load_linear(&tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)?,
                 up_proj: load_linear(&tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
                 down_proj: load_linear(&tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
@@ -272,12 +272,12 @@ impl QwenModel {
             });
         }
 
-        let norm = RmsNorm { weight: tensor_f32(&tensors, "model.norm.weight")?, eps: config.rms_norm_eps };
+        let norm = RmsNorm { weight: tensors.f32("model.norm.weight")?, eps: config.rms_norm_eps };
 
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            let raw = tensor_f32(&tensors, "lm_head.weight")?; // [vocab_size, hidden] 行優先(標準nn.Linear)
+            let raw = tensors.f32("lm_head.weight")?; // [vocab_size, hidden] 行優先(標準nn.Linear)
             ensure!(raw.len() == config.vocab_size * hidden, "open-cuda-llm: lm_head.weight has {} elements, expected {}x{}", raw.len(), config.vocab_size, hidden);
             let weight_t = transpose(&raw, config.vocab_size, hidden); // -> [hidden, vocab_size]
             Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
@@ -733,14 +733,64 @@ impl QwenModel {
     }
 }
 
+/// 分割(sharded)対応のテンソル参照。`weight_map`が空なら単一ファイル。
+struct Shards<'a> {
+    files: Vec<safetensors::SafeTensors<'a>>,
+    weight_map: std::collections::HashMap<String, usize>,
+}
+
+impl<'a> Shards<'a> {
+    fn new(buffers: &'a [Vec<u8>], weight_map: std::collections::HashMap<String, usize>) -> Result<Self> {
+        let files = buffers.iter().map(|b| safetensors::SafeTensors::deserialize(b).context("open-cuda-llm: failed to parse a safetensors file")).collect::<Result<Vec<_>>>()?;
+        Ok(Self { files, weight_map })
+    }
+
+    fn f32(&self, name: &str) -> Result<Vec<f32>> {
+        let idx = if self.weight_map.is_empty() { 0 } else { *self.weight_map.get(name).with_context(|| format!("open-cuda-llm: tensor '{name}' is not listed in model.safetensors.index.json"))? };
+        tensor_f32(&self.files[idx], name)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WeightIndex {
+    weight_map: std::collections::HashMap<String, String>,
+}
+
+/// 単一の`model.safetensors`、または`index.json`が指す全シャードを読む。
+/// 戻り値: (各ファイルのバイト列, テンソル名→バイト列番号。単一ファイルなら空)。
+fn read_weight_files(dir: &Path, index_path: &Path) -> Result<(Vec<Vec<u8>>, std::collections::HashMap<String, usize>)> {
+    if !index_path.exists() {
+        let p = dir.join("model.safetensors");
+        let data = std::fs::read(&p).with_context(|| format!("open-cuda-llm: failed to read {}", p.display()))?;
+        return Ok((vec![data], Default::default()));
+    }
+    let bytes = std::fs::read(index_path).with_context(|| format!("open-cuda-llm: failed to read {}", index_path.display()))?;
+    let index: WeightIndex = sonic_rs::from_slice(&bytes).context("open-cuda-llm: failed to parse model.safetensors.index.json")?;
+    ensure!(!index.weight_map.is_empty(), "open-cuda-llm: model.safetensors.index.json has an empty weight_map");
+    let mut file_ids: std::collections::BTreeMap<String, usize> = Default::default();
+    for f in index.weight_map.values() {
+        // パス区切りを含むファイル名は受け付けない(ディレクトリ外への参照を防ぐ)。
+        ensure!(!f.contains('/') && !f.contains('\\') && !f.contains(".."), "open-cuda-llm: unsafe shard file name '{f}'");
+        let n = file_ids.len();
+        file_ids.entry(f.clone()).or_insert(n);
+    }
+    let mut buffers = vec![Vec::new(); file_ids.len()];
+    for (f, id) in &file_ids {
+        let p = dir.join(f);
+        buffers[*id] = std::fs::read(&p).with_context(|| format!("open-cuda-llm: failed to read shard {}", p.display()))?;
+    }
+    let map = index.weight_map.into_iter().map(|(k, f)| (k, file_ids[&f])).collect();
+    Ok((buffers, map))
+}
+
 /// 標準的な`nn.Linear`(`[out_dim, in_dim]`行優先で保存、GPT-2の
 /// `Conv1D`とは転置関係が逆)から`Linear`を組み立てる。biasテンソルが
 /// 無ければ(Qwen2の`o_proj`/MLP系はbias無し)ゼロベクトルにする。
-fn load_linear(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
-    let raw = tensor_f32(tensors, &format!("{prefix}.weight"))?;
+fn load_linear(tensors: &Shards, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
+    let raw = tensors.f32(&format!("{prefix}.weight"))?;
     ensure!(raw.len() == out_dim * in_dim, "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}", raw.len(), out_dim, in_dim);
     let weight_t = transpose(&raw, out_dim, in_dim);
-    let bias = tensor_f32(tensors, &format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0; out_dim]);
+    let bias = tensors.f32(&format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0; out_dim]);
     Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
 }
 
@@ -953,5 +1003,33 @@ mod tests {
         let mut model4 = QwenModel::load_random(config, 4);
         model4.enable_mla_kv_compression(2, 999).unwrap();
         assert!(model4.enable_mla_kv_compression_calibrated(2, device.as_ref(), &[vec![1, 2, 3, 4]]).is_err());
+    }
+
+    /// 分割(sharded)checkpoint(index.json+2ファイル)と単一ファイルが同じテンソルを返すこと。
+    #[test]
+    fn sharded_weight_files_are_read_through_the_index() {
+        use safetensors::tensor::{Dtype, TensorView};
+        let a: Vec<u8> = [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b: Vec<u8> = [4.0f32, 5.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ser = |name: &str, bytes: &[u8], n: usize| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(name.to_string(), TensorView::new(Dtype::F32, vec![n], bytes).unwrap());
+            safetensors::serialize(&m, None).unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!("open-cuda-llm-qwen-shards-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), ser("model.a", &a, 3)).unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), ser("model.b", &b, 2)).unwrap();
+        let idx = dir.join("model.safetensors.index.json");
+        std::fs::write(&idx, r#"{"metadata":{},"weight_map":{"model.a":"model-00001-of-00002.safetensors","model.b":"model-00002-of-00002.safetensors"}}"#).unwrap();
+        let (buffers, map) = read_weight_files(&dir, &idx).unwrap();
+        let t = Shards::new(&buffers, map).unwrap();
+        assert_eq!(t.f32("model.a").unwrap(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(t.f32("model.b").unwrap(), vec![4.0, 5.0]);
+        assert!(t.f32("model.c").is_err());
+        // パス区切りを含むシャード名は拒否される。
+        std::fs::write(&idx, r#"{"weight_map":{"model.a":"../evil.safetensors"}}"#).unwrap();
+        assert!(read_weight_files(&dir, &idx).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
