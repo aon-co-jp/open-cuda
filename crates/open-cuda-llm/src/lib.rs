@@ -876,7 +876,7 @@ impl Linear {
         self.qint_weight = Some(if bits == 8 {
             QInt::I8(opencuda_blas::quantize_int8(device, &self.weight_t, group)?)
         } else {
-            QInt::I4(opencuda_blas::quantize_int4(device, &self.weight_t, group)?)
+            QInt::I4(opencuda_blas::quantize_int4(device, &self.weight_t, std::env::var("QWEN_INT4_GROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(128))?)
         });
         self.weight_t = Vec::new();
         Ok(())

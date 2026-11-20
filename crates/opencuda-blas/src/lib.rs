@@ -1706,23 +1706,33 @@ fn gemm_quant_fused<F: Fn(usize) -> f32 + Sync>(
 ) -> Vec<f32> {
     use rayon::prelude::*;
     let mut c = vec![0f32; m * n];
-    const BLOCK: usize = 256;
-    let nblocks = n.div_ceil(BLOCK);
+    let block: usize = group_size.clamp(1, 256);
+    let nblocks = n.div_ceil(block);
     let parts: Vec<Vec<f32>> = (0..nblocks)
         .into_par_iter()
         .map(|bi| {
-            let j0 = bi * BLOCK;
-            let w = BLOCK.min(n - j0);
+            let j0 = bi * block;
+            let w = block.min(n - j0);
             let mut acc = vec![0f32; m * w];
             let mut buf = vec![0f32; w];
             for i in 0..k {
                 let base = i * n + j0;
-                for jj in 0..w {
-                    let idx = base + jj;
-                    buf[jj] = dec(idx) * scales[idx / group_size];
+                // 1ブロックが同じスケールを共有するなら、整数除算と乗算を要素ごとにせず係数側へ畳み込む。
+                let g0 = base / group_size;
+                let same = (base + w - 1) / group_size == g0;
+                let sc0 = scales[g0];
+                if same {
+                    for jj in 0..w {
+                        buf[jj] = dec(base + jj);
+                    }
+                } else {
+                    for jj in 0..w {
+                        let idx = base + jj;
+                        buf[jj] = dec(idx) * scales[idx / group_size];
+                    }
                 }
                 for r in 0..m {
-                    let av = a[r * k + i];
+                    let av = a[r * k + i] * if same { sc0 } else { 1.0 };
                     if av == 0.0 {
                         continue;
                     }
@@ -1736,8 +1746,8 @@ fn gemm_quant_fused<F: Fn(usize) -> f32 + Sync>(
         })
         .collect();
     for (bi, acc) in parts.iter().enumerate() {
-        let j0 = bi * BLOCK;
-        let w = BLOCK.min(n - j0);
+        let j0 = bi * block;
+        let w = block.min(n - j0);
         for r in 0..m {
             c[r * n + j0..r * n + j0 + w].copy_from_slice(&acc[r * w..(r + 1) * w]);
         }
