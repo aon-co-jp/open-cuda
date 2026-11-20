@@ -59,3 +59,93 @@
 ## 2026-11-21 方針 / Policy: low-memory serving
 日本語: 小さなPCでは、品質を守れる範囲で重みをINT8(必要なら中間層のみINT4)にする。FP8は遅いので既定にしない。未測定の効果を成果として書かない。
 English: On small machines, keep weights at INT8 (INT4 only on middle layers if needed) while quality holds. FP8 is slow, so it is not the default. Never report unmeasured gains as results.
+
+## 2026-11-21 精度の自動選択と省メモリ(open-cuda・aruaru-llm)
+- **重みの精度**: CPUだけの32GB機では、重みをINT8で持つのが実用的です(FP8より約4倍速く、7Bが1トークン約2秒)。中間層だけINT4にもできますが、別の文では約17%悪化しました。FP8は遅いので既定にしません。
+- **自動選択**: `PrecisionTable::auto_for_memory` が、f32、全層INT8、中間層INT4の順に、空きRAMの7割に収まる最初の表を選びます。`aruaru-llm` では環境変数 `ARUARU_LLM_PRECISION`(未設定=f32、`auto`、または `int8,1:f32` のような表)で指定します。
+- **KVのINT8**: `QWEN_KV_INT8=1` は丸めの影響だけを測る試験で、迷い度は約1%の悪化でした。メモリはまだ減りません。
+- **未了**: KVを実際にINT8で保持する実装、実サーバーでの `auto` の通し確認。翻訳はAIによるもので、母語話者の確認はまだです。
+
+## 2026-11-21 Automatic precision selection and low memory (open-cuda, aruaru-llm)
+- **Weight precision**: on a CPU-only 32 GB machine, INT8 weights are the practical choice (about 4x faster than FP8; 7B runs at roughly 2 seconds per token). INT4 on the middle layers is possible but was about 17% worse on held-out text. FP8 is slow, so it is not the default.
+- **Automatic choice**: `PrecisionTable::auto_for_memory` picks the first table that fits 70% of free RAM, in the order f32, all-INT8, INT4 on middle layers. In `aruaru-llm`, set the environment variable `ARUARU_LLM_PRECISION` (unset = f32, `auto`, or a table such as `int8,1:f32`).
+- **INT8 KV cache**: `QWEN_KV_INT8=1` only simulates the rounding; perplexity got about 1% worse. Memory is not reduced yet.
+- **Open**: actually storing the KV cache as INT8, and an end-to-end run of `auto` on a real server. Translations are AI-made and not yet checked by native speakers.
+
+## 2026-11-21 精度自动选择与节省内存(open-cuda、aruaru-llm)
+- **权重精度**:在只有CPU的32GB机器上,用INT8保存权重最实用(比FP8快约4倍,7B模型每个词元约2秒)。也可以只把中间层改为INT4,但在另一段文字上质量下降约17%。FP8较慢,因此不作为默认。
+- **自动选择**:`PrecisionTable::auto_for_memory` 按"f32、全部INT8、中间层INT4"的顺序,选出第一个能放进可用内存70%的方案。在 `aruaru-llm` 中用环境变量 `ARUARU_LLM_PRECISION` 指定(未设置=f32、`auto`,或形如 `int8,1:f32` 的表)。
+- **KV缓存INT8**:`QWEN_KV_INT8=1` 只是模拟舍入的影响,困惑度约变差1%,内存尚未减少。
+- **未完成**:真正以INT8保存KV缓存,以及在真实服务器上完整测试 `auto`。翻译由AI完成,尚未经母语者确认。
+
+## 2026-11-21 精度自動選擇與節省記憶體(open-cuda、aruaru-llm)
+- **權重精度**:在只有CPU的32GB機器上,以INT8保存權重最實用(比FP8快約4倍,7B模型每個詞元約2秒)。也可以只把中間層改為INT4,但在另一段文字上品質下降約17%。FP8較慢,因此不作為預設。
+- **自動選擇**:`PrecisionTable::auto_for_memory` 依「f32、全部INT8、中間層INT4」的順序,選出第一個能放進可用記憶體70%的方案。在 `aruaru-llm` 中以環境變數 `ARUARU_LLM_PRECISION` 指定(未設定=f32、`auto`,或形如 `int8,1:f32` 的表)。
+- **KV快取INT8**:`QWEN_KV_INT8=1` 只是模擬捨入的影響,困惑度約變差1%,記憶體尚未減少。
+- **未完成**:真正以INT8保存KV快取,以及在真實伺服器上完整測試 `auto`。翻譯由AI完成,尚未經母語人士確認。
+
+## 2026-11-21 정밀도 자동 선택과 메모리 절약 (open-cuda, aruaru-llm)
+- **가중치 정밀도**: CPU만 있는 32GB 컴퓨터에서는 가중치를 INT8로 두는 것이 실용적입니다(FP8보다 약 4배 빠르고, 7B 모델이 토큰당 약 2초). 중간 층만 INT4로 바꿀 수도 있지만, 다른 문장에서는 품질이 약 17% 나빠졌습니다. FP8은 느려서 기본값으로 쓰지 않습니다.
+- **자동 선택**: `PrecisionTable::auto_for_memory`가 f32, 전 층 INT8, 중간 층 INT4 순으로, 남은 RAM의 70%에 들어가는 첫 번째 구성을 고릅니다. `aruaru-llm`에서는 환경 변수 `ARUARU_LLM_PRECISION`으로 지정합니다(미설정=f32, `auto`, 또는 `int8,1:f32` 같은 표).
+- **KV 캐시 INT8**: `QWEN_KV_INT8=1`은 반올림의 영향만 재는 시험이며, 혼란도(perplexity)는 약 1% 나빠졌습니다. 메모리는 아직 줄지 않았습니다.
+- **미완료**: KV 캐시를 실제로 INT8로 저장하는 구현, 실제 서버에서 `auto`를 끝까지 돌려 보는 시험. 번역은 AI가 했으며 원어민 확인은 아직입니다.
+
+## 21.11.2026 Automatische Genauigkeitswahl und geringer Speicherbedarf (open-cuda, aruaru-llm)
+- **Genauigkeit der Gewichte**: Auf einem Rechner mit 32 GB und nur CPU sind INT8-Gewichte die praktische Wahl (etwa viermal schneller als FP8; ein 7B-Modell braucht ungefähr 2 Sekunden pro Token). INT4 nur in den mittleren Schichten ist möglich, war bei anderem Text aber etwa 17 % schlechter. FP8 ist langsam und daher nicht der Standard.
+- **Automatische Wahl**: `PrecisionTable::auto_for_memory` nimmt in der Reihenfolge f32, alles INT8, INT4 in den mittleren Schichten die erste Tabelle, die in 70 % des freien Arbeitsspeichers passt. In `aruaru-llm` steuert man das über die Umgebungsvariable `ARUARU_LLM_PRECISION` (nicht gesetzt = f32, `auto` oder eine Tabelle wie `int8,1:f32`).
+- **INT8-KV-Cache**: `QWEN_KV_INT8=1` simuliert nur die Rundung; die Perplexität wurde etwa 1 % schlechter. Der Speicherbedarf sinkt dadurch noch nicht.
+- **Offen**: den KV-Cache tatsächlich als INT8 speichern und `auto` auf einem echten Server vollständig durchlaufen lassen. Die Übersetzungen stammen von einer KI und wurden noch nicht von Muttersprachlern geprüft.
+
+## 21/11/2026 Choix automatique de la précision et faible mémoire (open-cuda, aruaru-llm)
+- **Précision des poids** : sur une machine de 32 Go sans GPU, garder les poids en INT8 est le choix pratique (environ 4 fois plus rapide que le FP8 ; un modèle 7B produit un jeton en 2 secondes environ). On peut aussi passer seulement les couches centrales en INT4, mais la qualité a baissé d'environ 17 % sur un autre texte. Le FP8 est lent, donc il n'est pas le choix par défaut.
+- **Choix automatique** : `PrecisionTable::auto_for_memory` retient, dans l'ordre f32, tout en INT8, INT4 sur les couches centrales, la première table qui tient dans 70 % de la RAM libre. Dans `aruaru-llm`, on l'indique avec la variable d'environnement `ARUARU_LLM_PRECISION` (non définie = f32, `auto`, ou une table comme `int8,1:f32`).
+- **Cache KV en INT8** : `QWEN_KV_INT8=1` ne simule que l'effet de l'arrondi ; la perplexité s'est dégradée d'environ 1 %. La mémoire n'est pas encore réduite.
+- **À faire** : stocker réellement le cache KV en INT8, et exécuter `auto` de bout en bout sur un vrai serveur. Les traductions sont faites par une IA et n'ont pas encore été relues par des locuteurs natifs.
+
+## 21-11-2026 Elección automática de precisión y poca memoria (open-cuda, aruaru-llm)
+- **Precisión de los pesos**: en un equipo de 32 GB sin GPU, lo práctico es guardar los pesos en INT8 (unas 4 veces más rápido que FP8; un modelo 7B tarda unos 2 segundos por token). También se puede usar INT4 solo en las capas centrales, pero con otro texto la calidad empeoró cerca de un 17 %. FP8 es lento, así que no es el valor por defecto.
+- **Elección automática**: `PrecisionTable::auto_for_memory` elige, en el orden f32, todo INT8, INT4 en las capas centrales, la primera tabla que cabe en el 70 % de la RAM libre. En `aruaru-llm` se indica con la variable de entorno `ARUARU_LLM_PRECISION` (sin definir = f32, `auto`, o una tabla como `int8,1:f32`).
+- **Caché KV en INT8**: `QWEN_KV_INT8=1` solo simula el efecto del redondeo; la perplejidad empeoró cerca de un 1 %. La memoria aún no se reduce.
+- **Pendiente**: guardar de verdad la caché KV en INT8 y ejecutar `auto` de principio a fin en un servidor real. Las traducciones las hizo una IA y aún no las han revisado hablantes nativos.
+
+## 21/11/2026 Escolha automática de precisão e pouca memória (open-cuda, aruaru-llm)
+- **Precisão dos pesos**: num computador de 32 GB sem GPU, guardar os pesos em INT8 é a escolha prática (cerca de 4 vezes mais rápido que FP8; um modelo 7B leva uns 2 segundos por token). Também é possível usar INT4 só nas camadas do meio, mas com outro texto a qualidade piorou cerca de 17 %. O FP8 é lento, por isso não é o padrão.
+- **Escolha automática**: `PrecisionTable::auto_for_memory` escolhe, na ordem f32, tudo em INT8, INT4 nas camadas do meio, a primeira tabela que cabe em 70 % da RAM livre. No `aruaru-llm`, indica-se com a variável de ambiente `ARUARU_LLM_PRECISION` (não definida = f32, `auto`, ou uma tabela como `int8,1:f32`).
+- **Cache KV em INT8**: `QWEN_KV_INT8=1` apenas simula o efeito do arredondamento; a perplexidade piorou cerca de 1 %. A memória ainda não diminui.
+- **Pendente**: guardar de fato o cache KV em INT8 e executar o `auto` de ponta a ponta num servidor real. As traduções foram feitas por uma IA e ainda não foram revistas por falantes nativos.
+
+## 21/11/2026 Scelta automatica della precisione e poca memoria (open-cuda, aruaru-llm)
+- **Precisione dei pesi**: su un computer da 32 GB senza GPU, tenere i pesi in INT8 è la scelta pratica (circa 4 volte più veloce di FP8; un modello 7B impiega circa 2 secondi per token). Si può usare INT4 solo nei livelli centrali, ma su un altro testo la qualità è peggiorata di circa il 17 %. FP8 è lento, quindi non è l'impostazione predefinita.
+- **Scelta automatica**: `PrecisionTable::auto_for_memory` sceglie, nell'ordine f32, tutto INT8, INT4 nei livelli centrali, la prima tabella che sta nel 70 % della RAM libera. In `aruaru-llm` si indica con la variabile d'ambiente `ARUARU_LLM_PRECISION` (non impostata = f32, `auto`, oppure una tabella come `int8,1:f32`).
+- **Cache KV in INT8**: `QWEN_KV_INT8=1` simula soltanto l'effetto dell'arrotondamento; la perplessità è peggiorata di circa l'1 %. La memoria non è ancora ridotta.
+- **Da fare**: salvare davvero la cache KV in INT8 ed eseguire `auto` da capo a fondo su un server reale. Le traduzioni sono state fatte da un'IA e non sono ancora state verificate da madrelingua.
+
+## 21.11.2026 Автоматический выбор точности и экономия памяти (open-cuda, aruaru-llm)
+- **Точность весов**: на компьютере с 32 ГБ без видеокарты практичнее хранить веса в INT8 (примерно в 4 раза быстрее FP8; модель 7B выдаёт токен примерно за 2 секунды). Можно перевести в INT4 только средние слои, но на другом тексте качество ухудшилось примерно на 17 %. FP8 работает медленно, поэтому по умолчанию не используется.
+- **Автоматический выбор**: `PrecisionTable::auto_for_memory` берёт первую таблицу, которая помещается в 70 % свободной оперативной памяти, в порядке: f32, всё в INT8, INT4 в средних слоях. В `aruaru-llm` это задаётся переменной окружения `ARUARU_LLM_PRECISION` (не задана = f32, `auto` или таблица вроде `int8,1:f32`).
+- **KV-кэш в INT8**: `QWEN_KV_INT8=1` лишь имитирует влияние округления; перплексия ухудшилась примерно на 1 %. Памяти пока не стало меньше.
+- **Не сделано**: по-настоящему хранить KV-кэш в INT8 и пройти `auto` от начала до конца на реальном сервере. Переводы сделаны ИИ и ещё не проверены носителями языка.
+
+## 21.11.2026 Автоматичний вибір точності та економія пам'яті (open-cuda, aruaru-llm)
+- **Точність ваг**: на комп'ютері з 32 ГБ без відеокарти практичніше зберігати ваги в INT8 (приблизно у 4 рази швидше за FP8; модель 7B видає токен приблизно за 2 секунди). Можна перевести в INT4 лише середні шари, але на іншому тексті якість погіршилася приблизно на 17 %. FP8 працює повільно, тому типово не використовується.
+- **Автоматичний вибір**: `PrecisionTable::auto_for_memory` бере першу таблицю, що вміщується у 70 % вільної оперативної пам'яті, у порядку: f32, усе в INT8, INT4 у середніх шарах. В `aruaru-llm` це задається змінною середовища `ARUARU_LLM_PRECISION` (не задана = f32, `auto` або таблиця на кшталт `int8,1:f32`).
+- **KV-кеш в INT8**: `QWEN_KV_INT8=1` лише імітує вплив округлення; перплексія погіршилася приблизно на 1 %. Пам'яті поки що не побільшало.
+- **Не зроблено**: справді зберігати KV-кеш в INT8 і пройти `auto` від початку до кінця на реальному сервері. Переклади зробив ШІ, їх ще не перевіряли носії мови.
+
+## 21.11.2026 בחירה אוטומטית של דיוק וחיסכון בזיכרון (open-cuda, aruaru-llm)
+- **דיוק המשקלים**: במחשב עם 32 ג״ב וללא כרטיס מסך, הפתרון המעשי הוא לשמור את המשקלים ב-INT8 (מהיר פי 4 בערך מ-FP8; מודל 7B מפיק אסימון אחד תוך כ-2 שניות). אפשר גם להעביר ל-INT4 רק את השכבות האמצעיות, אך בטקסט אחר האיכות ירדה בכ-17%. FP8 איטי, ולכן הוא אינו ברירת המחדל.
+- **בחירה אוטומטית**: `PrecisionTable::auto_for_memory` בוחרת, לפי הסדר f32, הכול ב-INT8, INT4 בשכבות האמצעיות, את הטבלה הראשונה שנכנסת ל-70% מהזיכרון הפנוי. ב-`aruaru-llm` מגדירים זאת במשתנה הסביבה `ARUARU_LLM_PRECISION` (לא מוגדר = f32, `auto`, או טבלה כמו `int8,1:f32`).
+- **מטמון KV ב-INT8**: `QWEN_KV_INT8=1` רק מדמה את השפעת העיגול; הפרפלקסיה החמירה בכ-1%. הזיכרון עדיין לא קטן.
+- **טרם הושלם**: שמירה אמיתית של מטמון ה-KV ב-INT8, והרצה מלאה של `auto` על שרת אמיתי. התרגומים נעשו בידי בינה מלאכותית וטרם נבדקו על ידי דוברי שפת אם.
+
+## ٢١‏/١١‏/٢٠٢٦ الاختيار التلقائي للدقة وتوفير الذاكرة (open-cuda وaruaru-llm)
+- **دقة الأوزان**: على جهاز بذاكرة ٣٢ غيغابايت وبلا بطاقة رسوميات، يكون الأنسب حفظ الأوزان بصيغة INT8 (أسرع بنحو ٤ مرات من FP8، ونموذج 7B يُنتج الرمز الواحد في نحو ثانيتين). يمكن أيضاً استخدام INT4 في الطبقات الوسطى فقط، لكن الجودة تراجعت بنحو ١٧٪ على نص آخر. صيغة FP8 بطيئة، لذلك ليست الخيار الافتراضي.
+- **الاختيار التلقائي**: تختار `PrecisionTable::auto_for_memory` أول جدول يتسع في ٧٠٪ من الذاكرة الحرة، بهذا الترتيب: f32، ثم كل الطبقات INT8، ثم INT4 في الطبقات الوسطى. في `aruaru-llm` تُحدَّد عبر متغير البيئة `ARUARU_LLM_PRECISION` (غير معيَّن = f32، أو `auto`، أو جدول مثل `int8,1:f32`).
+- **ذاكرة KV بصيغة INT8**: الخيار `QWEN_KV_INT8=1` يحاكي أثر التقريب فقط؛ ازداد مقياس الحيرة (perplexity) سوءاً بنحو ١٪. ولم تنخفض الذاكرة بعد.
+- **لم يكتمل بعد**: حفظ ذاكرة KV فعلياً بصيغة INT8، وتشغيل `auto` من البداية إلى النهاية على خادم حقيقي. الترجمات أنجزها الذكاء الاصطناعي ولم يراجعها ناطقون أصليون بعد.
+
+## ۲۱‏/۱۱‏/۲۰۲۶ انتخاب خودکار دقت و صرفه‌جویی در حافظه (open-cuda و aruaru-llm)
+- **دقت وزن‌ها**: روی رایانه‌ای با ۳۲ گیگابایت حافظه و بدون کارت گرافیک، نگه‌داشتن وزن‌ها با INT8 عملی‌ترین انتخاب است (حدود ۴ برابر سریع‌تر از FP8؛ مدل 7B هر توکن را در حدود ۲ ثانیه تولید می‌کند). می‌توان فقط لایه‌های میانی را INT4 کرد، اما روی متنی دیگر کیفیت حدود ۱۷٪ بدتر شد. FP8 کند است و به همین دلیل پیش‌فرض نیست.
+- **انتخاب خودکار**: `PrecisionTable::auto_for_memory` به ترتیب f32، همه‌چیز INT8 و INT4 در لایه‌های میانی، نخستین جدولی را برمی‌گزیند که در ۷۰٪ حافظهٔ آزاد جا شود. در `aruaru-llm` آن را با متغیر محیطی `ARUARU_LLM_PRECISION` تعیین می‌کنید (تنظیم‌نشده = f32، `auto`، یا جدولی مانند `int8,1:f32`).
+- **حافظهٔ نهان KV با INT8**: گزینهٔ `QWEN_KV_INT8=1` فقط اثر گرد کردن را شبیه‌سازی می‌کند؛ سرگشتگی (perplexity) حدود ۱٪ بدتر شد. هنوز حافظه کم نشده است.
+- **انجام‌نشده**: ذخیرهٔ واقعی حافظهٔ نهان KV با INT8 و اجرای کامل `auto` روی یک سرور واقعی. ترجمه‌ها را هوش مصنوعی انجام داده و هنوز فارسی‌زبانان بومی آن‌ها را بررسی نکرده‌اند.
