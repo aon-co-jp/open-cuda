@@ -1692,6 +1692,132 @@ pub fn sgemm_fp8_weight(
     Ok(c)
 }
 
+/// 量子化重み(`k`×`n`、行優先)用の融合CPU GEMM。`dec(idx)`は平坦添字の
+/// スケール前の値、`scales[idx / group_size]`がスケール。FP8経路と同じ構造で、
+/// 行列全体をf32へ展開せず、出力列ブロックごとにrayon並列で積和する。
+fn gemm_quant_fused<F: Fn(usize) -> f32 + Sync>(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    group_size: usize,
+    scales: &[f32],
+    dec: F,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let mut c = vec![0f32; m * n];
+    const BLOCK: usize = 256;
+    let nblocks = n.div_ceil(BLOCK);
+    let parts: Vec<Vec<f32>> = (0..nblocks)
+        .into_par_iter()
+        .map(|bi| {
+            let j0 = bi * BLOCK;
+            let w = BLOCK.min(n - j0);
+            let mut acc = vec![0f32; m * w];
+            let mut buf = vec![0f32; w];
+            for i in 0..k {
+                let base = i * n + j0;
+                for jj in 0..w {
+                    let idx = base + jj;
+                    buf[jj] = dec(idx) * scales[idx / group_size];
+                }
+                for r in 0..m {
+                    let av = a[r * k + i];
+                    if av == 0.0 {
+                        continue;
+                    }
+                    let out = &mut acc[r * w..(r + 1) * w];
+                    for jj in 0..w {
+                        out[jj] += av * buf[jj];
+                    }
+                }
+            }
+            acc
+        })
+        .collect();
+    for (bi, acc) in parts.iter().enumerate() {
+        let j0 = bi * BLOCK;
+        let w = BLOCK.min(n - j0);
+        for r in 0..m {
+            c[r * n + j0..r * n + j0 + w].copy_from_slice(&acc[r * w..(r + 1) * w]);
+        }
+    }
+    c
+}
+
+/// INT8量子化済み重み`B`(`k`×`n`、行優先)での GEMM。`C = A(m×k)·dequant(B)`。
+pub fn sgemm_int8_weight(m: usize, k: usize, n: usize, a: &[f32], b: &QuantizedInt8Tensor) -> Result<Vec<f32>> {
+    if a.len() != m * k {
+        anyhow::bail!("sgemm_int8_weight: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    if b.len != k * n {
+        anyhow::bail!("sgemm_int8_weight: b.len={} != k*n={}", b.len, k * n);
+    }
+    Ok(gemm_quant_fused(m, k, n, a, b.group_size, &b.scales, |i| b.data[i] as f32))
+}
+
+/// INT4量子化済み重み`B`(`k`×`n`、行優先、ニブルパック)での GEMM。
+pub fn sgemm_int4_weight(m: usize, k: usize, n: usize, a: &[f32], b: &QuantizedInt4Tensor) -> Result<Vec<f32>> {
+    if a.len() != m * k {
+        anyhow::bail!("sgemm_int4_weight: a.len()={} != m*k={}", a.len(), m * k);
+    }
+    if b.len != k * n {
+        anyhow::bail!("sgemm_int4_weight: b.len={} != k*n={}", b.len, k * n);
+    }
+    Ok(gemm_quant_fused(m, k, n, a, b.group_size, &b.scales, |i| {
+        let byte = b.data[i >> 1];
+        let nib = if i & 1 == 0 { byte & 0x0f } else { byte >> 4 };
+        nib as f32 - 8.0
+    }))
+}
+
+#[cfg(test)]
+mod quant_gemm_tests {
+    use super::*;
+    use opencuda_cpu::CpuDevice;
+
+    /// INT8/INT4の融合GEMMが「展開してからf32積和」と一致し、F64参照との誤差が
+    /// INT8 < INT4 の順に小さいこと(F64Refオラクルの最小版)。
+    #[test]
+    fn int8_int4_fused_gemm_match_dequant_and_f64_reference() {
+        let dev = CpuDevice::new(0);
+        let (m, k, n, g) = (3usize, 64usize, 40usize, 32usize);
+        let mut s = 12345u64;
+        let mut rnd = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let a: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        let w: Vec<f32> = (0..k * n).map(|_| rnd()).collect();
+        let mut refc = vec![0f64; m * n];
+        for r in 0..m {
+            for i in 0..k {
+                for j in 0..n {
+                    refc[r * n + j] += a[r * k + i] as f64 * w[i * n + j] as f64;
+                }
+            }
+        }
+        let norm = refc.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let err = |c: &[f32]| (c.iter().zip(&refc).map(|(x, y)| (*x as f64 - y).powi(2)).sum::<f64>().sqrt()) / norm;
+        let q8 = quantize_int8(dev.as_ref(), &w, g).unwrap();
+        let q4 = quantize_int4(dev.as_ref(), &w, g).unwrap();
+        let c8 = sgemm_int8_weight(m, k, n, &a, &q8).unwrap();
+        let c4 = sgemm_int4_weight(m, k, n, &a, &q4).unwrap();
+        // 展開してからの積和と一致
+        for (c, dq) in [(&c8, dequantize_int8(&q8)), (&c4, dequantize_int4(&q4))] {
+            for r in 0..m {
+                for j in 0..n {
+                    let e: f32 = (0..k).map(|i| a[r * k + i] * dq[i * n + j]).sum();
+                    assert!((c[r * n + j] - e).abs() < 1e-3);
+                }
+            }
+        }
+        let (e8, e4) = (err(&c8), err(&c4));
+        eprintln!("rel err vs f64: int8={e8:.5} int4={e4:.5}");
+        assert!(e8 < 0.02 && e4 < 0.2 && e8 < e4);
+    }
+}
+
 /// AWQ（Activation-aware Weight Quantization、[Lin et al.](https://arxiv.org/abs/2306.00978)）
 /// 風のINT4量子化。既存の`quantize_int4`は全チャネルを均等に量子化するため、
 /// 重み自体は小さくても対応する活性化の振幅が大きい「重要チャネル」ほど、
