@@ -458,7 +458,7 @@ impl QwenModel {
                 apply_rope(&mut k_h, &cos, &sin);
                 let v_h = &v[kvh * head_dim..(kvh + 1) * head_dim];
                 let proj = layer.mla.as_ref().map(|v| &v[kvh]);
-                cache.kv[kvh].push(device, &k_h, v_h, proj, None)?;
+                cache.kv[kvh].push(device, &kv_sim(&k_h), &kv_sim(v_h), proj, None)?;
                 k_heads_rot.push(k_h);
             }
 
@@ -570,7 +570,7 @@ impl QwenModel {
                 for kvh in 0..cfg.num_kv_heads {
                     let mut k_h = k[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim].to_vec();
                     apply_rope(&mut k_h, cos, sin);
-                    cache.kv[kvh].push(device, &k_h, &v[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim], None, None)?;
+                    cache.kv[kvh].push(device, &kv_sim(&k_h), &kv_sim(&v[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim]), None, None)?;
                 }
             }
             // 因果的アテンション: 位置 i のクエリは、キャッシュ先頭から pos0+i までを見る。
@@ -1114,4 +1114,20 @@ mod tests {
         assert!(read_weight_files(&dir, &idx).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// KVキャッシュのINT8量子化の**品質シミュレーション**(2026-11-20)。`QWEN_KV_INT8=1`のとき、
+/// 1ヘッド1トークンのK/Vを絶対値最大でスケールしたINT8へ丸めて戻す(メモリは減らさない。
+/// 実際にINT8で保持する実装の前に、品質への影響だけを測るため)。
+fn kv_sim(x: &[f32]) -> Vec<f32> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("QWEN_KV_INT8").is_ok()) {
+        return x.to_vec();
+    }
+    let m = x.iter().fold(0f32, |a, &v| a.max(v.abs()));
+    if m == 0.0 {
+        return x.to_vec();
+    }
+    let s = m / 127.0;
+    x.iter().map(|&v| (v / s).round().clamp(-127.0, 127.0) * s).collect()
 }
