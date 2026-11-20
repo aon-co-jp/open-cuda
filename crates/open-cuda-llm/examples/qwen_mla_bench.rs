@@ -37,7 +37,7 @@ fn main() -> Result<()> {
     // 悪化の小さい順にK層をINT4、残りをINT8とする精度表を作って、評価文/別の文のpplを出す。
     if let Ok(k) = std::env::var("QWEN_AUTOTABLE") {
         use open_cuda_llm::{Precision, PrecisionTable};
-        let k: usize = k.parse()?;
+        let ks: Vec<usize> = k.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         let ids = tok.encode(EVAL)?;
         let ppl_of = |m: &QwenModel, ids: &[u32]| -> Result<f32> {
             let lp = m.token_logprobs(&device, ids)?;
@@ -69,14 +69,16 @@ fn main() -> Result<()> {
             sens.push((i, p));
         }
         sens.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let chosen: Vec<usize> = sens.iter().take(k).map(|x| x.0).collect();
-        let mut t = base.clone();
-        for &i in &chosen {
-            t.overrides.push((i, Precision::Int4));
+        for k in ks {
+            let chosen: Vec<usize> = sens.iter().take(k).map(|x| x.0).collect();
+            let mut t = base.clone();
+            for &i in &chosen {
+                t.overrides.push((i, Precision::Int4));
+            }
+            let m = QwenModel::load_precision(&dir, device.as_ref(), &t)?;
+            let spec: Vec<String> = chosen.iter().map(|i| format!("{i}:int4")).collect();
+            println!("AUTO K={k} table=int8,{} ppl={:.3} held={:.3}", spec.join(","), ppl_of(&m, &ids)?, held_ppl(&m)?);
         }
-        let m = QwenModel::load_precision(&dir, device.as_ref(), &t)?;
-        let spec: Vec<String> = chosen.iter().map(|i| format!("{i}:int4")).collect();
-        println!("AUTO table=int8,{} ppl={:.3} held={:.3}", spec.join(","), ppl_of(&m, &ids)?, held_ppl(&m)?);
         return Ok(());
     }
     let mut model = if let Ok(spec) = std::env::var("QWEN_PRECISION") { QwenModel::load_precision(&dir, device.as_ref(), &open_cuda_llm::PrecisionTable::parse(&spec)?)? } else if fp8 { QwenModel::load_fp8(&dir, device.as_ref(), opencuda_blas::Fp8Format::E4M3)? } else { QwenModel::load(&dir)? };
