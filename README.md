@@ -771,3 +771,33 @@ Apache-2.0
 - **Final result for layer skipping ("folding")**: Choosing layers to skip from a single sentence got worse on other sentences (skipping layers 5, 12 and 15 was about 15% worse on other sentences, and skipping five was worse still). The speed gain is at most about 14%. **Without retraining, the practical gain is small.** On this small problem, greedy search and annealing made little difference.
 - **About `pl2pl llm setup`**: Sharded-model support is now on `main` in `aruaru-llm`. The released build that `pl2pl` uses (v0.2.5) does not have it yet, so until a new release, 3B still falls back to a smaller model as before. After the new release, 3B and 7B can be chosen.
 - **Next (we go on without asking)**: make FP8 faster (SIMD and more), publish a new release, and check the survey document requested from the cloud.
+
+## 2026-11-20 現状と完成予定: 重みの精度(f32 / FP8 / INT8 / INT4) / Status and plan: weight precision
+
+### 日本語
+**現状(実装済み・main)**
+- `Precision`(F32 / Fp8 / Int8 / Int4)と層ごとの精度表 `PrecisionTable`。環境変数 `QWEN_PRECISION="int8,1:f32,24:fp8"`(最初の無印が既定、`層:精度`が上書き)。`QwenModel::load_precision` で読む。`QWEN_KEEP_F32` も従来どおり。
+- `opencuda-blas` に INT8/INT4 重みの融合CPU行列積(`sgemm_int8_weight` / `sgemm_int4_weight`)。行列全体を展開せず列ブロックごとに並列で積和し、同じスケールを共有するブロックでは係数へ畳み込む。f64参照との相対誤差の試験つき(INT8 0.3%、INT4 6.4%)。
+- 実測(Qwen2.5-1.5B、CPUのみ、評価文の迷い度 / 別の文 / 生成秒): f32 7.08 / – / 25、FP8 7.27 / 12.17 / 29.8、**INT8 7.37 / 12.94 / 27.2**、**INT4(128要素グループ)10.55 / 15.37 / 29.0**。INT4を1行1グループにすると迷い度26.4に悪化(グループが粗すぎ)。INT8の最初の版は81秒だったが、除算の除去で27秒になった。
+- 正直な注意: 3Bと7BのINT8/INT4は未測定。INT4は品質が落ちる(約+3.5)ので、メモリが足りない時の手段。速さはf32と同程度で、速くはならない(メモリは重みが約1/4〜1/8)。
+
+**完成予定(この順)**
+1. 層ごとの感度に基づいて精度表を自動で決める(感度の高い層だけf32/FP8、他はINT4)。
+2. KVキャッシュの量子化。
+3. 小さい行列のSIMD化によるFP8/INT8/INT4の高速化。
+4. 起動時にRAMを調べ、モデルと精度表を自動選択(`aruaru-llm` の `ModelsCompatible` を拡張)。
+5. `F64Ref`オラクルを試験に追加(FP64以上は試験専用、本番では使わない)。
+
+### English
+**Status (implemented, on main)**
+- `Precision` (F32 / Fp8 / Int8 / Int4) and a per-layer `PrecisionTable`. Set `QWEN_PRECISION="int8,1:f32,24:fp8"` (the bare item is the default, `layer:precision` overrides). Load with `QwenModel::load_precision`. `QWEN_KEEP_F32` still works.
+- `opencuda-blas` has fused CPU GEMMs for INT8/INT4 weights (`sgemm_int8_weight` / `sgemm_int4_weight`). They never expand the whole matrix; they accumulate per column block in parallel and fold the scale into the coefficient when a block shares one scale. Tested against an f64 reference (relative error INT8 0.3%, INT4 6.4%).
+- Measured (Qwen2.5-1.5B, CPU only; perplexity on the eval sentence / on other text / generation seconds): f32 7.08 / – / 25, FP8 7.27 / 12.17 / 29.8, **INT8 7.37 / 12.94 / 27.2**, **INT4 (128-element groups) 10.55 / 15.37 / 29.0**. With one group per row INT4 got much worse (ppl 26.4; groups too coarse). The first INT8 version took 81 s; removing a per-element integer division brought it to 27 s.
+- Honest notes: INT8/INT4 on 3B and 7B are not measured yet. INT4 costs quality (about +3.5 ppl), so it is for when memory is short. Speed is about the same as f32, not faster; memory for weights drops to about 1/4 (INT8) or 1/8 (INT4).
+
+**Planned (in this order)**
+1. Choose the precision table automatically from per-layer sensitivity (only sensitive layers stay f32/FP8, the rest INT4).
+2. KV-cache quantization.
+3. SIMD for small matrices to speed up FP8/INT8/INT4.
+4. Detect RAM at startup and pick the model and table automatically (extend `ModelsCompatible` in `aruaru-llm`).
+5. Add an `F64Ref` oracle to the tests (FP64 and wider are test-only, never used in production).
