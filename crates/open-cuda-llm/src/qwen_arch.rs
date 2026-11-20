@@ -269,18 +269,22 @@ impl QwenModel {
         ensure!(embed_tokens.len() == config.vocab_size * hidden, "open-cuda-llm: model.embed_tokens.weight has {} elements, expected {}x{}", embed_tokens.len(), config.vocab_size, hidden);
 
         let mut layers = Vec::with_capacity(config.num_layers);
+        // 混合精度: 環境変数 QWEN_KEEP_F32="1,24,26" の層はFP8にせずf32のまま持つ(感度が高い層の保護)。
+        let keep_f32: Vec<usize> = std::env::var("QWEN_KEEP_F32").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
         for i in 0..config.num_layers {
             let p = format!("model.layers.{i}");
+            let none: Option<(&dyn GpuDevice, opencuda_blas::Fp8Format)> = None;
+            let lfp8 = if keep_f32.contains(&i) { &none } else { &fp8 };
             layers.push(QwenLayer {
                 input_layernorm: RmsNorm { weight: tensors.f32(&format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
-                q_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.q_proj"), hidden, hidden)?,
-                k_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.k_proj"), hidden, kv_dim)?,
-                v_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.v_proj"), hidden, kv_dim)?,
-                o_proj: load_linear_q(&fp8, &tensors, &format!("{p}.self_attn.o_proj"), hidden, hidden)?,
+                q_proj: load_linear_q(lfp8, &tensors, &format!("{p}.self_attn.q_proj"), hidden, hidden)?,
+                k_proj: load_linear_q(lfp8, &tensors, &format!("{p}.self_attn.k_proj"), hidden, kv_dim)?,
+                v_proj: load_linear_q(lfp8, &tensors, &format!("{p}.self_attn.v_proj"), hidden, kv_dim)?,
+                o_proj: load_linear_q(lfp8, &tensors, &format!("{p}.self_attn.o_proj"), hidden, hidden)?,
                 post_attention_layernorm: RmsNorm { weight: tensors.f32(&format!("{p}.post_attention_layernorm.weight"))?, eps: config.rms_norm_eps },
-                gate_proj: load_linear_q(&fp8, &tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)?,
-                up_proj: load_linear_q(&fp8, &tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
-                down_proj: load_linear_q(&fp8, &tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
+                gate_proj: load_linear_q(lfp8, &tensors, &format!("{p}.mlp.gate_proj"), hidden, config.intermediate_size)?,
+                up_proj: load_linear_q(lfp8, &tensors, &format!("{p}.mlp.up_proj"), hidden, config.intermediate_size)?,
+                down_proj: load_linear_q(lfp8, &tensors, &format!("{p}.mlp.down_proj"), config.intermediate_size, hidden)?,
                 mla: None,
             });
         }
