@@ -843,3 +843,10 @@ English: On Qwen2.5-1.5B, starting from all-INT8, we set one layer at a time to 
 ## 2026-11-20 追記: INT4にする層数の測定 / How many layers can be INT4 (Qwen2.5-1.5B)
 日本語: 感度の低い順にK層をINT4、残りをINT8にした(評価文ppl / 別の文ppl): K=0 7.37/12.94、5 7.14/13.07、10 7.35/13.04、15 7.62/13.73、20 8.57/18.44、26 10.16/19.28、全28層 10.55/15.41。**10層までは品質ほぼ不変、15層から別の文で悪化、20層以上は明確に悪化。** 1文だけの評価なので目安。
 English: K least-sensitive layers as INT4, rest INT8 (eval/held-out ppl): K=0 7.37/12.94, 5 7.14/13.07, 10 7.35/13.04, 15 7.62/13.73, 20 8.57/18.44, 26 10.16/19.28, all 28 10.55/15.41. Quality holds up to ~10 INT4 layers, degrades from 15, clearly worse at 20+. Single-sentence selection; indicative only.
+
+## 2026-11-20 追記: 7Bの INT8 / 混合INT4 の実測 / Qwen2.5-7B INT8 and mixed INT4 measured
+日本語: 32GB・GPUなしのCPUで実測(24トークン生成)。INT8: 読込245秒、ppl 8.88 / 別の文 13.33、生成47秒(約2秒/語)。混合INT4(0〜2・27番だけINT8、残りINT4): 読込224秒、ppl 8.37 / 別の文 15.62、生成56秒。**FP8(約8秒/語)より約4倍速い**。INT4は別の文で約17%悪化するので、品質優先ならINT8。1つの短い文での目安。
+English: Measured on a CPU-only 32 GB PC (24 tokens generated). INT8: load 245 s, ppl 8.88 / held-out 13.33, generation 47 s (~2 s/token). Mixed INT4 (layers 0-2 and 27 INT8, rest INT4): load 224 s, ppl 8.37 / held-out 15.62, generation 56 s. About 4x faster than FP8 (~8 s/token). INT4 is ~17% worse on held-out text, so prefer INT8 for quality. Indicative (short sentences).
+العربية: قِيس على وحدة معالجة مركزية فقط وذاكرة 32 غيغابايت. INT8: التحميل 245 ثانية، الحيرة 8.88 (13.33 على جمل أخرى)، والتوليد 47 ثانية (نحو ثانيتين للكلمة)، أي أسرع بنحو 4 مرات من FP8. INT4 المختلط أسوأ بنحو 17% على جمل أخرى، لذا يُفضَّل INT8 للجودة.
+فارسی: روی پردازنده بدون GPU و با ۳۲ گیگابایت حافظه اندازه‌گیری شد. INT8: بارگذاری ۲۴۵ ثانیه، سردرگمی ۸٫۸۸ (روی جمله‌های دیگر ۱۳٫۳۳)، تولید ۴۷ ثانیه (حدود ۲ ثانیه برای هر کلمه)، یعنی حدود ۴ برابر سریع‌تر از FP8. INT4 ترکیبی روی جمله‌های دیگر حدود ۱۷٪ بدتر است، پس برای کیفیت INT8 بهتر است.
+Deutsch/Français/Español/Português/Русский/简体中文/繁體中文/한국어: 7B INT8 245 s load, ppl 8.88 (13.33), ~2 s/token, ~4x faster than FP8; mixed INT4 ppl 8.37 (15.62). (AI翻訳の本文は毎朝のルーチンで確認 / full translations are refined by the daily routine.)
