@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let fp8 = std::env::var("QWEN_FP8").is_ok();
     let device: Arc<dyn GpuDevice> = CpuDevice::new(0);
-    let mut model = if fp8 { QwenModel::load_fp8(&dir, device.as_ref(), opencuda_blas::Fp8Format::E4M3)? } else { QwenModel::load(&dir)? };
+    let mut model = if let Ok(spec) = std::env::var("QWEN_PRECISION") { QwenModel::load_precision(&dir, device.as_ref(), &open_cuda_llm::PrecisionTable::parse(&spec)?)? } else if fp8 { QwenModel::load_fp8(&dir, device.as_ref(), opencuda_blas::Fp8Format::E4M3)? } else { QwenModel::load(&dir)? };
     let load_s = t0.elapsed().as_secs_f32();
     let mut calib_s = 0.0;
     if d_c > 0 {

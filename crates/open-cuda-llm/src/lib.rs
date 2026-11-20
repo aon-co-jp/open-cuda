@@ -46,6 +46,7 @@ use serde::Deserialize;
 /// 既存の`GptModel`(GPT-2系)経路とは独立・並行。
 mod qwen_arch;
 pub use qwen_arch::{QwenConfig, QwenModel};
+// Precision / PrecisionTable は下で定義(同一クレート直下)。
 
 /// DeepSeek-V2/V3系Multi-head Latent Attention(MLA)アーキテクチャの
 /// 新しいforward pass経路(2026-09-13新設、`deepseek_arch.rs`のモジュール
@@ -326,7 +327,7 @@ fn load_conv1d(tensors: &safetensors::SafeTensors, prefix: &str, in_dim: usize, 
         out_dim
     );
     let bias = tensor_f32(tensors, &format!("{prefix}.bias"))?;
-    Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+    Ok(Linear { weight_t: weight, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None })
 }
 
 /// ビットパック済み整数テンソル(GPTQ の `qweight`/`qzeros`、I32/U32)を
@@ -432,7 +433,7 @@ fn load_conv1d_gptq(
         "open-cuda-llm: '{prefix}.bias' has {} elements, expected {out_dim}",
         bias.len()
     );
-    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None })
 }
 
 /// AWQ(Activation-aware Weight Quantization、AutoAWQ / vLLM 形式)の
@@ -508,7 +509,7 @@ fn load_conv1d_awq(
         "open-cuda-llm: '{prefix}.bias' has {} elements, expected {out_dim}",
         bias.len()
     );
-    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None })
 }
 
 /// AWQ の interleave 並び(4bit、pack=8)。`load_conv1d_awq` と共有。
@@ -675,6 +676,68 @@ struct Linear {
     /// ソフトウェア実装。利益は重みメモリ(1要素1バイト、f32 の 1/4)で
     /// あり演算速度ではない(`opencuda-blas` の同名関数の doc 参照)。
     fp8_weight: Option<opencuda_blas::QuantizedFp8Tensor>,
+    /// INT8/INT4量子化重み(2026-11-20)。`forward`で融合CPU GEMMを通す。
+    qint_weight: Option<QInt>,
+}
+
+/// 整数量子化した重み(`Precision::Int8` / `Precision::Int4`)。
+#[derive(Debug, Clone)]
+pub(crate) enum QInt {
+    I8(opencuda_blas::QuantizedInt8Tensor),
+    I4(opencuda_blas::QuantizedInt4Tensor),
+}
+
+/// 線形層の重みの精度(層ごとの精度表の要素、2026-11-20)。
+/// 環境変数 `QWEN_PRECISION="int8,1:f32,24:fp8"` のように指定する
+/// (最初の無印が既定、`層番号:精度`が層ごとの上書き)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precision {
+    F32,
+    Fp8,
+    Int8,
+    Int4,
+}
+
+impl Precision {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "f32" | "fp32" => Some(Self::F32),
+            "fp8" | "f8" => Some(Self::Fp8),
+            "int8" | "i8" => Some(Self::Int8),
+            "int4" | "i4" => Some(Self::Int4),
+            _ => None,
+        }
+    }
+}
+
+/// 層ごとの精度表。既定の精度+層番号ごとの上書き。
+#[derive(Debug, Clone)]
+pub struct PrecisionTable {
+    pub default: Precision,
+    pub overrides: Vec<(usize, Precision)>,
+}
+
+impl PrecisionTable {
+    pub fn uniform(p: Precision) -> Self {
+        Self { default: p, overrides: Vec::new() }
+    }
+    /// `"int8,1:f32,24:fp8"` を解釈する。解釈できない要素は無視せずエラー。
+    pub fn parse(s: &str) -> Result<Self> {
+        let mut t = Self::uniform(Precision::F32);
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            if let Some((l, p)) = part.split_once(':') {
+                let layer: usize = l.trim().parse().map_err(|_| anyhow::anyhow!("bad layer index '{l}'"))?;
+                let prec = Precision::parse(p).ok_or_else(|| anyhow::anyhow!("bad precision '{p}'"))?;
+                t.overrides.push((layer, prec));
+            } else {
+                t.default = Precision::parse(part).ok_or_else(|| anyhow::anyhow!("bad precision '{part}'"))?;
+            }
+        }
+        Ok(t)
+    }
+    pub fn for_layer(&self, i: usize) -> Precision {
+        self.overrides.iter().rev().find(|(l, _)| *l == i).map(|(_, p)| *p).unwrap_or(self.default)
+    }
 }
 
 /// [`GptModel::set_matmul_dxil_offload`]で配線される、密GEMM専用の
@@ -721,7 +784,7 @@ impl std::fmt::Debug for DxilMatmulOffload {
 impl Linear {
     fn random(rng: &mut SplitMix64, in_dim: usize, out_dim: usize) -> Self {
         let scale = 1.0 / (in_dim as f32).sqrt();
-        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None }
+        Self { weight_t: random_vec(rng, in_dim * out_dim, scale), bias: vec![0.0; out_dim], in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None }
     }
 
     /// **2026-09-01新設**: 明示的な重み・バイアスから構築する
@@ -730,7 +793,7 @@ impl Linear {
     fn from_weights(weight_t: Vec<f32>, bias: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
         debug_assert_eq!(weight_t.len(), in_dim * out_dim);
         debug_assert_eq!(bias.len(), out_dim);
-        Self { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None }
+        Self { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None }
     }
 
     /// **2026-09-01新設**: 全出力を常にゼロにする`Linear`(=このLinearの
@@ -779,6 +842,19 @@ impl Linear {
             }
             return Ok(out);
         }
+        if let Some(q) = &self.qint_weight {
+            let result = match q {
+                QInt::I8(t) => opencuda_blas::sgemm_int8_weight(seq_len, self.in_dim, self.out_dim, x, t)?,
+                QInt::I4(t) => opencuda_blas::sgemm_int4_weight(seq_len, self.in_dim, self.out_dim, x, t)?,
+            };
+            out.copy_from_slice(&result);
+            for row in 0..seq_len {
+                for c in 0..self.out_dim {
+                    out[row * self.out_dim + c] += self.bias[c];
+                }
+            }
+            return Ok(out);
+        }
         let spirv = self.spirv_matmul.as_deref().map(|v| v.as_slice());
         opencuda_blas::sgemm(device, seq_len, self.in_dim, self.out_dim, 1.0, x, &self.weight_t, 0.0, &mut out, spirv)?;
         for row in 0..seq_len {
@@ -793,6 +869,19 @@ impl Linear {
     /// `weight_t`(f32)はそのまま残す(DXIL/常駐経路が必要とする場合や、
     /// 量子化前後の比較検証のため)——真のメモリ削減が必要なら呼び出し側で
     /// クリアする。
+    /// 重みをINT8/INT4へ量子化して`qint_weight`へ格納し、f32を解放する。
+    /// グループは入力チャネル1行(out_dim要素)。
+    fn quantize_to_int(&mut self, device: &dyn GpuDevice, bits: u8) -> Result<()> {
+        let group = self.out_dim.max(1);
+        self.qint_weight = Some(if bits == 8 {
+            QInt::I8(opencuda_blas::quantize_int8(device, &self.weight_t, group)?)
+        } else {
+            QInt::I4(opencuda_blas::quantize_int4(device, &self.weight_t, group)?)
+        });
+        self.weight_t = Vec::new();
+        Ok(())
+    }
+
     fn quantize_to_fp8(&mut self, device: &dyn GpuDevice, format: opencuda_blas::Fp8Format) -> Result<()> {
         // 転置レイアウト(in_dim×out_dim, 行優先)の各行(= 出力チャネル方向で
         // なく入力チャネル 1 本ぶん)をグループにする。out_dim を group_size に
@@ -1589,6 +1678,7 @@ impl GptModel {
             spirv_matmul: None,
             dxil_offload: None,
             fp8_weight: None,
+            qint_weight: None,
         };
 
         Ok(Self { config, word_embeddings, position_embeddings, layers, final_ln, lm_head, softmax_spirv: None, flash_attn_spirv: None, dxil_resident_weights: None })

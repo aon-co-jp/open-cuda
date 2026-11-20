@@ -833,7 +833,7 @@ impl DeepseekModel {
             let raw = weights.tensor_f32("lm_head.weight")?;
             ensure!(raw.len() == config.vocab_size * hidden, "open-cuda-llm: lm_head.weight has {} elements, expected {}x{}", raw.len(), config.vocab_size, hidden);
             let weight_t = transpose(&raw, config.vocab_size, hidden);
-            Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+            Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None })
         };
 
         Ok(Self { config, embed_tokens, layers, norm, lm_head, weights: Some(weights) })
@@ -1217,7 +1217,7 @@ fn load_linear(weights: &ModelWeights, prefix: &str, in_dim: usize, out_dim: usi
     ensure!(raw.len() == out_dim * in_dim, "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}", raw.len(), out_dim, in_dim);
     let weight_t = transpose(&raw, out_dim, in_dim);
     let bias = weights.tensor_f32(&format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0; out_dim]);
-    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None })
 }
 
 #[cfg(test)]

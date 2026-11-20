@@ -35,7 +35,7 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use opencuda_core::GpuDevice;
 
-use super::{argmax, apply_repetition_penalty, pca_top_directions, random_vec, tensor_f32, transpose, KvCacheHead, Linear, MlaHeadProjection, SplitMix64};
+use super::{Precision, PrecisionTable, argmax, apply_repetition_penalty, pca_top_directions, random_vec, tensor_f32, transpose, KvCacheHead, Linear, MlaHeadProjection, SplitMix64};
 
 /// Qwen2/Qwen2.5 dense アーキテクチャの設定。`config.json` の該当
 /// フィールドにそのまま対応する。
@@ -236,17 +236,31 @@ impl QwenModel {
     /// (`model-00001-of-00002.safetensors`等)のsharded checkpointには
     /// 未対応(`GptModel::load`と同じ制約——単一ファイルのモデルのみ)。
     pub fn load(dir: &Path) -> Result<Self> {
-        Self::load_with(dir, None)
+        Self::load_with(dir, None, &PrecisionTable::uniform(Precision::F32))
+    }
+
+    /// 層ごとの精度表(f32/FP8/INT8/INT4)で読み込む(2026-11-20)。
+    /// 各線形層は読むたびに量子化し、f32の元重みをすぐ捨てる。
+    pub fn load_precision(dir: &Path, device: &dyn GpuDevice, table: &PrecisionTable) -> Result<Self> {
+        Self::load_with(dir, Some(device), table)
     }
 
     /// [`load`](Self::load)の変種。`fp8`を渡すと、各線形層の重みを読むたびにFP8へ量子化し、
     /// f32の元重みをすぐ捨てる(常駐メモリは約1/4、7B級を32GB機へ載せるための経路、2026-11-19)。
     /// 埋め込み・正規化・biasはf32のまま。
     pub fn load_fp8(dir: &Path, device: &dyn GpuDevice, format: opencuda_blas::Fp8Format) -> Result<Self> {
-        Self::load_with(dir, Some((device, format)))
+        let _ = format; // 現状FP8はE4M3のみ(精度表のFp8)
+        // 互換: QWEN_KEEP_F32="1,24" の層はf32のまま。
+        let mut table = PrecisionTable::uniform(Precision::Fp8);
+        if let Ok(v) = std::env::var("QWEN_KEEP_F32") {
+            for l in v.split(',').filter_map(|x| x.trim().parse::<usize>().ok()) {
+                table.overrides.push((l, Precision::F32));
+            }
+        }
+        Self::load_with(dir, Some(device), &table)
     }
 
-    fn load_with(dir: &Path, fp8: Option<(&dyn GpuDevice, opencuda_blas::Fp8Format)>) -> Result<Self> {
+    fn load_with(dir: &Path, device: Option<&dyn GpuDevice>, table: &PrecisionTable) -> Result<Self> {
         let config_bytes = std::fs::read(dir.join("config.json")).with_context(|| format!("open-cuda-llm: failed to read {}/config.json", dir.display()))?;
         let config: QwenConfig = sonic_rs::from_slice(&config_bytes).context("open-cuda-llm: failed to parse Qwen config.json")?;
         ensure!(
@@ -269,12 +283,9 @@ impl QwenModel {
         ensure!(embed_tokens.len() == config.vocab_size * hidden, "open-cuda-llm: model.embed_tokens.weight has {} elements, expected {}x{}", embed_tokens.len(), config.vocab_size, hidden);
 
         let mut layers = Vec::with_capacity(config.num_layers);
-        // 混合精度: 環境変数 QWEN_KEEP_F32="1,24,26" の層はFP8にせずf32のまま持つ(感度が高い層の保護)。
-        let keep_f32: Vec<usize> = std::env::var("QWEN_KEEP_F32").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
         for i in 0..config.num_layers {
             let p = format!("model.layers.{i}");
-            let none: Option<(&dyn GpuDevice, opencuda_blas::Fp8Format)> = None;
-            let lfp8 = if keep_f32.contains(&i) { &none } else { &fp8 };
+            let lfp8 = &(device, table.for_layer(i));
             layers.push(QwenLayer {
                 input_layernorm: RmsNorm { weight: tensors.f32(&format!("{p}.input_layernorm.weight"))?, eps: config.rms_norm_eps },
                 q_proj: load_linear_q(lfp8, &tensors, &format!("{p}.self_attn.q_proj"), hidden, hidden)?,
@@ -297,7 +308,7 @@ impl QwenModel {
             let raw = tensors.f32("lm_head.weight")?; // [vocab_size, hidden] 行優先(標準nn.Linear)
             ensure!(raw.len() == config.vocab_size * hidden, "open-cuda-llm: lm_head.weight has {} elements, expected {}x{}", raw.len(), config.vocab_size, hidden);
             let weight_t = transpose(&raw, config.vocab_size, hidden); // -> [hidden, vocab_size]
-            Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+            Some(Linear { weight_t, bias: vec![0.0; config.vocab_size], in_dim: hidden, out_dim: config.vocab_size, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None })
         };
 
         Ok(Self { config, embed_tokens, layers, norm, lm_head, skip: Vec::new() })
@@ -838,11 +849,21 @@ fn read_weight_files(dir: &Path, index_path: &Path) -> Result<(Vec<memmap2::Mmap
 /// 標準的な`nn.Linear`(`[out_dim, in_dim]`行優先で保存、GPT-2の
 /// `Conv1D`とは転置関係が逆)から`Linear`を組み立てる。biasテンソルが
 /// 無ければ(Qwen2の`o_proj`/MLP系はbias無し)ゼロベクトルにする。
-fn load_linear_q(fp8: &Option<(&dyn GpuDevice, opencuda_blas::Fp8Format)>, tensors: &Shards, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
+fn load_linear_q(spec: &(Option<&dyn GpuDevice>, Precision), tensors: &Shards, prefix: &str, in_dim: usize, out_dim: usize) -> Result<Linear> {
     let mut l = load_linear(tensors, prefix, in_dim, out_dim)?;
-    if let Some((device, format)) = fp8 {
-        l.quantize_to_fp8(*device, *format)?;
-        l.weight_t = Vec::new(); // f32を解放(forwardはfp8_weightを優先して使う)
+    let (device, prec) = spec;
+    if *prec == Precision::F32 {
+        return Ok(l);
+    }
+    let device = device.ok_or_else(|| anyhow::anyhow!("open-cuda-llm: quantized precision needs a device"))?;
+    match prec {
+        Precision::Fp8 => {
+            l.quantize_to_fp8(device, opencuda_blas::Fp8Format::E4M3)?;
+            l.weight_t = Vec::new(); // f32を解放(forwardはfp8_weightを優先して使う)
+        }
+        Precision::Int8 => l.quantize_to_int(device, 8)?,
+        Precision::Int4 => l.quantize_to_int(device, 4)?,
+        Precision::F32 => {}
     }
     Ok(l)
 }
@@ -852,7 +873,7 @@ fn load_linear(tensors: &Shards, prefix: &str, in_dim: usize, out_dim: usize) ->
     ensure!(raw.len() == out_dim * in_dim, "open-cuda-llm: '{prefix}.weight' has {} elements, expected {}x{}", raw.len(), out_dim, in_dim);
     let weight_t = transpose(&raw, out_dim, in_dim);
     let bias = tensors.f32(&format!("{prefix}.bias")).unwrap_or_else(|_| vec![0.0; out_dim]);
-    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None })
+    Ok(Linear { weight_t, bias, in_dim, out_dim, spirv_matmul: None, dxil_offload: None, fp8_weight: None, qint_weight: None })
 }
 
 #[cfg(test)]
