@@ -738,6 +738,81 @@ impl PrecisionTable {
     pub fn for_layer(&self, i: usize) -> Precision {
         self.overrides.iter().rev().find(|(l, _)| *l == i).map(|(_, p)| *p).unwrap_or(self.default)
     }
+
+    /// 起動時の自動選択(2026-11-20)。重みをf32で持った場合のバイト数`f32_bytes`、
+    /// 使える空きメモリ`avail_bytes`、層数`n_layers`から精度表を決める。
+    /// 空きの70%を重みの予算とする(KV・活性・OS用に残す)。
+    /// 順に: f32が収まる→f32 / 全層INT8(1/4)が収まる→INT8(品質優先でFP8より速い)
+    /// / 収まらなければINT8を土台に、収まるまで層をINT4へ(0〜2層と最終層は感度が高いので
+    /// INT8のまま、中ほどの層から)/ 全層INT4(約1/8、感度の高い層を除く)でも
+    /// 収まらなければエラー。層の重みは均等と近似する。
+    pub fn auto_for_memory(f32_bytes: u64, avail_bytes: u64, n_layers: usize) -> Result<Self> {
+        let budget = avail_bytes / 10 * 7;
+        if f32_bytes <= budget {
+            return Ok(Self::uniform(Precision::F32));
+        }
+        let int8 = f32_bytes / 4;
+        if int8 <= budget {
+            return Ok(Self::uniform(Precision::Int8));
+        }
+        // INT4にできる層: 感度の高い先頭3層と最終層を除く。
+        let candidates: Vec<usize> = (3..n_layers.saturating_sub(1)).collect();
+        // 1層をINT8→INT4にすると、その層ぶん(int8 / n_layers)の半分が減る。
+        let per_layer_saving = int8 / (n_layers.max(1) as u64) / 2;
+        let need = int8 - budget;
+        let k = if per_layer_saving == 0 { usize::MAX } else { need.div_ceil(per_layer_saving) as usize };
+        if k > candidates.len() {
+            anyhow::bail!(
+                "auto_for_memory: model needs ~{} MB even with INT4 layers, only {} MB budget",
+                (int8 - candidates.len() as u64 * per_layer_saving) >> 20,
+                budget >> 20
+            );
+        }
+        let mut t = Self::uniform(Precision::Int8);
+        // 中ほどから外側へ(感度が低い傾向。1.5Bの実測では6,20,7,9,10,18が低かった)。
+        let mid = n_layers / 2;
+        let mut order = candidates;
+        order.sort_by_key(|&i| (i as i64 - mid as i64).abs());
+        for &i in order.iter().take(k) {
+            t.overrides.push((i, Precision::Int4));
+        }
+        Ok(t)
+    }
+}
+
+#[cfg(test)]
+mod auto_precision_tests {
+    use super::*;
+    const GB: u64 = 1 << 30;
+
+    #[test]
+    fn picks_f32_when_it_fits() {
+        let t = PrecisionTable::auto_for_memory(6 * GB, 32 * GB, 28).unwrap();
+        assert_eq!(t.default, Precision::F32);
+        assert!(t.overrides.is_empty());
+    }
+    #[test]
+    fn picks_int8_for_7b_on_32gb() {
+        // 7B f32 は約30GB、予算22.4GB → INT8(約7.6GB)
+        let t = PrecisionTable::auto_for_memory(30 * GB, 32 * GB, 28).unwrap();
+        assert_eq!(t.default, Precision::Int8);
+        assert!(t.overrides.is_empty());
+    }
+    #[test]
+    fn mixes_int4_when_int8_does_not_fit() {
+        // int8=8GB、予算7GB(空き10GB)→ INT4を足して収める。感度の高い層(0〜2,最終)は残す。
+        let t = PrecisionTable::auto_for_memory(32 * GB, 10 * GB, 28).unwrap();
+        assert_eq!(t.default, Precision::Int8);
+        assert!(!t.overrides.is_empty());
+        for (l, p) in &t.overrides {
+            assert_eq!(*p, Precision::Int4);
+            assert!(*l >= 3 && *l < 27, "sensitive layer {l} must stay INT8");
+        }
+    }
+    #[test]
+    fn errors_when_nothing_fits() {
+        assert!(PrecisionTable::auto_for_memory(60 * GB, 8 * GB, 28).is_err());
+    }
 }
 
 /// [`GptModel::set_matmul_dxil_offload`]で配線される、密GEMM専用の
