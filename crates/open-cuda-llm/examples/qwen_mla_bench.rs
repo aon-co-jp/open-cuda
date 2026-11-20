@@ -33,6 +33,52 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let fp8 = std::env::var("QWEN_FP8").is_ok();
     let device: Arc<dyn GpuDevice> = CpuDevice::new(0);
+    // QWEN_AUTOTABLE=K: 各層を1つだけINT4にした時の評価文pplの悪化(感度)を測り、
+    // 悪化の小さい順にK層をINT4、残りをINT8とする精度表を作って、評価文/別の文のpplを出す。
+    if let Ok(k) = std::env::var("QWEN_AUTOTABLE") {
+        use open_cuda_llm::{Precision, PrecisionTable};
+        let k: usize = k.parse()?;
+        let ids = tok.encode(EVAL)?;
+        let ppl_of = |m: &QwenModel, ids: &[u32]| -> Result<f32> {
+            let lp = m.token_logprobs(&device, ids)?;
+            Ok((-(lp.iter().sum::<f32>() / lp.len() as f32)).exp())
+        };
+        let held: Vec<Vec<u32>> = HELDOUT.iter().map(|t| tok.encode(t)).collect::<Result<_>>()?;
+        let held_ppl = |m: &QwenModel| -> Result<f32> {
+            let mut s = 0.0;
+            let mut n = 0usize;
+            for h in &held {
+                let lp = m.token_logprobs(&device, h)?;
+                s += lp.iter().sum::<f32>();
+                n += lp.len();
+            }
+            Ok((-(s / n as f32)).exp())
+        };
+        let base = { let mut t = PrecisionTable::uniform(Precision::Int8); t.default = Precision::Int8; t };
+        let m = QwenModel::load_precision(&dir, device.as_ref(), &base)?;
+        let nl = m.num_layers();
+        println!("AUTO base int8 ppl={:.3} held={:.3}", ppl_of(&m, &ids)?, held_ppl(&m)?);
+        drop(m);
+        let mut sens = Vec::new();
+        for i in 0..nl {
+            let mut t = base.clone();
+            t.overrides.push((i, Precision::Int4));
+            let m = QwenModel::load_precision(&dir, device.as_ref(), &t)?;
+            let p = ppl_of(&m, &ids)?;
+            println!("AUTO layer={i} int4 ppl={p:.3}");
+            sens.push((i, p));
+        }
+        sens.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let chosen: Vec<usize> = sens.iter().take(k).map(|x| x.0).collect();
+        let mut t = base.clone();
+        for &i in &chosen {
+            t.overrides.push((i, Precision::Int4));
+        }
+        let m = QwenModel::load_precision(&dir, device.as_ref(), &t)?;
+        let spec: Vec<String> = chosen.iter().map(|i| format!("{i}:int4")).collect();
+        println!("AUTO table=int8,{} ppl={:.3} held={:.3}", spec.join(","), ppl_of(&m, &ids)?, held_ppl(&m)?);
+        return Ok(());
+    }
     let mut model = if let Ok(spec) = std::env::var("QWEN_PRECISION") { QwenModel::load_precision(&dir, device.as_ref(), &open_cuda_llm::PrecisionTable::parse(&spec)?)? } else if fp8 { QwenModel::load_fp8(&dir, device.as_ref(), opencuda_blas::Fp8Format::E4M3)? } else { QwenModel::load(&dir)? };
     let load_s = t0.elapsed().as_secs_f32();
     let mut calib_s = 0.0;
