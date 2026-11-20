@@ -55,3 +55,7 @@
 ### Русский
 **Состояние**: точность весов выбирается по слоям (`QWEN_PRECISION="int8,1:f32,24:fp8"`; F32 / FP8 / INT8 / INT4), измерено только на CPU. 1.5B: перплексия f32 7,08, FP8 7,27, INT8 7,37 (27 с), INT4 10,55 (29 с). 3B: INT8 8,05 (40 с), INT4 10,76 (46 с). Память весов примерно 1/4 (INT8) и 1/8 (INT4); скорость близка к f32.
 **Планы**: ①автоматически определять таблицу точности по чувствительности слоёв ②квантование KV-кэша ③SIMD-ускорение FP8/INT8/INT4 ④при запуске проверять ОЗУ и выбирать модель и таблицу ⑤измерить 7B в INT4 ⑥выпустить новую версию `pl2pl`.
+
+## 2026-11-21 方針 / Policy: low-memory serving
+日本語: 小さなPCでは、品質を守れる範囲で重みをINT8(必要なら中間層のみINT4)にする。FP8は遅いので既定にしない。未測定の効果を成果として書かない。
+English: On small machines, keep weights at INT8 (INT4 only on middle layers if needed) while quality holds. FP8 is slow, so it is not the default. Never report unmeasured gains as results.
