@@ -383,3 +383,7 @@ v0.3.5 では、`ash` による Vulkan Instance / Device / Queue / Buffer / Shad
 - **自動選択**: `PrecisionTable::auto_for_memory` が、f32、全層INT8、中間層INT4の順に、空きRAMの7割に収まる最初の表を選びます。`aruaru-llm` では環境変数 `ARUARU_LLM_PRECISION`(未設定=f32、`auto`、または `int8,1:f32` のような表)で指定します。
 - **KVのINT8**: `QWEN_KV_INT8=1` は丸めの影響だけを測る試験で、迷い度は約1%の悪化でした。メモリはまだ減りません。
 - **未了**: KVを実際にINT8で保持する実装、実サーバーでの `auto` の通し確認。翻訳はAIによるもので、母語話者の確認はまだです。
+
+## 2026-11-21 追記: KVキャッシュを実際にINT8で保持
+- `QWEN_KV_INT8=1` で、KVキャッシュを1ヘッド1トークンごとのスケール付きINT8として**実際に保持**するようにした(`open-cuda` 2ba4b5f)。Qwen2.5-1.5Bで迷い度は7.079→7.159(約+1%)、別の文では12.1→11.8(誤差の範囲)。KVのメモリはf32の約1/4(head_dim 64の試験で3倍以上の縮小を確認)。
+- 未了: `ARUARU_LLM_PRECISION=auto` を実サーバーで通して確認すること。翻訳はAIが作成し、ネイティブ話者による確認は未了。
