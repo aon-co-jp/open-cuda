@@ -1465,12 +1465,55 @@ struct KvCacheHead {
     v: Vec<f32>,
     k_latent: Vec<f32>,
     v_latent: Vec<f32>,
+    /// INT8保持(2026-11-21、`push_q8`)。非空のときK/Vはこちらに入り、`k`/`v`は空。
+    /// 1トークンごとに絶対値最大スケール(`k_s`/`v_s`)で量子化する。
+    k_q: Vec<i8>,
+    v_q: Vec<i8>,
+    k_s: Vec<f32>,
+    v_s: Vec<f32>,
     n: usize,
+}
+
+fn q8_row(x: &[f32], q: &mut Vec<i8>, s: &mut Vec<f32>) {
+    let m = x.iter().fold(0f32, |a, &v| a.max(v.abs()));
+    let sc = if m == 0.0 { 1.0 } else { m / 127.0 };
+    s.push(sc);
+    q.extend(x.iter().map(|&v| (v / sc).round().clamp(-127.0, 127.0) as i8));
+}
+
+fn dq8(q: &[i8], s: &[f32], head_dim: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(q.len());
+    for (row, &sc) in q.chunks_exact(head_dim).zip(s) {
+        out.extend(row.iter().map(|&v| v as f32 * sc));
+    }
+    out
 }
 
 impl KvCacheHead {
     fn empty() -> Self {
-        Self { k: Vec::new(), v: Vec::new(), k_latent: Vec::new(), v_latent: Vec::new(), n: 0 }
+        Self { k: Vec::new(), v: Vec::new(), k_latent: Vec::new(), v_latent: Vec::new(), k_q: Vec::new(), v_q: Vec::new(), k_s: Vec::new(), v_s: Vec::new(), n: 0 }
+    }
+
+    /// 1トークンぶんをINT8で保持する(MLA圧縮とは併用しない)。
+    fn push_q8(&mut self, k_row: &[f32], v_row: &[f32]) {
+        q8_row(k_row, &mut self.k_q, &mut self.k_s);
+        q8_row(v_row, &mut self.v_q, &mut self.v_s);
+        self.n += 1;
+    }
+
+    /// 保持中のK/Vを f32 の行列として返す(INT8保持なら復元、通常なら借用)。
+    fn rows(&self, head_dim: usize) -> (std::borrow::Cow<'_, [f32]>, std::borrow::Cow<'_, [f32]>) {
+        if self.k_q.is_empty() {
+            (std::borrow::Cow::Borrowed(&self.k[..]), std::borrow::Cow::Borrowed(&self.v[..]))
+        } else {
+            (std::borrow::Cow::Owned(dq8(&self.k_q, &self.k_s, head_dim)), std::borrow::Cow::Owned(dq8(&self.v_q, &self.v_s, head_dim)))
+        }
+    }
+
+    /// INT8保持で実際に確保しているバイト数(試験・測定用)。
+    #[allow(dead_code)]
+    fn stored_bytes(&self) -> usize {
+        (self.k.len() + self.v.len() + self.k_latent.len() + self.v_latent.len() + self.k_s.len() + self.v_s.len()) * 4 + self.k_q.len() + self.v_q.len()
     }
 
     /// 1トークンぶん(`head_dim`長)のk/vをキャッシュへ追加する。
@@ -1506,7 +1549,10 @@ impl KvCacheHead {
                 let v = opencuda_blas::mla_decompress_kv(device, self.n, p.d_c, head_dim, &self.v_latent, &p.up_proj, spirv)?;
                 Ok((k, v))
             }
-            None => Ok((self.k.clone(), self.v.clone())),
+            None => {
+                let (k, v) = self.rows(head_dim);
+                Ok((k.into_owned(), v.into_owned()))
+            }
         }
     }
 
@@ -1523,6 +1569,10 @@ impl KvCacheHead {
         debug_assert!(self.k_latent.is_empty() && self.v_latent.is_empty(), "open-cuda-llm: KvCacheHead::truncate: MLA-compressed caches are not supported");
         self.k.truncate(new_n * head_dim);
         self.v.truncate(new_n * head_dim);
+        self.k_q.truncate(new_n * head_dim);
+        self.v_q.truncate(new_n * head_dim);
+        self.k_s.truncate(new_n);
+        self.v_s.truncate(new_n);
         self.n = new_n;
     }
 }

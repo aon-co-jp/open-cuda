@@ -458,7 +458,11 @@ impl QwenModel {
                 apply_rope(&mut k_h, &cos, &sin);
                 let v_h = &v[kvh * head_dim..(kvh + 1) * head_dim];
                 let proj = layer.mla.as_ref().map(|v| &v[kvh]);
-                cache.kv[kvh].push(device, &kv_sim(&k_h), &kv_sim(v_h), proj, None)?;
+                if proj.is_none() && kv_int8_on() {
+                    cache.kv[kvh].push_q8(&k_h, v_h);
+                } else {
+                    cache.kv[kvh].push(device, &k_h, v_h, proj, None)?;
+                }
                 k_heads_rot.push(k_h);
             }
 
@@ -570,15 +574,22 @@ impl QwenModel {
                 for kvh in 0..cfg.num_kv_heads {
                     let mut k_h = k[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim].to_vec();
                     apply_rope(&mut k_h, cos, sin);
-                    cache.kv[kvh].push(device, &kv_sim(&k_h), &kv_sim(&v[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim]), None, None)?;
+                    let v_h = &v[i * kv_dim + kvh * head_dim..i * kv_dim + (kvh + 1) * head_dim];
+                    if kv_int8_on() {
+                        cache.kv[kvh].push_q8(&k_h, v_h);
+                    } else {
+                        cache.kv[kvh].push(device, &k_h, v_h, None, None)?;
+                    }
                 }
             }
             // 因果的アテンション: 位置 i のクエリは、キャッシュ先頭から pos0+i までを見る。
             let mut context = vec![0.0f32; seq * hidden];
+            // INT8保持のKVは、KVヘッドごとに1回だけ復元して全クエリヘッドで共有する。
+            let kv_rows: Vec<_> = (0..cfg.num_kv_heads).map(|h| cache.kv[h].rows(head_dim)).collect();
             for qh in 0..cfg.num_heads {
                 let kvh = qh / heads_per_kv;
-                let kc = &cache.kv[kvh].k;
-                let vc = &cache.kv[kvh].v;
+                let kc = &kv_rows[kvh].0;
+                let vc = &kv_rows[kvh].1;
                 for i in 0..seq {
                     let mut q_h = q[i * hidden + qh * head_dim..i * hidden + (qh + 1) * head_dim].to_vec();
                     apply_rope(&mut q_h, &rope[i].0, &rope[i].1);
@@ -1116,18 +1127,39 @@ mod tests {
     }
 }
 
-/// KVキャッシュのINT8量子化の**品質シミュレーション**(2026-11-20)。`QWEN_KV_INT8=1`のとき、
-/// 1ヘッド1トークンのK/Vを絶対値最大でスケールしたINT8へ丸めて戻す(メモリは減らさない。
-/// 実際にINT8で保持する実装の前に、品質への影響だけを測るため)。
-fn kv_sim(x: &[f32]) -> Vec<f32> {
+/// KVキャッシュをINT8で**実際に保持**する(2026-11-21。2026-11-20のシミュレーションを置き換え)。
+/// `QWEN_KV_INT8`が設定されているとき、1ヘッド1トークンごとに絶対値最大でスケールした
+/// INT8として積み、Attentionの直前にf32へ復元する(f32の約1/4のメモリ)。
+fn kv_int8_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("QWEN_KV_INT8").is_ok()) {
-        return x.to_vec();
+    *ON.get_or_init(|| std::env::var("QWEN_KV_INT8").is_ok())
+}
+
+#[cfg(test)]
+mod kv_int8_tests {
+    use super::*;
+
+    #[test]
+    fn q8_cache_round_trips_and_is_smaller() {
+        let hd = 64;
+        let mut c = KvCacheHead::empty();
+        let mut f = KvCacheHead::empty();
+        for t in 0..5 {
+            let k: Vec<f32> = (0..hd).map(|i| ((t * 7 + i) as f32 * 0.37).sin() * 3.0).collect();
+            let v: Vec<f32> = (0..hd).map(|i| ((t * 5 + i) as f32 * 0.21).cos()).collect();
+            c.push_q8(&k, &v);
+            f.k.extend_from_slice(&k);
+            f.v.extend_from_slice(&v);
+            f.n += 1;
+        }
+        assert_eq!(c.n, 5);
+        let (ck, cv) = c.rows(hd);
+        let (fk, fv) = f.rows(hd);
+        for (a, b) in ck.iter().zip(fk.iter()).chain(cv.iter().zip(fv.iter())) {
+            assert!((a - b).abs() < 3.0 / 127.0, "{a} vs {b}");
+        }
+        assert!(c.stored_bytes() * 3 < f.stored_bytes(), "{} vs {}", c.stored_bytes(), f.stored_bytes());
+        c.truncate(2, hd);
+        assert_eq!(c.rows(hd).0.len(), 2 * hd);
     }
-    let m = x.iter().fold(0f32, |a, &v| a.max(v.abs()));
-    if m == 0.0 {
-        return x.to_vec();
-    }
-    let s = m / 127.0;
-    x.iter().map(|&v| (v / s).round().clamp(-127.0, 127.0) * s).collect()
 }
